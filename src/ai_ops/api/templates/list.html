@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · ai-ops-auto{% endblock %}
+{% block body %}
+<h2>{{ title }}（{{ rows | length }}）</h2>
+
+{% if rows %}
+<table>
+  <thead>
+    <tr>
+    {% for col in columns %}<th>{{ col }}</th>{% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+    {% for col in columns %}
+      {% set v = row[col] %}
+      <td>
+        {% if col == 'status' or col == 'health' %}
+          <span class="badge badge-{{ v }}">{{ v }}</span>
+        {% elif v is mapping or v is iterable and v is not string %}
+          <code>{{ v }}</code>
+        {% else %}
+          {{ v if v is not none else "-" }}
+        {% endif %}
+      </td>
+    {% endfor %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">还没有 {{ title }} 数据。{{ empty_hint }}</div>
+{% endif %}
+{% endblock %}

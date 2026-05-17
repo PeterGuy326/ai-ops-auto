@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 项目数据
+.env
+data/*.db
+data/assets/*
+data/outputs/*
+data/cookies/
+!data/assets/.gitkeep
+!data/outputs/.gitkeep
+
+# 外部工具（本地 clone 的，不进我们的仓库；用 install_external.sh 拉）
+external/
+
+# 日志
+logs/
+*.log
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db

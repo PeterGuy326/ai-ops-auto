@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>{% block title %}ai-ops-auto{% endblock %}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      margin: 0; background: #0f1419; color: #e6edf3;
+    }
+    header {
+      background: #161b22; border-bottom: 1px solid #30363d;
+      padding: 16px 32px; display: flex; align-items: center; gap: 32px;
+    }
+    header h1 { margin: 0; font-size: 18px; color: #58a6ff; }
+    header nav a {
+      color: #c9d1d9; text-decoration: none; margin-right: 20px;
+      font-size: 14px; padding: 6px 12px; border-radius: 4px;
+    }
+    header nav a:hover { background: #21262d; color: #58a6ff; }
+    main { padding: 24px 32px; max-width: 1280px; margin: 0 auto; }
+    h2 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+    table {
+      width: 100%; border-collapse: collapse; margin-top: 16px;
+      background: #161b22; border-radius: 6px; overflow: hidden;
+    }
+    th, td {
+      text-align: left; padding: 10px 14px;
+      border-bottom: 1px solid #30363d; font-size: 13px;
+    }
+    th { background: #21262d; color: #8b949e; font-weight: 500; }
+    tr:hover { background: #1c2128; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 10px;
+      font-size: 11px; font-weight: 500;
+    }
+    .badge-draft     { background: #6e768166; color: #8b949e; }
+    .badge-ready     { background: #1f6feb44; color: #79c0ff; }
+    .badge-scheduled { background: #d29922aa; color: #fff; }
+    .badge-publishing{ background: #bc8cffaa; color: #fff; }
+    .badge-published { background: #238636; color: #fff; }
+    .badge-failed    { background: #da3633; color: #fff; }
+    .badge-dead      { background: #6e7681; color: #fff; }
+    .empty {
+      text-align: center; padding: 60px 0; color: #6e7681;
+    }
+    .meta-card {
+      display: inline-block; background: #161b22; border: 1px solid #30363d;
+      border-radius: 6px; padding: 16px 24px; margin-right: 12px; margin-top: 12px;
+    }
+    .meta-card .label { color: #8b949e; font-size: 12px; }
+    .meta-card .value { color: #58a6ff; font-size: 22px; font-weight: 600; margin-top: 4px; }
+    code { background: #21262d; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+    .footer { color: #6e7681; text-align: center; margin: 60px 0 24px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🚀 ai-ops-auto</h1>
+    <nav>
+      <a href="/ui">总览</a>
+      <a href="/ui/topics">主题</a>
+      <a href="/ui/articles">文章</a>
+      <a href="/ui/accounts">账号</a>
+      <a href="/ui/jobs">任务</a>
+      <a href="/docs">API 文档</a>
+    </nav>
+  </header>
+  <main>
+    {% block body %}{% endblock %}
+  </main>
+  <div class="footer">ai-ops-auto · 编排层 · 多平台 AI 运营自动化</div>
+</body>
+</html>

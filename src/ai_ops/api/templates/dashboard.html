@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}总览 · ai-ops-auto{% endblock %}
+{% block body %}
+<h2>总览</h2>
+
+<div>
+  <div class="meta-card"><div class="label">主题</div><div class="value">{{ counts.topics }}</div></div>
+  <div class="meta-card"><div class="label">文章</div><div class="value">{{ counts.articles }}</div></div>
+  <div class="meta-card"><div class="label">账号</div><div class="value">{{ counts.accounts }}</div></div>
+  <div class="meta-card"><div class="label">任务</div><div class="value">{{ counts.jobs }}</div></div>
+  <div class="meta-card"><div class="label">已发布</div><div class="value">{{ counts.published }}</div></div>
+  <div class="meta-card"><div class="label">失败</div><div class="value">{{ counts.failed }}</div></div>
+</div>
+
+<h2 style="margin-top: 40px;">🔥 热门主题（heat_score 倒排）</h2>
+{% if hot_topics %}
+<table>
+  <thead><tr><th>ID</th><th>名称</th><th>关键词</th><th>热度分</th></tr></thead>
+  <tbody>
+  {% for t in hot_topics %}
+    <tr>
+      <td>{{ t.id }}</td>
+      <td>{{ t.name }}</td>
+      <td>{{ t.keywords | join(", ") }}</td>
+      <td><code>{{ "%.3f"|format(t.heat_score) }}</code></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">还没有主题数据。POST /topics 创建一个。</div>
+{% endif %}
+
+<h2 style="margin-top: 40px;">⏰ 最近任务</h2>
+{% if recent_jobs %}
+<table>
+  <thead><tr><th>ID</th><th>平台</th><th>状态</th><th>账号</th><th>尝试</th><th>开始时间</th></tr></thead>
+  <tbody>
+  {% for j in recent_jobs %}
+    <tr>
+      <td>{{ j.id }}</td>
+      <td>{{ j.platform }}</td>
+      <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
+      <td>{{ j.account_id }}</td>
+      <td>{{ j.attempts }}/{{ j.max_attempts }}</td>
+      <td>{{ j.started_at or "-" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">还没有发布任务。POST /jobs/&lt;id&gt;/run 触发一个。</div>
+{% endif %}
+{% endblock %}

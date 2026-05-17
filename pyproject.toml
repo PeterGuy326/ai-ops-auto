@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-ops-auto"
+version = "0.1.0"
+description = "AI 运营自动化中台：内容生产 → 视频剪辑 → 多平台多账号分发"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "apscheduler>=3.10",
+    "httpx>=0.27",
+    "cryptography>=42",
+    "python-multipart>=0.0.9",
+    "rich>=13.7",
+    "typer>=0.12",
+    "tenacity>=8.2",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg2-binary>=2.9"]
+celery = ["celery[redis]>=5.3"]
+llm-openai = ["openai>=1.30"]
+llm-anthropic = ["anthropic>=0.25"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.9",
+]
+
+[project.scripts]
+ai-ops = "ai_ops.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
