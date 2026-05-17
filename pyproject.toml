@@ -27,6 +27,8 @@ dependencies = [
     "playwright>=1.45",
     # Markdown → HTML，用于编辑器粘贴注入（Draft.js / ProseMirror）
     "markdown>=3.6",
+    # 图片反指纹处理（asset_processor：EXIF/微裁剪/微旋转/调色）
+    "Pillow>=10",
 ]
 
 [project.optional-dependencies]
@@ -36,11 +38,16 @@ llm-openai = ["openai>=1.30"]
 llm-anthropic = ["anthropic>=0.25"]
 # 高风控平台（小红书）反检测加固档：drop-in 兼容 playwright API
 stealth = ["patchright>=1.40"]
+# 反检测顶配档：Firefox + C++ 层指纹欺骗，小红书首选
+# 安装后需跑：python -m camoufox fetch
+stealth-pro = ["camoufox[geoip]>=0.4"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
     "mypy>=1.9",
+    # 文本查重；core/dedup.py 优先用，没装时回退到内置轻量实现
+    "simhash>=2.1",
 ]
 
 [project.scripts]

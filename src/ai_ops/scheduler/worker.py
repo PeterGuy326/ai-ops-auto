@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from ..accounts.health_monitor import get_paused_until, is_paused
 from ..accounts.manager import check_rate_limit, get_credential, mark_published, update_health
 from ..core.db import session_scope
-from ..core.enums import AccountHealth, ArticleStatus, JobStatus, Platform
-from ..core.models import Article, PublishJob
+from ..core.enums import AccountHealth, ArticleStatus, ContentType, JobStatus, Platform
+from ..core.models import Account, Article, PublishJob
 from ..core.schemas import PublishContent, PublishResult
 from ..publishers.registry import default_registry
 
@@ -37,6 +38,14 @@ async def execute_job(job_id: int) -> PublishResult:
             job.error = f"rate-limit: {gate.reason}"
             return PublishResult(success=False, error=job.error)
 
+        # 风控降权暂停期检查（health_monitor 写入 account.profile["paused_until"]）
+        account = s.get(Account, job.account_id)
+        if account is not None and is_paused(account):
+            until = get_paused_until(account)
+            job.status = JobStatus.FAILED
+            job.error = f"账号暂停中至 {until.isoformat() if until else 'unknown'}"
+            return PublishResult(success=False, error=job.error)
+
         try:
             credential = get_credential(s, job.account_id)
         except ValueError as e:
@@ -46,6 +55,20 @@ async def execute_job(job_id: int) -> PublishResult:
 
         platform = Platform(job.platform)
         content = _build_content(article)
+
+        # 小红书图文：发布前对图片做反指纹处理（EXIF/微裁剪/微旋转/调色）
+        # 仅对 XIAOHONGSHU + IMAGE_TEXT 执行，规避其它平台回归
+        if (
+            platform == Platform.XIAOHONGSHU
+            and content.content_type == ContentType.IMAGE_TEXT
+            and content.images
+        ):
+            try:
+                from ..content.asset_processor import process_images
+                content.images = process_images(content.images, job.account_id)
+            except Exception:
+                # 处理失败不阻断发布，沿用原图
+                pass
 
         job.status = JobStatus.RUNNING
         job.started_at = datetime.utcnow()

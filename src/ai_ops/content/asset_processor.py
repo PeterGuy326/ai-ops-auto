@@ -18,10 +18,36 @@ import hashlib
 import random
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from PIL import Image, ImageEnhance
+
+from ..config import settings
+
+
+# —— EXIF 字段编号（参考 Pillow / TIFF 标准） —— #
+_EXIF_TAG_IMAGE_DESCRIPTION = 0x010E
+_EXIF_TAG_MAKE = 0x010F
+_EXIF_TAG_MODEL = 0x0110
+_EXIF_TAG_SOFTWARE = 0x0131
+_EXIF_TAG_DATETIME = 0x0132
+_EXIF_TAG_DATETIME_ORIGINAL = 0x9003
+_EXIF_TAG_DATETIME_DIGITIZED = 0x9004
+
+# 真实手机/相机组合候选——避免极端冷门，规避指纹打点
+_DEVICE_POOL = [
+    ("Apple", "iPhone 13", "iOS 17.4 Camera"),
+    ("Apple", "iPhone 14 Pro", "iOS 17.5"),
+    ("Apple", "iPhone 15", "iOS 17.6"),
+    ("HUAWEI", "P50 Pro", "EMUI 12.0"),
+    ("HUAWEI", "Mate 60", "HarmonyOS 4.0"),
+    ("Xiaomi", "Mi 13", "MIUI 14"),
+    ("Xiaomi", "14 Ultra", "HyperOS 1.0"),
+    ("OPPO", "Find X6", "ColorOS 13"),
+    ("vivo", "X100", "OriginOS 4"),
+    ("samsung", "SM-S928B", "Galaxy S24 Ultra"),
+]
 
 
 def compute_md5(path: Path | str) -> str:
@@ -130,3 +156,150 @@ def diversify_content_for_account(
     new_images = [str(diversify_image(p, out_dir, seed=account_id + i)) for i, p in enumerate(images)]
     new_videos = [str(diversify_video(p, out_dir, seed=account_id + i)) for i, p in enumerate(videos)]
     return new_images, new_videos
+
+
+# ============================================================================ #
+# v2 接口：process_image / process_images
+# ----------------------------------------------------------------------------- #
+# 比 diversify_image 多做的事：
+#   - 写 EXIF（Software / Make / Model / DateTime / DateTimeOriginal）
+#   - 微旋转 0.1-0.3°（白底填充避免黑边露馅）
+#   - 输出路径强约定到 data/processed/acc_{id}/，文件名 deterministic
+#   - seed 仅依赖 (account_id, src_filename)，同账号同图幂等
+#
+# 设计要点：
+#   - 所有随机抽取都用 account_id-derived rng，保证幂等
+#   - EXIF 时间戳基于"当前时间 ± random(0,3600)"，但 rng 由 seed 控制，所以同次调用
+#     得到相同时间；不同账号不同时间——这正是反矩阵化想要的
+#   - 旋转后 .resize 回原尺寸的近似（再裁剪一次），避免输出尺寸暴露
+# ============================================================================ #
+
+def _processed_dir(account_id: int, output_dir: Path | str | None = None) -> Path:
+    """统一输出目录。默认 settings.data_dir / processed / acc_{id}/"""
+    if output_dir is not None:
+        return Path(output_dir)
+    return Path(settings.data_dir) / "processed" / f"acc_{account_id}"
+
+
+def _stable_seed(account_id: int, src: Path) -> int:
+    """同账号同源文件名 → 同 seed。供 rng / 文件名 hash 共用。"""
+    raw = f"asset:{account_id}:{src.name}".encode()
+    return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big")
+
+
+def _format_exif_datetime(dt: datetime) -> str:
+    # EXIF 时间格式：'YYYY:MM:DD HH:MM:SS'
+    return dt.strftime("%Y:%m:%d %H:%M:%S")
+
+
+def process_image(
+    local_path: str,
+    account_id: int,
+    *,
+    output_dir: Path | str | None = None,
+    publish_time: datetime | None = None,
+) -> str:
+    """对单张图片做反指纹处理。返回新文件绝对路径（字符串）。
+
+    扰动量级（按 account_id 派生 seed，幂等）：
+      - 四边各裁 1-3 像素
+      - 亮度 / 对比度 / 饱和度 ±2-3%
+      - 旋转 0.1-0.3°（白底填充 + 重裁防黑边）
+      - EXIF DateTimeOriginal = publish_time ± random(0, 3600)s
+      - EXIF Software / Make / Model 改写为常见手机组合
+      - 重新编码（JPEG quality 88-95）
+    """
+    src = Path(local_path)
+    if not src.exists():
+        raise FileNotFoundError(f"image not found: {src}")
+
+    dst_dir = _processed_dir(account_id, output_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    seed = _stable_seed(account_id, src)
+    rng = random.Random(seed)
+
+    img = Image.open(src)
+    src_mode = img.mode
+    if src_mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    elif src_mode == "RGBA":
+        # RGBA 在 JPEG 不支持；统一 RGB（透明背景以白色填充）
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[3])
+        img = bg
+    else:
+        img = img.copy()  # 避免直接动 PIL lazy file handle
+
+    w, h = img.size
+
+    # 1) 四边随机微裁 1-3px
+    crop_l = rng.randint(1, 3)
+    crop_t = rng.randint(1, 3)
+    crop_r = rng.randint(1, 3)
+    crop_b = rng.randint(1, 3)
+    new_w = max(1, w - crop_l - crop_r)
+    new_h = max(1, h - crop_t - crop_b)
+    img = img.crop((crop_l, crop_t, crop_l + new_w, crop_t + new_h))
+
+    # 2) 亮度 / 对比度 / 饱和度 ±2-3%
+    img = ImageEnhance.Brightness(img).enhance(1.0 + rng.uniform(-0.03, 0.03))
+    img = ImageEnhance.Contrast(img).enhance(1.0 + rng.uniform(-0.03, 0.03))
+    img = ImageEnhance.Color(img).enhance(1.0 + rng.uniform(-0.03, 0.03))
+
+    # 3) 微旋转 0.1-0.3°，白底 + 再裁掉 1% 边避免黑/白边露馅
+    angle = rng.uniform(0.1, 0.3) * rng.choice([-1, 1])
+    img = img.rotate(angle, resample=Image.BICUBIC, fillcolor=(255, 255, 255), expand=False)
+    # 旋转后内圈裁掉 ~1% 防边
+    rw, rh = img.size
+    pad_w = max(1, int(rw * 0.01))
+    pad_h = max(1, int(rh * 0.01))
+    img = img.crop((pad_w, pad_h, rw - pad_w, rh - pad_h))
+
+    # 4) 构造 EXIF
+    pub_time = publish_time or datetime.utcnow()
+    offset_seconds = rng.randint(0, 3600)
+    # 一半概率往前，一半往后（用 seed 决定）
+    sign = -1 if (rng.random() < 0.5) else 1
+    shot_time = pub_time + timedelta(seconds=sign * offset_seconds)
+    make, model, software = rng.choice(_DEVICE_POOL)
+
+    exif = img.getexif()
+    exif[_EXIF_TAG_MAKE] = make
+    exif[_EXIF_TAG_MODEL] = model
+    exif[_EXIF_TAG_SOFTWARE] = software
+    exif[_EXIF_TAG_DATETIME] = _format_exif_datetime(shot_time)
+    exif[_EXIF_TAG_DATETIME_ORIGINAL] = _format_exif_datetime(shot_time)
+    exif[_EXIF_TAG_DATETIME_DIGITIZED] = _format_exif_datetime(shot_time)
+    # 一个独特 description 防 md5 撞——同账号每次生成都不同也无所谓，反正只用于区分
+    exif[_EXIF_TAG_IMAGE_DESCRIPTION] = f"IMG_{seed & 0xFFFFFFFF:08x}"
+
+    # 5) 输出路径：{stem}_p{hash6}.jpg，hash 来自 seed，保证幂等
+    tag = f"{seed & 0xFFFFFF:06x}"  # 6 hex chars
+    dst = dst_dir / f"{src.stem}_p{tag}.jpg"
+
+    save_kwargs = {
+        "quality": rng.randint(88, 95),
+        "optimize": True,
+        "exif": exif.tobytes() if exif else b"",
+    }
+    img.save(dst, "JPEG", **save_kwargs)
+    return str(dst)
+
+
+def process_images(
+    local_paths: list[str],
+    account_id: int,
+    *,
+    output_dir: Path | str | None = None,
+    publish_time: datetime | None = None,
+) -> list[str]:
+    """批量版 process_image。逐张处理，失败不中断（返回原路径作为兜底）。"""
+    out: list[str] = []
+    for p in local_paths:
+        try:
+            out.append(process_image(p, account_id, output_dir=output_dir, publish_time=publish_time))
+        except Exception:
+            # 单张失败不影响主流程：退回原路径，由 publisher 自己消化
+            out.append(p)
+    return out

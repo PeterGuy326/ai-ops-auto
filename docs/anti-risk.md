@@ -101,20 +101,30 @@ async with AsyncCamoufox(headless=False, proxy=...) as browser:
 已落地 ✅：
 - [x] `config.browser_engine` 可切 4 种引擎
 - [x] `config.browser_headless` 默认 False（高风控建议）
-- [x] `config.browser_proxy` 单账号代理
+- [x] `config.browser_proxy` 全局兜底代理
 - [x] `config.publish_min_interval_seconds` 默认 4h
 - [x] `config.publish_max_per_day` 默认 2
 - [x] `config.nurture_days` 默认 7
 - [x] `xhs_skills.py` 的 `--headless` 跟随 settings 切换
+- [x] `accounts.manager.is_in_nurture_period()` 养号期判断
+- [x] `accounts.manager.check_rate_limit()` 发布前限流校验
+- [x] **接入 Camoufox 主链路** — `publishers/xhs_camoufox.py`（`BROWSER_ENGINE=camoufox` 时自动接管，priority=5 顶到 SAU / XhsSkills 之前）
+- [x] **per-account 代理** — `AccountIn.proxy` / `Account.profile["proxy"]`；`accounts.manager.get_account_proxy()` 取值
+- [x] **per-account 固定指纹** — `get_account_fingerprint()` 按 account_id 派生稳定 OS + 屏幕，同账号每次 launch 同指纹
+- [x] **Camoufox 持久化 profile** — `data/browser_profiles/xhs/acc_<id>/`，Firefox profile 全套保留
+- [x] **发布时间打散** — `scheduler/jitter.py` + `queue.schedule_publish()`，默认 +random(0,600)s，凌晨 0-7 强制推到白天
+- [x] **真人化前置/后置浏览** — `XhsCamoufoxPublisher._human_browse` 发布前后各刷一次推荐流
+- [x] **真人化输入节奏** — `_human_type` 逐字 35-110ms + 4% "想一下"停顿；Camoufox `humanize=True` 管鼠标轨迹
+- [x] **文案反 AI 检测 humanize** — `content/humanize.py`（句长方差 / 转折词替换 / 标点扰动 / 注入口语词），生成器自动接入，发布层兜底再洗一次
+- [x] **风控横幅检测** — 发布前扫描"账号异常 / 操作频繁 / 账号受限"，命中直接返回
+- [x] **风控降权自动闭环** — `accounts/health_monitor.py`：24h 节点 metric 回流后比对 7d baseline 中位数，views 跌破 20% 累计 3 次 → DEGRADED + pause 48h；连续 5 次 → BANNED + pause 7d。paused_until 落 `account.profile["paused_until"]`（ISO 字符串），worker.py 在 rate-limit 后追加 is_paused 检查。
+- [x] **图片去重 asset_processor** — `content/asset_processor.process_image()`：EXIF（Software/Make/Model/DateTimeOriginal）+ 四边 1-3px 随机裁剪 + 亮度/对比度/饱和度 ±3% + 微旋转 0.1-0.3°；seed 由 `(account_id, src_filename)` 派生，同账号同图幂等，不同账号不同结果；输出到 `data/processed/acc_{id}/`。worker.py 在 XHS + IMAGE_TEXT 路径接入。
+- [x] **simhash 查重骨架** — `core/dedup.py`：`compute_simhash` / `hamming_distance` / `is_too_similar`；优先用 `simhash` 包，未装时回退到内置 64-bit md5-based 实现。**仅暴露接口，未接发布主流程**，下个 sprint 接入。
 
 待补 ⏳（优先级排序）：
-- [ ] 接入 Camoufox（`pip install camoufox`，wrapper 里加分支）
-- [ ] `accounts.manager.is_in_nurture_period()` 养号期判断
-- [ ] `accounts.manager.check_rate_limit()` 发布前限流校验
-- [ ] `content/asset_processor.py` 图片/视频去重处理器
-- [ ] `core/dedup.py` simhash 查重
-- [ ] `scheduler` 的发布时间打散（默认 +random 600s）
 - [ ] 蒲公英 / 聚光接口适配器
+- [ ] `health_monitor.py` 定时扫账号健康度（当前是事件驱动；定时巡检还未做）
+- [ ] `core/dedup.is_too_similar()` 接入 `content/generator.py` 与 `xhs_camoufox` 发布前置校验
 
 ## 参考资料
 

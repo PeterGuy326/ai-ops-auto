@@ -52,6 +52,24 @@ async def collect_one(job_id: int) -> dict:
             raw=data.get("raw", {}),
         )
         s.add(m)
+        s.flush()
+        # 数到这是该 job 累计第几条 metric——第 2 条 = 24h 节点（1h/24h/7d 三次采集）
+        metric_count = (
+            s.query(Metrics).filter(Metrics.job_id == job_id).count()
+        )
+
+    # 24h 节点：触发健康度评估（曝光异常 → 降级 + 暂停）
+    if metric_count == 2:
+        try:
+            from ..accounts.health_monitor import evaluate_after_metrics
+            with session_scope() as s2:
+                action = evaluate_after_metrics(s2, job_id)
+                data["health_action"] = {
+                    "decision": action.decision,
+                    "reason": action.reason,
+                }
+        except Exception:
+            pass  # 健康评估失败不影响采集主流程
 
     # 异步刷新主题热度（fire and forget）
     try:
