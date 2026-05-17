@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     nurture_days: int = 7
     # 内容差异化阈值（同主题不同账号的 simhash 距离下限）
     cross_account_dedup_threshold: float = 0.6
+    # 发布时间打散窗口（秒）— 计划时间 + random(0, N)，规避"整点发布"机器签名
+    publish_jitter_seconds: int = 600
+    # 文案是否过 humanize 反 AI 检测（默认开；调试时可关）
+    xhs_humanize_enabled: bool = True
 
     # ====== GitHub Pages / 自有博客 ======
     # 本地 Hexo/Jekyll/Hugo 仓库路径（用户的博客源码）

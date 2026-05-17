@@ -38,6 +38,7 @@ class PublisherRegistry:
 
 def build_default_registry() -> PublisherRegistry:
     """默认装配——按选型决策注册。"""
+    from ..config import settings
     from .github_pages import GitHubPagesPublisher
     from .social_auto_upload import SAU_PLATFORM_MAP, SocialAutoUploadPublisher
     from .toutiao import ToutiaoPublisher
@@ -50,6 +51,11 @@ def build_default_registry() -> PublisherRegistry:
     # SAU 主力 — 覆盖 7 个平台
     for p in SAU_PLATFORM_MAP:
         reg.register(p, lambda p=p: SocialAutoUploadPublisher(p), priority=10)
+
+    # 小红书反风控主链路：BROWSER_ENGINE=camoufox 时，XhsCamoufoxPublisher 顶到最高优先级
+    if settings.browser_engine == "camoufox":
+        from .xhs_camoufox import XhsCamoufoxPublisher
+        reg.register(Platform.XIAOHONGSHU, XhsCamoufoxPublisher, priority=5)
 
     # 小红书加固 — 主力失败时 fallback
     reg.register(Platform.XIAOHONGSHU, XhsSkillsPublisher, priority=20)

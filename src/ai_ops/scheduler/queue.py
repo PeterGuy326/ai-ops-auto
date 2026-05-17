@@ -7,6 +7,8 @@ from typing import Callable, Coroutine
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from .jitter import jitter_publish_time
+
 
 class TaskQueue:
     """对调度后端的薄壳，业务代码不直接依赖 APScheduler。"""
@@ -62,6 +64,22 @@ class TaskQueue:
             self._scheduler.remove_job(job_id)
         except Exception:
             pass
+
+    def schedule_publish(
+        self,
+        planned: datetime,
+        coro_factory: Callable[[], Coroutine],
+        job_id: str | None = None,
+        *,
+        avoid_night: bool = True,
+    ) -> tuple[str, datetime]:
+        """带 jitter + 凌晨保护的发布调度。返回 (调度ID, 实际触发时间)。
+
+        与 schedule_once 区别：本方法专为 PublishJob 设计，规避风控对"机器规律"的检测。
+        """
+        actual = jitter_publish_time(planned, avoid_night=avoid_night)
+        sid = self.schedule_once(actual, coro_factory, job_id=job_id)
+        return sid, actual
 
 
 queue = TaskQueue()
