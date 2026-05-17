@@ -22,6 +22,11 @@ dependencies = [
     "rich>=13.7",
     "typer>=0.12",
     "tenacity>=8.2",
+    # 浏览器自动化（主流，微软官方维护，knwon star ~73k）
+    # 默认走 playwright + 本地 Chrome channel，足以覆盖知乎/头条/公众号
+    "playwright>=1.45",
+    # Markdown → HTML，用于编辑器粘贴注入（Draft.js / ProseMirror）
+    "markdown>=3.6",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +34,8 @@ postgres = ["psycopg2-binary>=2.9"]
 celery = ["celery[redis]>=5.3"]
 llm-openai = ["openai>=1.30"]
 llm-anthropic = ["anthropic>=0.25"]
+# 高风控平台（小红书）反检测加固档：drop-in 兼容 playwright API
+stealth = ["patchright>=1.40"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

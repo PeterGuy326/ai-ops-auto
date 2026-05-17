@@ -9,6 +9,7 @@ class Platform(str, Enum):
     BILIBILI = "bilibili"
     KUAISHOU = "kuaishou"
     WECHAT_VIDEO = "wechat_video"
+    WECHAT_MP = "wechat_mp"  # 微信公众号图文
     BAIJIAHAO = "baijiahao"
     TIKTOK = "tiktok"
     YOUTUBE = "youtube"

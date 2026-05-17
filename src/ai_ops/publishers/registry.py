@@ -41,6 +41,7 @@ def build_default_registry() -> PublisherRegistry:
     from .github_pages import GitHubPagesPublisher
     from .social_auto_upload import SAU_PLATFORM_MAP, SocialAutoUploadPublisher
     from .toutiao import ToutiaoPublisher
+    from .wechat_mp import WechatMpPublisher
     from .xhs_skills import XhsSkillsPublisher
     from .zhihu import ZhihuPublisher
 
@@ -56,6 +57,7 @@ def build_default_registry() -> PublisherRegistry:
     # 知乎、头条 — 开源缺口，自建
     reg.register(Platform.ZHIHU, ZhihuPublisher, priority=10)
     reg.register(Platform.TOUTIAO, ToutiaoPublisher, priority=10)
+    reg.register(Platform.WECHAT_MP, WechatMpPublisher, priority=10)
 
     # 自有博客（GitHub Pages / Hexo）
     reg.register(Platform.GITHUB_PAGES, GitHubPagesPublisher, priority=10)

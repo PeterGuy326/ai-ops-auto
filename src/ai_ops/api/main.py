@@ -200,8 +200,9 @@ async def api_login_account(account_id: int):
     except asyncio.TimeoutError:
         raise HTTPException(408, "登录超时（5 分钟内未完成扫码）")
 
-    # publisher.login 会把 cookies 写回 cred dict — 这里加密落库
-    if ok and cred.get("cookies"):
+    # publisher.login 会把凭证写回 cred dict（cookies-based / profile_dir-based 都可能）
+    # — 只要登录成功且 cred 非空就 Fernet 加密落库，兼容所有 publisher
+    if ok and cred:
         with session_scope() as s:
             from ..accounts.store import get_store
             a = s.get(Account, account_id)
