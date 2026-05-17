@@ -21,9 +21,10 @@ import {
 
 const NAV = [
   { title: "总览", url: "/dashboard", icon: LayoutDashboard },
-  { title: "主题", url: "/topics", icon: BookOpen },
-  { title: "文章", url: "/articles", icon: FileText },
+  // 专题作为一等公民：置顶在"账号"/"文章"之前
+  { title: "专题", url: "/topics", icon: BookOpen },
   { title: "账号", url: "/accounts", icon: Users },
+  { title: "文章", url: "/articles", icon: FileText },
   { title: "任务", url: "/jobs", icon: ListChecks },
 ];
 
@@ -48,16 +49,21 @@ export function AppSidebar() {
           <SidebarGroupLabel>管理</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {NAV.map((item) => (
-                <SidebarMenuItem key={item.url}>
-                  <SidebarMenuButton asChild isActive={pathname === item.url}>
-                    <Link to={item.url}>
-                      <item.icon />
-                      <span>{item.title}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
+              {NAV.map((item) => {
+                const isActive =
+                  pathname === item.url ||
+                  (item.url !== "/" && pathname.startsWith(item.url + "/"));
+                return (
+                  <SidebarMenuItem key={item.url}>
+                    <SidebarMenuButton asChild isActive={isActive}>
+                      <Link to={item.url}>
+                        <item.icon />
+                        <span>{item.title}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                );
+              })}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

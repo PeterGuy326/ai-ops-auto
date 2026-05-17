@@ -119,10 +119,10 @@ const platformConfig = {
 } satisfies ChartConfig;
 
 export default function Dashboard() {
-  const topicsQ = useQuery({ queryKey: ["topics"], queryFn: api.topics });
-  const accountsQ = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
-  const articlesQ = useQuery({ queryKey: ["articles"], queryFn: api.articles });
-  const jobsQ = useQuery({ queryKey: ["jobs"], queryFn: api.jobs });
+  const topicsQ = useQuery({ queryKey: ["topics"], queryFn: () => api.topics() });
+  const accountsQ = useQuery({ queryKey: ["accounts"], queryFn: () => api.accounts() });
+  const articlesQ = useQuery({ queryKey: ["articles"], queryFn: () => api.articles() });
+  const jobsQ = useQuery({ queryKey: ["jobs"], queryFn: () => api.jobs() });
   const heatQ = useQuery({ queryKey: ["heat-rank"], queryFn: () => api.heatRank(5) });
 
   const counts = {

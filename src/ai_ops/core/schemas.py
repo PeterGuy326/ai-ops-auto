@@ -15,15 +15,43 @@ from .enums import (
 
 class TopicIn(BaseModel):
     name: str
+    category: str = Field(
+        default="general",
+        description="专题分类（常见值：general/tech/exam/sports/lifestyle）",
+    )
     keywords: list[str] = Field(default_factory=list)
     persona: dict = Field(default_factory=dict)
     target_platforms: list[Platform] = Field(default_factory=list)
     notes: str = ""
 
 
+class TopicUpdate(BaseModel):
+    """PATCH /topics/{id}：所有字段可选。"""
+    name: Optional[str] = None
+    category: Optional[str] = None
+    keywords: Optional[list[str]] = None
+    persona: Optional[dict] = None
+    target_platforms: Optional[list[Platform]] = None
+    notes: Optional[str] = None
+
+
 class TopicOut(TopicIn):
     id: int
     heat_score: float
+    created_at: datetime
+
+
+class TopicStats(BaseModel):
+    """GET /topics 列表项：带账号/文章统计。"""
+    id: int
+    name: str
+    category: str
+    keywords: list[str] = Field(default_factory=list)
+    target_platforms: list[Platform] = Field(default_factory=list)
+    heat_score: float
+    notes: str = ""
+    account_count: int = 0
+    article_count: int = 0
     created_at: datetime
 
 
@@ -58,6 +86,10 @@ class AccountIn(BaseModel):
     nickname: str
     profile: dict = Field(default_factory=dict)
     daily_quota: int = 5
+    topic_id: Optional[int] = Field(
+        default=None,
+        description="账号绑定的专题 id（None=未绑定，存量账号兼容）",
+    )
     credential_plain: dict = Field(
         default_factory=dict,
         description="明文凭证（cookie/token），落库时加密",
@@ -65,16 +97,25 @@ class AccountIn(BaseModel):
     tags: list[str] = Field(default_factory=list, description="账号标签：人设/赛道/地域，存到 profile.tags")
     group: str = Field(default="", description="账号分组，用于跨账号分发策略")
     weight: int = Field(default=1, ge=1, le=100, description="分发权重，默认 1")
+    proxy: str = Field(
+        default="",
+        description="账号专属代理（一机一号一IP 是反风控核心）。格式：http://user:pass@host:port",
+    )
 
 
 class AccountUpdate(BaseModel):
     """PATCH /accounts/{id} 用，所有字段可选。"""
     nickname: Optional[str] = None
     daily_quota: Optional[int] = None
+    topic_id: Optional[int] = Field(
+        default=None,
+        description="重新绑定专题；None=不变；-1=清空绑定",
+    )
     tags: Optional[list[str]] = None
     group: Optional[str] = None
     weight: Optional[int] = Field(default=None, ge=1, le=100)
     credential_plain: Optional[dict] = Field(default=None, description="如提供则覆盖加密凭证")
+    proxy: Optional[str] = Field(default=None, description="账号专属代理；None 表示不变，空串表示清空")
 
 
 class AccountOut(BaseModel):
@@ -82,6 +123,7 @@ class AccountOut(BaseModel):
     platform: Platform
     nickname: str
     profile: dict
+    topic_id: Optional[int] = None
     health: AccountHealth
     risk_level: int
     daily_quota: int
@@ -100,6 +142,10 @@ class AccountOut(BaseModel):
     @property
     def weight(self) -> int:
         return self.profile.get("weight", 1)
+
+    @property
+    def proxy(self) -> str:
+        return self.profile.get("proxy", "")
 
 
 class PublishContent(BaseModel):

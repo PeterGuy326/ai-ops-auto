@@ -30,6 +30,8 @@ from ..core.schemas import (
     JobOut,
     TopicIn,
     TopicOut,
+    TopicStats,
+    TopicUpdate,
 )
 # 触发 lint：JobStatus 用于 dashboard 路由的统计
 from ..scheduler.queue import queue
@@ -95,16 +97,33 @@ def api_create_topic(data: TopicIn, s: Session = Depends(get_session)):
     return content_mgr.create_topic(s, data)
 
 
-@app.get("/topics", response_model=list[TopicOut])
+@app.get("/topics", response_model=list[TopicStats])
 def api_list_topics(s: Session = Depends(get_session)):
-    return content_mgr.list_topics(s)
+    """带 account_count / article_count 统计的 topic 列表。
+
+    兼容性：响应体在原 TopicOut 基础上**新增**统计字段，删除了 `persona`（前端列表不用）。
+    若前端需要完整字段，请用 `GET /topics/{id}` 获取单条（留为 P5+ 增量，目前没有）。
+    """
+    return content_mgr.list_topic_stats(s)
+
+
+@app.patch("/topics/{topic_id}", response_model=TopicOut)
+def api_update_topic(topic_id: int, data: TopicUpdate, s: Session = Depends(get_session)):
+    try:
+        return content_mgr.update_topic(s, topic_id, data)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
 
 
 # ---------------- Articles ----------------
 
 @app.get("/articles", response_model=list[ArticleOut])
-def api_list_articles(limit: int = 100, s: Session = Depends(get_session)):
-    return content_mgr.list_articles(s, limit=limit)
+def api_list_articles(
+    limit: int = 100,
+    topic_id: Optional[int] = None,
+    s: Session = Depends(get_session),
+):
+    return content_mgr.list_articles(s, limit=limit, topic_id=topic_id)
 
 
 @app.post("/articles", response_model=ArticleOut)
@@ -134,9 +153,10 @@ def api_create_account(data: AccountIn, s: Session = Depends(get_session)):
 @app.get("/accounts", response_model=list[AccountOut])
 def api_list_accounts(
     platform: Optional[Platform] = None,
+    topic_id: Optional[int] = None,
     s: Session = Depends(get_session),
 ):
-    return account_mgr.list_accounts(s, platform=platform)
+    return account_mgr.list_accounts(s, platform=platform, by_topic=topic_id)
 
 
 @app.patch("/accounts/{account_id}", response_model=AccountOut)

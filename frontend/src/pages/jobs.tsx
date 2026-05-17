@@ -1,5 +1,6 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/lib/api";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { api } from "@/lib/api"
+import { useTopicFilter } from "@/hooks/use-topic-filter"
 import {
   Table,
   TableBody,
@@ -7,11 +8,12 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Play, RefreshCw } from "lucide-react";
+} from "@/components/ui/table"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Play, RefreshCw } from "lucide-react"
+import { CategoryBadge } from "@/components/topics/category-badge"
 
 const STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
   pending: "outline",
@@ -20,23 +22,38 @@ const STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | "dest
   success: "default",
   failed: "destructive",
   dead: "destructive",
-};
+}
 
 export default function Jobs() {
-  const qc = useQueryClient();
-  const { data, isLoading } = useQuery({ queryKey: ["jobs"], queryFn: api.jobs });
+  const qc = useQueryClient()
+  const { topicId } = useTopicFilter()
+  const { data, isLoading } = useQuery({
+    queryKey: ["jobs", { topic_id: topicId ?? null }],
+    queryFn: () => api.jobs(topicId),
+  })
+  const topicsQ = useQuery({ queryKey: ["topics"], queryFn: () => api.topics() })
+  const topicMap = new Map(topicsQ.data?.map((t) => [t.id, t]) ?? [])
+  const currentTopic = topicId ? topicMap.get(topicId) : null
 
   const runMut = useMutation({
     mutationFn: (id: number) => api.runJob(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["jobs"] }),
-  });
+  })
   const collectMut = useMutation({
     mutationFn: (id: number) => api.collectMetrics(id),
-  });
+  })
 
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-bold">任务</h1>
+      <div>
+        <h1 className="text-2xl font-bold">任务</h1>
+        {currentTopic && (
+          <p className="text-muted-foreground text-sm">
+            当前过滤：{currentTopic.name}{" "}
+            <CategoryBadge category={currentTopic.category} className="ml-1" />
+          </p>
+        )}
+      </div>
       <Card>
         <CardHeader>
           <CardTitle>发布任务（{data?.length ?? 0}）</CardTitle>
@@ -65,11 +82,15 @@ export default function Jobs() {
                       <Badge variant="outline">{j.platform}</Badge>
                     </TableCell>
                     <TableCell>
-                      <Badge variant={STATUS_VARIANT[j.status] ?? "outline"}>{j.status}</Badge>
+                      <Badge variant={STATUS_VARIANT[j.status] ?? "outline"}>
+                        {j.status}
+                      </Badge>
                     </TableCell>
                     <TableCell className="text-right tabular-nums">{j.attempts}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">
-                      {j.started_at ? new Date(j.started_at).toLocaleString("zh-CN") : "—"}
+                      {j.started_at
+                        ? new Date(j.started_at).toLocaleString("zh-CN")
+                        : "—"}
                     </TableCell>
                     <TableCell className="max-w-xs truncate">
                       {j.platform_url ? (
@@ -115,5 +136,5 @@ export default function Jobs() {
         </CardContent>
       </Card>
     </div>
-  );
+  )
 }

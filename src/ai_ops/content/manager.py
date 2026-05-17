@@ -1,11 +1,20 @@
 """内容（主题 + 文章 + 物料）管理。"""
 from __future__ import annotations
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..core.enums import ArticleStatus
-from ..core.models import Article, Asset, Topic
-from ..core.schemas import ArticleIn, ArticleOut, AssetRef, TopicIn, TopicOut
+from ..core.models import Account, Article, Asset, Topic
+from ..core.schemas import (
+    ArticleIn,
+    ArticleOut,
+    AssetRef,
+    TopicIn,
+    TopicOut,
+    TopicStats,
+    TopicUpdate,
+)
 
 
 def create_topic(session: Session, data: TopicIn) -> TopicOut:
@@ -20,11 +29,33 @@ def create_topic(session: Session, data: TopicIn) -> TopicOut:
     )
 
 
+def update_topic(session: Session, topic_id: int, patch: TopicUpdate) -> TopicOut:
+    t = session.get(Topic, topic_id)
+    if t is None:
+        raise ValueError(f"topic {topic_id} not found")
+    data = patch.model_dump(exclude_unset=True)
+    for k, v in data.items():
+        setattr(t, k, v)
+    session.flush()
+    return TopicOut(
+        id=t.id,
+        name=t.name,
+        category=t.category,
+        keywords=t.keywords,
+        persona=t.persona,
+        target_platforms=t.target_platforms,
+        notes=t.notes,
+        heat_score=t.heat_score,
+        created_at=t.created_at,
+    )
+
+
 def list_topics(session: Session) -> list[TopicOut]:
     return [
         TopicOut(
             id=t.id,
             name=t.name,
+            category=t.category,
             keywords=t.keywords,
             persona=t.persona,
             target_platforms=t.target_platforms,
@@ -36,10 +67,50 @@ def list_topics(session: Session) -> list[TopicOut]:
     ]
 
 
-def list_articles(session: Session, limit: int = 100) -> list[ArticleOut]:
+def list_topic_stats(session: Session) -> list[TopicStats]:
+    """带账号 / 文章统计的 topic 列表（GET /topics 用）。
+
+    用两次 group-by 聚合而非每行 N+1 查询，列表页 O(1) 次 IO。
+    """
+    acct_counts = dict(
+        session.execute(
+            select(Account.topic_id, func.count(Account.id))
+            .where(Account.topic_id.isnot(None))
+            .group_by(Account.topic_id)
+        ).all()
+    )
+    art_counts = dict(
+        session.execute(
+            select(Article.topic_id, func.count(Article.id))
+            .group_by(Article.topic_id)
+        ).all()
+    )
+    return [
+        TopicStats(
+            id=t.id,
+            name=t.name,
+            category=t.category,
+            keywords=t.keywords or [],
+            target_platforms=t.target_platforms or [],
+            heat_score=t.heat_score,
+            notes=t.notes,
+            account_count=int(acct_counts.get(t.id, 0)),
+            article_count=int(art_counts.get(t.id, 0)),
+            created_at=t.created_at,
+        )
+        for t in session.query(Topic).order_by(Topic.id.asc()).all()
+    ]
+
+
+def list_articles(
+    session: Session, limit: int = 100, topic_id: int | None = None
+) -> list[ArticleOut]:
+    q = session.query(Article)
+    if topic_id is not None:
+        q = q.filter(Article.topic_id == topic_id)
     return [
         _to_article_out(a)
-        for a in session.query(Article).order_by(Article.id.desc()).limit(limit).all()
+        for a in q.order_by(Article.id.desc()).limit(limit).all()
     ]
 
 

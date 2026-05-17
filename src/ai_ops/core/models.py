@@ -28,6 +28,8 @@ class Topic(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True)
+    # 专题分类（用字符串而非 enum，方便后续扩展；常见值：general/tech/exam/sports/lifestyle）
+    category: Mapped[str] = mapped_column(String(32), default="general", server_default="general")
     keywords: Mapped[list] = mapped_column(JSON, default=list)
     persona: Mapped[dict] = mapped_column(JSON, default=dict)
     target_platforms: Mapped[list] = mapped_column(JSON, default=list)
@@ -36,6 +38,7 @@ class Topic(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
     articles: Mapped[list["Article"]] = relationship(back_populates="topic")
+    accounts: Mapped[list["Account"]] = relationship(back_populates="topic")
 
 
 class Article(Base):
@@ -80,6 +83,8 @@ class Account(Base):
     platform: Mapped[Platform] = mapped_column(String(32))
     nickname: Mapped[str] = mapped_column(String(128))
     profile: Mapped[dict] = mapped_column(JSON, default=dict)
+    # 账号绑定的专题（nullable=True 兼容存量；profile.group/tags 仍可用作软分组的二级维度）
+    topic_id: Mapped[Optional[int]] = mapped_column(ForeignKey("topics.id"), nullable=True)
     encrypted_credential: Mapped[bytes] = mapped_column(default=b"")
     health: Mapped[AccountHealth] = mapped_column(String(32), default=AccountHealth.UNKNOWN)
     risk_level: Mapped[int] = mapped_column(Integer, default=0)
@@ -87,6 +92,8 @@ class Account(Base):
     last_publish_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_health_check_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+    topic: Mapped[Optional["Topic"]] = relationship(back_populates="accounts")
 
 
 class PublishJob(Base):
