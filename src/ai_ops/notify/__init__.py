@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Union
 
 from ..observability import get_logger
-from . import dedup, webhook
+from . import dedup, lark_cli, webhook
 
 logger = get_logger(__name__)
 
@@ -74,6 +74,44 @@ def _platform_label(value: Any) -> str:
     return getattr(value, "value", str(value))
 
 
+def _send(text: str) -> bool:
+    """双后端分发器 — 按 settings.notify_backend 决定走 lark-cli / webhook / 两者。
+
+    底层逻辑：dev 走 lark-cli 零配置（本机 auth login 即用），prod 走 webhook 解耦人机依赖，
+    迁移期 both 兜底（任一通道成功即视为 success）。各通道内部已吞异常返 bool，本函数
+    只汇总；不抛异常给事件层（事件层还有 @_safe 第二道防线）。
+    """
+    from ..config import settings  # 延迟 import，避免循环
+
+    backend = (settings.notify_backend or "both").lower()
+    success = False
+
+    if backend in ("lark_cli", "both"):
+        chat_ids = lark_cli._parse_chat_ids(settings.lark_cli_chat_ids or "")
+        if chat_ids:
+            try:
+                if lark_cli.send_via_lark_cli(text, chat_ids):
+                    success = True
+            except Exception as e:  # 兜底防御，lark_cli 内部已吞但加一层保险
+                logger.warning(
+                    "notify._send: lark_cli path raised",
+                    extra={"event": "send_lark_cli_raised", "error": str(e)},
+                )
+
+    if backend in ("webhook", "both"):
+        # webhook.send 在 url 未配置时已 silently skip 返 False
+        try:
+            if webhook.send(text):
+                success = True
+        except Exception as e:  # 兜底
+            logger.warning(
+                "notify._send: webhook path raised",
+                extra={"event": "send_webhook_raised", "error": str(e)},
+            )
+
+    return success
+
+
 # ============================================================================
 # 事件 1: 单条发布成功
 # ============================================================================
@@ -97,7 +135,7 @@ def publish_success(job: _JobLike) -> None:
     text = f"已发布：account_id={account_id} 在 {platform} 发布《{title}》 {url}".rstrip()
     if hint:
         text = f"[{hint}] {text}"
-    webhook.send(text)
+    _send(text)
 
 
 # ============================================================================
@@ -121,7 +159,7 @@ def publish_failed(job: _JobLike) -> None:
     text = f"job_id={job_id} 发布失败：{error}"
     if hint:
         text = f"[{hint}] {text}"
-    webhook.send(text)
+    _send(text)
 
 
 # ============================================================================
@@ -151,7 +189,7 @@ def account_expired(account: _AccountLike) -> None:
     )
     if hint:
         text = f"[{hint}] {text}"
-    webhook.send(text)
+    _send(text)
 
 
 # ============================================================================
@@ -174,7 +212,7 @@ def report_ready(kind: Literal["daily", "weekly"], path: Union[str, Path]) -> No
     text = f"{kind_label}已生成：{path_str}"
     if hint:
         text = f"[{hint}] {text}"
-    webhook.send(text)
+    _send(text)
 
 
 # ============================================================================
@@ -195,7 +233,7 @@ def content_taint(article_id: int, match: str) -> None:
     text = f"article_id={article_id} 正文含 {match}，发布已 abort，去编辑器修"
     if hint:
         text = f"[{hint}] {text}"
-    webhook.send(text)
+    _send(text)
 
 
 # ============================================================================
@@ -216,7 +254,7 @@ def fanout_done(article_id: int, n_ok: int, n_fail: int) -> None:
     text = f"article_id={article_id} fanout 完成：成功 {n_ok} / 失败 {n_fail}"
     if hint:
         text = f"[{hint}] {text}"
-    webhook.send(text)
+    _send(text)
 
 
 __all__ = [

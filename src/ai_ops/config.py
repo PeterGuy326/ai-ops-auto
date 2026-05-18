@@ -96,5 +96,18 @@ class Settings(BaseSettings):
     # 日志级别：DEBUG / INFO / WARNING / ERROR
     log_level: str = "INFO"
 
+    # ====== Task · notify lark-cli 后端（双后端架构）======
+    # notify 后端切换：
+    #   "lark_cli" = 只走 lark-cli OpenAPI（需本机 lark-cli auth login + scope:im:message）
+    #   "webhook"  = 只走飞书 custom robot webhook（需 FEISHU_WEBHOOK_URL）
+    #   "both"     = 两路并发尝试，任一成功即视为 success（dev 默认，零配置即用）
+    # 底层逻辑：dev 用 cli 零配置，prod 用 webhook 解耦人机依赖，迁移期 both 兜底
+    notify_backend: str = "both"
+    # lark-cli 目标群（多个用逗号分隔）。默认「自动化通知群」chat_id。
+    # 用 str + 运行时 split，避免 pydantic-settings 对 list[str] 的 env JSON 解析坑。
+    lark_cli_chat_ids: str = "oc_41202008f7723927f9da76ccb3c158c5"
+    # lark-cli subprocess 总超时（秒）—— 兜底防 cli 本身卡死拖垮主业务
+    lark_cli_timeout_seconds: int = 15
+
 
 settings = Settings()
