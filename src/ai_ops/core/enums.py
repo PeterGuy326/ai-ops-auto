@@ -11,6 +11,7 @@ class Platform(str, Enum):
     WECHAT_VIDEO = "wechat_video"
     WECHAT_MP = "wechat_mp"  # 微信公众号图文
     BAIJIAHAO = "baijiahao"
+    SOHUHAO = "sohuhao"  # 搜狐号（门户系媒体）
     TIKTOK = "tiktok"
     YOUTUBE = "youtube"
     GITHUB_PAGES = "github_pages"  # 自有博客（Hexo / Jekyll / Hugo / 纯静态）

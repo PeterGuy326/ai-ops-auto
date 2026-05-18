@@ -68,7 +68,18 @@ def build_default_registry() -> PublisherRegistry:
     # 自有博客（GitHub Pages / Hexo）
     reg.register(Platform.GITHUB_PAGES, GitHubPagesPublisher, priority=10)
 
+    # 百家号（Round 2A）— 开源缺口，自建；百度 SEO 流量管道，与头条号互补
+    from .baijiahao import BaijiahaoPublisher
+    reg.register(Platform.BAIJIAHAO, BaijiahaoPublisher, priority=10)
+
     return reg
 
 
 default_registry = build_default_registry()
+
+
+# ---------------- Round 2B 增量：搜狐号 ----------------
+# 与 baijiahao Round 2A 并行 P7 任务，物理分区在 registry.py 末尾各加各的注册块，
+# 互不干涉、互不重复 import；git merge 时按"先后追加"语义保留两块即可。
+from .sohuhao import SohuhaoPublisher  # noqa: E402
+default_registry.register(Platform.SOHUHAO, SohuhaoPublisher, priority=10)
