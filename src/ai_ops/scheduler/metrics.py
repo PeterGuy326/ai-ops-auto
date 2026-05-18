@@ -35,6 +35,7 @@ async def collect_one(
     job_id: int,
     *,
     interval_index: int | None = None,
+    source: str = "scheduled",
 ) -> dict:
     """采集单个 job 的最新数据，写 Metrics 表，触发热度重算。
 
@@ -43,11 +44,16 @@ async def collect_one(
     job_id : int
         要采集的 PublishJob.id
     interval_index : int | None, keyword-only
-        - None（默认）：手动触发 / 不知道是哪一档飞轮，走旧的 cutoff + count 兜底路径。
+        - None（默认）：手动触发 / 不知道是哪一档飞轮，走 source-based / cutoff 兜底路径。
           兼容 api/main.py 的手动触发、observability 测试桩、上 sprint P0 守护测试。
         - int：第 N 档飞轮（0-indexed，与 DEFAULT_INTERVALS_SECONDS 对齐）。
           触发判定改为 `interval_index == HEALTH_EVAL_INTERVAL_INDEX` 显式比对，
           跳过 cutoff 查询（既省一次 SQL 也让"显式=不依赖时间"语义干净）。
+    source : str, keyword-only
+        - "scheduled"（默认）：飞轮 schedule_after_publish 回调路径
+        - "manual"：API /jobs/{id}/collect 端点手动触发（API 调用方显式传）
+        - 写入 Metrics.source 字段，让 24h 触发判定能基于 source 计数排除非飞轮行
+          （Round 6 / TD-Z3-followup-2 / TD-P0-debt2）。
 
     keyword-only 防误传：避免后续加参数时位置漂移导致悄悄 break。
     """
@@ -81,38 +87,68 @@ async def collect_one(
             shares=data.get("shares", 0),
             views=data.get("views", 0),
             raw=data.get("raw", {}),
+            # Round 6：source 由调用方决定。飞轮回调默认 "scheduled"；API 手动触发传 "manual"。
+            source=source,
         )
         s.add(m)
         s.flush()
 
-        # 触发节点判定：优先用显式 interval_index（飞轮路径），兜底用 cutoff + count（兼容路径）。
+        # 触发节点判定 — 三段优先级（Round 6 / TD-Z3-followup-2 / TD-P0-debt2）：
+        #
+        # 优先级 1：显式 interval_index（飞轮调度路径，最稳）
+        #   schedule_after_publish 回调直接告诉我们"我是第几档"，不需要回表数 metric。
+        #
+        # 优先级 2：source-based scheduled count（owner 终态判定）
+        #   表里至少有 1 条非 "scheduled" 的 metric（说明 initial / manual 写入已生效），
+        #   直接按 source='scheduled' 计数：count == HEALTH_EVAL_INTERVAL_INDEX + 1 触发
+        #   （+1 因为本次 collect_one 写的 scheduled 行已 flush 进库，含当前）。
+        #   这是 owner 设计的终态——任何后续给 Metrics 加写入入口（backfill / external API）
+        #   都不污染触发判定，因为非飞轮入口都会标自己的 source。
+        #
+        # 优先级 3：cutoff + count 兜底（守护测试 + 生产 ALTER 瞬间）
+        #   表里所有 metric source 都是 "scheduled"（默认 server_default 兜底状态）：
+        #     - 守护测试场景：_seed_metric 不传 source → 默认 "scheduled"
+        #     - 生产 ALTER 瞬间：老 initial 行被 server_default 一刀切标 "scheduled"
+        #   这种状态下 source 区分尚未生效，降级到 TD-Z3-followup-A 的 cutoff + count 路径
+        #   （cutoff=finished_at+30min 把"接近 finished_at"的老 initial 行排除掉）。
+        #   新数据陆续写入（worker 落 initial / API 落 manual）后，自动过渡到优先级 2。
         if interval_index is not None:
-            # 显式路径：飞轮调度直接告诉我们"我是第几档"，不需要回表数 metric
+            # 优先级 1：显式飞轮路径
             is_health_eval_node = interval_index == HEALTH_EVAL_INTERVAL_INDEX
         else:
-            # 兼容路径（手动触发 / 老调用方 / observability 测试）：
-            # 用"真实时间窗"代替"metric 计数"——
-            # TD-Z3 后 Metrics 表会有 initial 行（≈ job.finished_at，publish 完成瞬间落库），
-            # 飞轮采集（1h/24h/7d）的 collected_at 是飞轮真正跑的时刻；
-            # 取 finished_at + 30min 做 cutoff，只数飞轮采集、排除 initial 行——
-            # 30min 阈值兼顾调度抖动（1h 飞轮可能 ±10 分钟跑）；
-            # 否则 publish + 1h 就会被误判为 24h 节点，刚发 1h 数据没起来就误降权 / 暂停账号。
-            job = s.get(PublishJob, job_id)
-            job_anchor = (job.finished_at or job.created_at) if job is not None else None
-            if job_anchor is not None:
-                cutoff = job_anchor + timedelta(minutes=30)
-                metric_count = (
-                    s.query(Metrics)
-                    .filter(Metrics.job_id == job_id, Metrics.collected_at > cutoff)
-                    .count()
-                )
+            # 检查是否已有 source 区分（至少 1 条非 "scheduled" → 走优先级 2）
+            from sqlalchemy import func, select
+            non_scheduled_exists = s.scalar(
+                select(func.count(Metrics.id))
+                .where(Metrics.job_id == job_id, Metrics.source != "scheduled")
+            ) or 0
+
+            if non_scheduled_exists > 0:
+                # 优先级 2：source-based scheduled count（owner 终态）
+                scheduled_count = s.scalar(
+                    select(func.count(Metrics.id))
+                    .where(Metrics.job_id == job_id, Metrics.source == "scheduled")
+                ) or 0
+                # +1 因为本次 collect_one 写的 scheduled 行已 flush 进库，含当前
+                is_health_eval_node = scheduled_count == HEALTH_EVAL_INTERVAL_INDEX + 1
             else:
-                # 极端兜底：job 被并发删 / 时间字段全空。退回旧行为不阻塞主流程；
-                # 这条路径理论不可达（能跑到 collect_one 的 job 都已 finished）。
-                metric_count = (
-                    s.query(Metrics).filter(Metrics.job_id == job_id).count()
-                )
-            is_health_eval_node = metric_count == 2
+                # 优先级 3：cutoff + count 兜底（守护测试 / 迁移瞬间）
+                job = s.get(PublishJob, job_id)
+                job_anchor = (job.finished_at or job.created_at) if job is not None else None
+                if job_anchor is not None:
+                    cutoff = job_anchor + timedelta(minutes=30)
+                    metric_count = (
+                        s.query(Metrics)
+                        .filter(Metrics.job_id == job_id, Metrics.collected_at > cutoff)
+                        .count()
+                    )
+                else:
+                    # 极端兜底：job 被并发删 / 时间字段全空。退回旧行为不阻塞主流程；
+                    # 这条路径理论不可达（能跑到 collect_one 的 job 都已 finished）。
+                    metric_count = (
+                        s.query(Metrics).filter(Metrics.job_id == job_id).count()
+                    )
+                is_health_eval_node = metric_count == 2
 
     # 24h 节点：触发健康度评估（曝光异常 → 降级 + 暂停）
     if is_health_eval_node:

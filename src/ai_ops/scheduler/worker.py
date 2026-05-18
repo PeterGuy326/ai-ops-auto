@@ -438,6 +438,9 @@ def _persist_initial_metrics(
             comments=comments,
             shares=shares,
             raw=dict(initial_metadata),  # 浅拷贝隔离，避免后续修改 raw_response 时联动
+            # Round 6 / TD-Z3-followup-2：显式标 source="initial"——让 scheduler/metrics.py
+            # 的 24h 触发判定能基于 source 计数排除掉这条初始快照（飞轮 count 只数 scheduled）。
+            source="initial",
         )
         session.add(metric)
         session.flush()

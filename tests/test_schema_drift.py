@@ -114,12 +114,12 @@ def _run_alembic_command(action: str, rev: str | None = None) -> None:
 def test_get_code_head_returns_latest_revision():
     """code_head 必须返回 alembic/versions/ 最新 migration 的 revision id。
 
-    硬钉 7c183c0ba12a（add publish_jobs.superseded_by_job_id）—— 当前仓库 head。
+    硬钉 7c7c50aecd6a（Round 6: add metrics.source）—— 当前仓库 head。
     若以后加新 migration，本断言会显眼提醒更新（这是 feature 不是 bug）。
     """
     head = db_mod.get_code_alembic_head()
-    assert head == "7c183c0ba12a", (
-        f"code head 期望 7c183c0ba12a (Round 1 superseded migration)，实际 {head}；"
+    assert head == "7c7c50aecd6a", (
+        f"code head 期望 7c7c50aecd6a (Round 6 metrics.source migration)，实际 {head}；"
         "如新增了 migration 请同步更新本测试"
     )
 
@@ -134,8 +134,8 @@ def test_check_schema_drift_in_sync_when_db_at_head(
 
     drift = db_mod.check_schema_drift()
     assert drift["in_sync"] is True
-    assert drift["db_head"] == "7c183c0ba12a"
-    assert drift["code_head"] == "7c183c0ba12a"
+    assert drift["db_head"] == "7c7c50aecd6a"
+    assert drift["code_head"] == "7c7c50aecd6a"
     assert drift["missing_migrations"] == []
 
 
@@ -160,10 +160,10 @@ def test_check_schema_drift_detects_no_alembic_version_table(
 
     drift = db_mod.check_schema_drift()
     assert drift["db_head"] is None, "create_all 建的 DB 应无 db_head"
-    assert drift["code_head"] == "7c183c0ba12a"
+    assert drift["code_head"] == "7c7c50aecd6a"
     assert drift["in_sync"] is False, "P9 事故场景必须被识别为漂移"
     # missing 应列出所有 rev（base → head）
-    assert drift["missing_migrations"] == ["b09fbf0bf0f0", "7c183c0ba12a"]
+    assert drift["missing_migrations"] == ["b09fbf0bf0f0", "7c183c0ba12a", "7c7c50aecd6a"]
 
 
 def test_check_schema_drift_detects_old_db_stamped_at_baseline(tmp_db_url):
@@ -177,10 +177,10 @@ def test_check_schema_drift_detects_old_db_stamped_at_baseline(tmp_db_url):
 
     drift = db_mod.check_schema_drift()
     assert drift["db_head"] == "b09fbf0bf0f0"
-    assert drift["code_head"] == "7c183c0ba12a"
+    assert drift["code_head"] == "7c7c50aecd6a"
     assert drift["in_sync"] is False
-    assert drift["missing_migrations"] == ["7c183c0ba12a"], (
-        f"应只缺 1 个 migration，实际 {drift['missing_migrations']}"
+    assert drift["missing_migrations"] == ["7c183c0ba12a", "7c7c50aecd6a"], (
+        f"应缺 2 个 migration（superseded + source），实际 {drift['missing_migrations']}"
     )
 
 
@@ -248,23 +248,26 @@ def test_try_auto_upgrade_promotes_old_db_to_head(
     drift_before = db_mod.check_schema_drift()
     assert drift_before["in_sync"] is False
     assert drift_before["db_head"] == "b09fbf0bf0f0"
-    assert drift_before["missing_migrations"] == ["7c183c0ba12a"]
+    assert drift_before["missing_migrations"] == ["7c183c0ba12a", "7c7c50aecd6a"]
 
     # 步骤 2: 触发自动升级（force=True 绕开 settings.auto_upgrade_db 默认 False）
     result = db_mod.try_auto_upgrade(force=True)
     assert result["attempted"] is True, f"应真跑 upgrade，实际 {result}"
     assert result["ok"] is True, f"upgrade 应成功，实际 error={result['error']}"
     assert result["from_rev"] == "b09fbf0bf0f0"
-    assert result["to_rev"] == "7c183c0ba12a"
+    assert result["to_rev"] == "7c7c50aecd6a"
 
     # 步骤 3: 验证 schema 已对齐 + 字段真加上了
     drift_after = db_mod.check_schema_drift()
     assert drift_after["in_sync"] is True
-    assert drift_after["db_head"] == "7c183c0ba12a"
+    assert drift_after["db_head"] == "7c7c50aecd6a"
     assert drift_after["missing_migrations"] == []
 
     cols_after = [c["name"] for c in _inspect(engine).get_columns("publish_jobs")]
-    assert "superseded_by_job_id" in cols_after, "事故字段必须被自动升级加上"
+    assert "superseded_by_job_id" in cols_after, "Round 1 superseded 字段必须被自动升级加上"
+    # Round 6 新加：metrics.source 字段也应被升级路径自动加上
+    metrics_cols_after = [c["name"] for c in _inspect(engine).get_columns("metrics")]
+    assert "source" in metrics_cols_after, "Round 6 metrics.source 字段必须被自动升级加上"
 
 
 def test_try_auto_upgrade_dry_run_does_not_change_db(tmp_db_url):
@@ -276,7 +279,7 @@ def test_try_auto_upgrade_dry_run_does_not_change_db(tmp_db_url):
     assert result["ok"] is True
     assert "dry_run" in result["reason"]
     assert result["from_rev"] == "b09fbf0bf0f0"
-    assert result["to_rev"] == "7c183c0ba12a"
+    assert result["to_rev"] == "7c7c50aecd6a"
 
     # DB 仍停在 baseline，未被改动
     assert db_mod.get_db_alembic_head() == "b09fbf0bf0f0"

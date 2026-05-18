@@ -139,3 +139,22 @@ class Metrics(Base):
     shares: Mapped[int] = mapped_column(Integer, default=0)
     views: Mapped[int] = mapped_column(Integer, default=0)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    # 采集来源标签（Round 6, TD-Z3-followup-2 / TD-P0-debt2）：
+    #   - "initial"  = worker._persist_initial_metrics 落第一份发布快照（≈ finished_at）
+    #   - "scheduled" = scheduler/metrics.collect_one 飞轮采集（1h/24h/7d 等档位）
+    #   - "manual"   = api/main.py /jobs/{id}/collect 端点手动触发
+    #   - 预留：external（第三方数据回填）/ backfill 等
+    # 设计目的：让 24h 健康度评估触发判定不再"二阶推导"（按计数 / 时间窗反推），
+    # 直接按 source='scheduled' 计数——任何后续给 Metrics 加写入入口都不污染触发判定。
+    # 双层默认：
+    #   - default="scheduled"     ORM 写入侧兜底（业务 / 测试 Metrics(...) 不传 source 时）
+    #   - server_default="scheduled" DB ALTER ADD 时给老行兜底（避免 NOT NULL 升级失败）
+    # 生产 ALTER 瞬间的语义不一致（老 initial 行被一刀切标 scheduled）由
+    # scheduler/metrics.py 的三段优先级（interval_index → source-based → cutoff 兜底）兜住，
+    # 详见 scheduler/metrics.collect_one 触发判定块。
+    source: Mapped[str] = mapped_column(
+        String(16),
+        default="scheduled",
+        server_default="scheduled",
+        nullable=False,
+    )

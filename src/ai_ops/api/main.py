@@ -410,9 +410,14 @@ def api_republish_job(job_id: int, s: Session = Depends(get_session)):
 
 @app.post("/jobs/{job_id}/collect", dependencies=[Depends(require_api_key)])
 async def api_collect_metrics(job_id: int):
-    """手动触发一次数据采集（不等飞轮调度）。"""
+    """手动触发一次数据采集（不等飞轮调度）。
+
+    Round 6 / TD-Z3-followup-2：传 source="manual" 让 Metrics 行被显式标记，
+    24h 触发判定的 source-based 优先级（priority 2）会自动排除这条非飞轮行，
+    避免运营手动复采污染健康度评估节点。
+    """
     from ..scheduler.metrics import collect_one
-    return await collect_one(job_id)
+    return await collect_one(job_id, source="manual")
 
 
 @app.get("/topics/heat-rank", dependencies=[Depends(require_api_key)])
