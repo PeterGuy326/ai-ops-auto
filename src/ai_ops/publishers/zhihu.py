@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 
 from ..config import settings
 from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
@@ -42,6 +43,36 @@ SEL_BODY_EDITOR = ".public-DraftEditor-content"
 SEL_COVER_FILE_INPUT = ".UploadPicture-wrapper input[type=file]"
 SEL_PUBLISH_BTN = 'button:text-is("发布"):not([disabled])'
 SEL_LOGGED_IN_AVATAR = ".AppHeader-userInfo, .Avatar--md, [class*=AppHeader-profile]"
+
+
+# 知乎专栏公开 URL 严格模式：zhuanlan.zhihu.com/p/<纯数字 id>（容错末尾斜杠）
+# /edit 后缀 = 草稿状态；其他形态（answer/question/follow 等）保守判失败
+_ZHIHU_PUBLIC_URL_RE = re.compile(r"^https?://zhuanlan\.zhihu\.com/p/\d+/?$")
+
+
+def _check_published_url(url: str) -> tuple[bool, str]:
+    """判断知乎文章 URL 是否处于公开发布状态。
+
+    现状（修复前）：_do_publish 抓到 final_url 后直接返回 success=True，
+    但 /p/{id}/edit 也满足 wait_for_url("**/p/*") 通配。当发布按钮未真发、
+    页面停在草稿编辑态时，会把草稿当成功返回——这就是「虚假闭环」，
+    比 fail 更危险，因为系统给了 SUCCESS 信号但内容根本没公开。
+
+    判定规则：
+      /p/{id}/edit  → (False, url)：草稿
+      /p/{id}       → (True, url)：公开
+      /p/{id}/      → (True, url.rstrip("/"))：公开，末尾斜杠归一化
+      其他形态      → (False, url)：未知，保守判失败（不冒虚假闭环风险）
+    """
+    if not url:
+        return False, url
+    # /edit 后缀（含末尾斜杠）= 草稿，无条件判失败
+    if url.rstrip("/").endswith("/edit"):
+        return False, url
+    # 必须严格匹配 zhuanlan /p/<digits>(/)?$ 才算真公开
+    if _ZHIHU_PUBLIC_URL_RE.match(url):
+        return True, url.rstrip("/")
+    return False, url
 
 
 async def _random_delay(lo: float = 1.0, hi: float = 3.0) -> None:
@@ -250,14 +281,31 @@ class ZhihuPublisher(PublisherBase):
                 )
 
         article_url = page.url
-        # 提取 article_id（URL 模式：zhuanlan.zhihu.com/p/<id>）
-        article_id = article_url.rstrip("/").rsplit("/", 1)[-1]
+
+        # 闭环关键：判 /edit 后缀，草稿状态不算成功，防止虚假闭环
+        is_published, normalized_url = _check_published_url(article_url)
+        if not is_published:
+            return PublishResult(
+                success=False,
+                platform_url=article_url,
+                error=f"知乎仍处于草稿状态或 URL 异常: {article_url}",
+                raw_response={
+                    "final_url": article_url,
+                    "is_published": False,
+                },
+            )
+
+        # 提取 article_id（URL 已通过严格正则，rstrip 已在 _check_published_url 内做）
+        article_id = normalized_url.rsplit("/", 1)[-1]
 
         return PublishResult(
             success=True,
             platform_post_id=article_id,
-            platform_url=article_url,
-            raw_response={"final_url": article_url},
+            platform_url=normalized_url,
+            raw_response={
+                "final_url": article_url,
+                "is_published": True,
+            },
         )
 
     async def collect_metrics(self, post_id: str, post_url, credential: dict) -> dict:

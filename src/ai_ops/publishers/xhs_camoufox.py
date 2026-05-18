@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import random
 from pathlib import Path
 from typing import Any
@@ -35,9 +34,10 @@ from ..core.db import session_scope
 from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
 from ..core.models import Account
 from ..core.schemas import PublishContent, PublishResult
+from ..observability import get_logger
 from .base import PublisherBase
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 # —— 小红书 DOM 选择器 ——
@@ -150,7 +150,13 @@ class XhsCamoufoxPublisher(PublisherBase):
         try:
             from camoufox.async_api import AsyncCamoufox
         except ImportError:
-            log.error("camoufox 未安装：pip install -U 'camoufox[geoip]' && python -m camoufox fetch")
+            log.error(
+                "camoufox 未安装",
+                extra={
+                    "event": "camoufox_missing",
+                    "hint": "pip install -U 'camoufox[geoip]' && python -m camoufox fetch",
+                },
+            )
             return False
 
         # 登录必须有窗口（扫码）
@@ -161,7 +167,10 @@ class XhsCamoufoxPublisher(PublisherBase):
             await page.goto(_URL_HOME, wait_until="domcontentloaded")
             # 已登录的话直接退出（profile 已持久化）
             if await self._is_logged_in(page):
-                log.info(f"xhs acc_{account_id} 已登录（profile 命中）")
+                log.info(
+                    "xhs login profile hit",
+                    extra={"event": "xhs_login_profile_hit", "account_id": account_id},
+                )
                 return True
             # 触发登录弹窗
             try:
@@ -172,9 +181,15 @@ class XhsCamoufoxPublisher(PublisherBase):
             for _ in range(60):
                 await asyncio.sleep(2)
                 if await self._is_logged_in(page):
-                    log.info(f"xhs acc_{account_id} 扫码登录成功")
+                    log.info(
+                        "xhs login qrcode success",
+                        extra={"event": "xhs_login_qrcode_success", "account_id": account_id},
+                    )
                     return True
-            log.warning(f"xhs acc_{account_id} 扫码超时")
+            log.warning(
+                "xhs login qrcode timeout",
+                extra={"event": "xhs_login_timeout", "account_id": account_id},
+            )
             return False
 
     async def publish(
@@ -220,7 +235,14 @@ class XhsCamoufoxPublisher(PublisherBase):
                     )
                 await self._human_browse(page, dwell_seconds=random.uniform(25, 55))
             except Exception as e:
-                log.warning(f"前置浏览失败 (不阻断): {e}")
+                log.warning(
+                    "xhs pre-browse failed (non-blocking)",
+                    extra={
+                        "event": "xhs_pre_browse_failed",
+                        "account_id": account_id,
+                        "error": str(e),
+                    },
+                )
 
             # —— 2. 走到创作页 ——
             try:
@@ -245,7 +267,14 @@ class XhsCamoufoxPublisher(PublisherBase):
                 await page.locator(_try_selectors(tab_selectors)).first.click(timeout=5000)
                 await asyncio.sleep(random.uniform(0.5, 1.5))
             except Exception:
-                log.info("tab 切换 selector 未命中，可能站点改版；继续尝试上传")
+                log.info(
+                    "xhs tab selector miss",
+                    extra={
+                        "event": "xhs_tab_selector_miss",
+                        "account_id": account_id,
+                        "is_video": is_video,
+                    },
+                )
 
             # —— 5. 上传 ——
             try:
@@ -338,7 +367,15 @@ class XhsCamoufoxPublisher(PublisherBase):
                     return AccountHealth.DEGRADED
                 return AccountHealth.HEALTHY
         except Exception as e:
-            log.warning(f"health_check 异常 acc_{account_id}: {e}")
+            log.warning(
+                "xhs health_check error",
+                extra={
+                    "event": "xhs_health_check_error",
+                    "account_id": account_id,
+                    "error": str(e),
+                },
+                exc_info=True,
+            )
             return AccountHealth.UNKNOWN
 
     # —— 内部工具 ——
@@ -403,7 +440,10 @@ class XhsCamoufoxPublisher(PublisherBase):
                 from ..content.humanize import HumanizeOptions, humanize_for_xhs
                 body = humanize_for_xhs(body, HumanizeOptions())
             except Exception as e:
-                log.warning(f"humanize 失败 (不阻断发布): {e}")
+                log.warning(
+                    "xhs humanize failed (non-blocking)",
+                    extra={"event": "xhs_humanize_failed", "error": str(e)},
+                )
         if content.tags:
             tag_line = " ".join(f"#{t.lstrip('#')}" for t in content.tags)
             body = f"{body}\n\n{tag_line}" if body else tag_line

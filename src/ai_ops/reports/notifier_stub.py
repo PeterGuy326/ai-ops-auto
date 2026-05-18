@@ -19,10 +19,11 @@
 """
 from __future__ import annotations
 
-import logging
 import sys
 
-logger = logging.getLogger(__name__)
+from ..observability import get_logger
+
+logger = get_logger(__name__)
 
 
 def report_ready(kind: str, path: str) -> None:
@@ -32,6 +33,9 @@ def report_ready(kind: str, path: str) -> None:
     本函数仅为兼容性兜底，行为：打 INFO 日志 + stderr 提示，不发飞书。
     """
     msg = f"[report_ready][stub-deprecated] kind={kind} path={path}"
-    logger.info(msg)
+    logger.info(
+        "report_ready stub invoked (deprecated)",
+        extra={"event": "report_ready_stub_deprecated", "kind": kind, "path": str(path)},
+    )
     # stderr 输出便于 cron / docker 日志中可见
     print(msg, file=sys.stderr, flush=True)

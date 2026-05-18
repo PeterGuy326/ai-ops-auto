@@ -7,7 +7,10 @@ from typing import Callable, Coroutine
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from ..observability import get_logger
 from .jitter import jitter_publish_time
+
+logger = get_logger(__name__)
 
 
 class TaskQueue:

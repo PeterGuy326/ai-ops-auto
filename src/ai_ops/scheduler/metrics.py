@@ -11,7 +11,10 @@ from ..core.db import session_scope
 from ..core.enums import Platform
 from ..core.models import Article, Metrics, PublishJob
 from ..publishers.registry import default_registry
+from ..observability import get_logger
 from .queue import queue
+
+logger = get_logger(__name__)
 
 
 # 发布后采集时间点

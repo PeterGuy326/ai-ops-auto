@@ -15,7 +15,10 @@ from ..core.db import session_scope
 from ..core.enums import AccountHealth, Platform
 from ..core.models import Account
 from ..publishers.registry import default_registry
+from ..observability import get_logger
 from .queue import queue
+
+logger = get_logger(__name__)
 
 
 async def check_all_accounts() -> dict:

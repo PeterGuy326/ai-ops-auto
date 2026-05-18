@@ -16,7 +16,11 @@ from ..core.dedup import is_too_similar
 from ..core.enums import AccountHealth, ArticleStatus, ContentType, JobStatus, Platform
 from ..core.models import Account, Article, PublishJob
 from ..core.schemas import PublishContent, PublishResult
+from ..observability import get_logger
+from ..observability.sentry import capture_exception
 from ..publishers.registry import default_registry
+
+logger = get_logger(__name__)
 
 # 发布前置兜底污点词清单（命中即 fail-fast，防止 TODO / 未替换占位符 / 错版本号溜出）。
 # 注：暂不进 config.py（Task B 在那条战线，避免合并冲突），下个 sprint 再迁移。
@@ -85,9 +89,18 @@ async def execute_job(job_id: int) -> PublishResult:
             try:
                 from ..content.asset_processor import process_images
                 content.images = process_images(content.images, job.account_id)
-            except Exception:
-                # 处理失败不阻断发布，沿用原图
-                pass
+            except Exception as e:
+                # 处理失败不阻断发布，沿用原图——但事故必须可观测，不能闷声
+                logger.warning(
+                    "worker.image_anti_fingerprint: swallowed",
+                    extra={"job_id": job.id, "account_id": job.account_id, "error": str(e)},
+                )
+                capture_exception(
+                    e,
+                    scope="worker.image_anti_fingerprint",
+                    job_id=job.id,
+                    account_id=job.account_id,
+                )
 
         job.status = JobStatus.RUNNING
         job.started_at = datetime.utcnow()
@@ -117,8 +130,13 @@ async def execute_job(job_id: int) -> PublishResult:
             try:
                 from .metrics import schedule_after_publish
                 schedule_after_publish(job.id)
-            except Exception:
-                pass  # 采集失败不影响主流程
+            except Exception as e:
+                # 采集失败不影响主流程——但必须留观测痕迹，否则飞轮长期断掉无人知
+                logger.warning(
+                    "worker.schedule_metrics: swallowed",
+                    extra={"job_id": job.id, "error": str(e)},
+                )
+                capture_exception(e, scope="worker.schedule_metrics", job_id=job.id)
             # 通知模块快照（Task B）：在 session 内拼好数据，出块后再发——
             # 避免 notify 调用失败/慢回写影响 job 状态落库
             notify_snapshot = {
@@ -154,9 +172,23 @@ async def execute_job(job_id: int) -> PublishResult:
             publish_success(notify_snapshot)
         else:
             publish_failed(notify_snapshot)
-    except Exception:
-        # 通知是辅助通道，任何异常都不能影响主业务返回值
-        pass
+    except Exception as e:
+        # 通知是辅助通道，任何异常都不能影响主业务返回值——
+        # 但通知静默失败 = 运营群再也收不到消息，必须 capture 让 Sentry 兜底告警
+        logger.warning(
+            "worker.notify: swallowed",
+            extra={
+                "job_id": job_id,
+                "kind": notify_snapshot.get("kind"),
+                "error": str(e),
+            },
+        )
+        capture_exception(
+            e,
+            scope="worker.notify",
+            job_id=job_id,
+            kind=notify_snapshot.get("kind"),
+        )
 
     return result
 

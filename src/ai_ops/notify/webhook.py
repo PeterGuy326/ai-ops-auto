@@ -11,14 +11,14 @@
 """
 from __future__ import annotations
 
-import logging
 from typing import Optional
 
 import httpx
 
 from ..config import settings
+from ..observability import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # 飞书 custom robot 最大 5s 超时；webhook 响应慢就当它没响应——不能拖死主业务
 _HTTP_TIMEOUT = 5.0
@@ -47,7 +47,12 @@ def send(text: str, *, webhook_url: Optional[str] = None) -> bool:
             resp = client.post(url, json=payload)
         if resp.status_code != 200:
             logger.warning(
-                "notify.webhook: non-200 status=%s body=%s", resp.status_code, resp.text[:200]
+                "notify.webhook: non-200",
+                extra={
+                    "event": "webhook_non_200",
+                    "status_code": resp.status_code,
+                    "body": resp.text[:200],
+                },
             )
             return False
         # 飞书 robot 返回 {"StatusCode": 0, ...} 表示成功（也可能是 code/msg 字段）
@@ -56,7 +61,14 @@ def send(text: str, *, webhook_url: Optional[str] = None) -> bool:
             # 兼容字段大小写差异（飞书 v1 返回 StatusCode/StatusMessage，v2 返回 code/msg）
             code = data.get("code", data.get("StatusCode", 0))
             if code != 0:
-                logger.warning("notify.webhook: business-fail body=%s", resp.text[:200])
+                logger.warning(
+                    "notify.webhook: business-fail",
+                    extra={
+                        "event": "webhook_business_fail",
+                        "code": code,
+                        "body": resp.text[:200],
+                    },
+                )
                 return False
         except Exception:
             # 响应非 JSON，但 HTTP 200，姑且认为成功（mock server 经常裸回 200 文本）
@@ -64,9 +76,16 @@ def send(text: str, *, webhook_url: Optional[str] = None) -> bool:
         return True
     except (httpx.RequestError, httpx.HTTPError) as e:
         # ConnectError / TimeoutException / 其他网络层失败 → 吞掉
-        logger.warning("notify.webhook: request failed: %s", e)
+        logger.warning(
+            "notify.webhook: request failed",
+            extra={"event": "webhook_request_failed", "error": str(e)},
+        )
         return False
     except Exception as e:
         # 兜底防御：任何意外都不能炸到调用方
-        logger.warning("notify.webhook: unexpected error: %s", e)
+        logger.warning(
+            "notify.webhook: unexpected error",
+            extra={"event": "webhook_unexpected_error", "error": str(e)},
+            exc_info=True,
+        )
         return False

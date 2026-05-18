@@ -52,6 +52,13 @@ SEL_COVER_PREVIEW_IMG = ".article-cover-images img"
 SEL_PUBLISH_BTN = 'button:has-text("预览并发布")'
 SEL_FINAL_CONFIRM_BTN = 'button:has-text("确认发布")'
 
+# 发布完成后去作品管理后台抓 /item/{id}/ 真实链接（publishing-sop §九 TODO 第 5 项）
+# 直接拿 page.url 只能拿到发布页 URL，不可分享、不可定位真文章，下游分析/分享全失效。
+PROFILE_ARTICLES_URL = "https://mp.toutiao.com/profile_v4/graphic/articles"
+SEL_ARTICLE_CARD = ".article-card"
+# 作品管理后台按时间倒序排列，第一个 .article-card 即最新发布的那篇
+SEL_ARTICLE_CARD_ITEM_LINK = '.article-card a[href*="/item/"]'
+
 
 async def _random_delay(lo: float, hi: float) -> None:
     """随机停顿，模拟人工节奏，规避头条节奏检测。"""
@@ -244,14 +251,52 @@ class ToutiaoPublisher(PublisherBase):
         await _random_delay(5, 8)
         url_after = page.url
 
+        # 闭环关键：跳到作品管理后台抓真实 /item/{id}/ 链接，抓不到降级到原发布页 URL
+        real_url = await self._fetch_real_post_url(page, url_after)
+
         return PublishResult(
             success=True,
-            platform_url=url_after,
+            platform_url=real_url,
             raw_response={
                 "final_url": url_after,
+                "real_url": real_url,
+                "url_resolved_from_backend": real_url != url_after,
                 "url_changed": url_after != url_before,
             },
         )
+
+    async def _fetch_real_post_url(self, page, fallback_url: str) -> str:
+        """发布完成后跳到作品管理后台抓最新一条文章的 /item/{id}/ 真实链接。
+
+        现状（修复前）：_do_publish 返回的 platform_url 是发布页 URL，
+        既不可分享、也不可用于回看/分析/外部跳转，下游全失效。
+
+        实现：作品管理后台按时间倒序排列，第一个 .article-card 卡片
+        即刚发布的那篇，从卡片里抓 href 含 /item/ 的 a 链接即可拿到真链。
+
+        失败策略：抓不到（页面结构变 / 文章还没入库 / 网络异常）→
+        降级返回 fallback_url，**不抛**——发布本身已经成功，不能因为
+        抓真链失败而把整个 publish 拖垮。
+        """
+        try:
+            await page.goto(
+                PROFILE_ARTICLES_URL,
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+            await page.wait_for_selector(SEL_ARTICLE_CARD, timeout=15000)
+            href = await page.evaluate(
+                """() => {
+                    const a = document.querySelector('.article-card a[href*="/item/"]');
+                    return a ? a.href : null;
+                }"""
+            )
+            if href:
+                return href
+        except Exception:
+            # 抓不到真链不破坏发布闭环，降级到原 URL
+            pass
+        return fallback_url
 
     async def _paste_html_to_prosemirror(self, page, html: str) -> None:
         """把 markdown 转出的 HTML 通过 ClipboardEvent 注入到 ProseMirror。

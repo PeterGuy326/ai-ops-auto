@@ -24,13 +24,13 @@
 from __future__ import annotations
 
 import functools
-import logging
 from pathlib import Path
 from typing import Any, Callable, Literal, Union
 
+from ..observability import get_logger
 from . import dedup, webhook
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # 类型别名：业务侧可以传 ORM 对象，也可以传 snapshot dict
 _JobLike = Union[Any, dict]
@@ -50,7 +50,11 @@ def _safe(fn: Callable) -> Callable:
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            logger.warning("notify.%s: swallowed exception: %s", fn.__name__, e)
+            logger.warning(
+                "notify event swallowed exception",
+                extra={"event": fn.__name__, "error": str(e)},
+                exc_info=True,
+            )
             return None
 
     return wrapper
