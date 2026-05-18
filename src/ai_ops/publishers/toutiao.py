@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import random
-import re
 
 from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
 from ..core.schemas import PublishContent, PublishResult

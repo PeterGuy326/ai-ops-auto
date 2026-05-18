@@ -184,6 +184,24 @@ async def execute_job(job_id: int) -> PublishResult:
                 job.status = JobStatus.DEAD
                 # 失败联动：先降级到 DEGRADED；近 24h 内连续 3 次 DEAD → 升级到 BANNED
                 _escalate_health_on_failure(s, job.account_id)
+                # 自动重发钩子（publishing-sop §五 / §八"笔记发了发现内容错"自动通道）：
+                # 默认关（AUTO_REPUBLISH_ON_DEAD=False）——避免 publisher 真挂时无限建 v2 → v3 → ...
+                # 风暴。本钩子仅"建 v2 + 标 v1 superseded"，**不真触发 v2 执行**：
+                # 让 scheduler.queue 按既有节奏拉起，复用风控 / 限流 / dedup 全套兜底。
+                # 异常吞 + capture：自动重发是辅助通道，挂了不能拖累 job 状态本身的落库。
+                if AUTO_REPUBLISH_ON_DEAD:
+                    try:
+                        v2 = republish_job(s, job.id, reason="auto_retry_exhausted")
+                        logger.info(
+                            "worker.auto_republish: created v2",
+                            extra={"old_job_id": job.id, "new_job_id": v2.id},
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "worker.auto_republish: swallowed",
+                            extra={"job_id": job.id, "error": str(e)},
+                        )
+                        capture_exception(e, scope="worker.auto_republish", job_id=job.id)
             # 通知模块快照（Task B）：失败也快照，session 外调 notify.publish_failed
             notify_snapshot = {
                 "kind": "failed",
@@ -485,4 +503,87 @@ def _mark_job_superseded(session, old_job_id: int, new_job_id: int) -> bool:
     old.superseded_by_job_id = new_job_id
     session.flush()
     return True
+
+
+# ---------------------------------------------------------------------------
+# 重发覆盖主流程（publishing-sop §五"重发覆盖语义" / §八风险表）
+# ---------------------------------------------------------------------------
+
+# 自动重发开关：默认关。打开 = execute_job 把 attempts >= max_attempts 的 job 标 DEAD 后
+# 自动建 v2 PublishJob（v1.superseded_by_job_id 指向 v2）。
+#
+# 默认关的原因：
+#   - publisher 真坏掉时（cookies 失效 / 平台改版 / 网络断），重试只会无限建 v2 → v3 → ...
+#     形成风暴，反而把账号刷成 BANNED；
+#   - 自动重发应该被外层"健康度评估 + 人工 review"门控；
+#   - 运营拿到失败告警后手动调 POST /jobs/{id}/republish 才是当前推荐路径。
+#
+# 何时打开：accounts.health_monitor 接入"按账号自动判断是否值得重发"之后（follow-up）。
+AUTO_REPUBLISH_ON_DEAD = False
+
+# 允许重发的旧 job 状态白名单：只有真"跑挂了"的 job 才允许覆盖重发。
+# - SUCCESS：已发布成功，重发 = 重复发，应走平台手动删 + 重新建 article 路径
+# - PENDING / RUNNING / RETRYING：job 还在进行中，重发会形成竞态（多个 worker 抢同一 article）
+# 只放行 FAILED / DEAD —— 前者是单轮失败、后者是耗尽重试。
+_REPUBLISHABLE_STATUSES = (JobStatus.FAILED, JobStatus.DEAD)
+
+
+def republish_job(session, old_job_id: int, *, reason: str = "manual") -> PublishJob:
+    """基于失败的旧 PublishJob 创建 v2，并把旧 job 标记为 superseded。
+
+    主流程入口（publishing-sop §五"重发覆盖语义"的物理载体）：
+      - 人工触发：POST /jobs/{id}/republish（运营 UI 按钮）→ reason="manual"
+      - 自动触发：execute_job 在 max_attempts 耗尽时调（AUTO_REPUBLISH_ON_DEAD=True 时）
+        → reason="auto_retry_exhausted"
+
+    本函数只"建 v2 + 标 v1 superseded"，**不真触发 v2 执行**——让 scheduler 拉起，
+    复用现有风控 / 限流 / dedup / 健康度评估全套兜底，避免重发流程绕开主路径。
+
+    Args:
+        session: SQLAlchemy session（**不在函数内 commit**，commit 由调用方的 session_scope
+            / API 的 get_session 统一管；保持 helper 薄）
+        old_job_id: 被覆盖的旧 PublishJob.id（必须存在且 status ∈ {FAILED, DEAD}）
+        reason: 重发原因，写入 v2.raw_response["republish_reason"]，用于运营复盘。
+            约定值："manual" | "auto_retry_exhausted"；其它字符串也接受（向前兼容）
+
+    Returns:
+        新建的 v2 PublishJob 实例（已 add 进 session 并 flush，id 已分配）
+
+    Raises:
+        ValueError: 旧 job 不存在 / 状态不在白名单。调用方负责转译为 HTTP 400 等。
+
+    数据契约（v2 vs v1）：
+      - 复用：article_id / account_id / platform / publisher_kind / max_attempts
+      - 重置：status=PENDING, attempts=0, started_at/finished_at/platform_*/error=None
+      - 新写：raw_response = {"republish_reason": reason, "republished_from": old_id}
+      - 关联：v1.superseded_by_job_id = v2.id（via _mark_job_superseded）
+    """
+    old = session.get(PublishJob, old_job_id)
+    if old is None:
+        raise ValueError(f"job {old_job_id} not found")
+
+    if old.status not in _REPUBLISHABLE_STATUSES:
+        raise ValueError(
+            f"can only republish FAILED/DEAD jobs, got {old.status}"
+        )
+
+    new_job = PublishJob(
+        article_id=old.article_id,
+        account_id=old.account_id,
+        platform=old.platform,
+        publisher_kind=old.publisher_kind,
+        status=JobStatus.PENDING,
+        attempts=0,
+        max_attempts=old.max_attempts,
+        raw_response={
+            "republish_reason": reason,
+            "republished_from": old.id,
+        },
+    )
+    session.add(new_job)
+    session.flush()  # 拿 new_job.id
+
+    # 标 v1 superseded（helper 自带"老 job 不存在则降级"，但此处老 job 100% 存在）
+    _mark_job_superseded(session, old.id, new_job.id)
+    return new_job
 

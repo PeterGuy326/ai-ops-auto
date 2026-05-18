@@ -72,14 +72,14 @@ def build_default_registry() -> PublisherRegistry:
     from .baijiahao import BaijiahaoPublisher
     reg.register(Platform.BAIJIAHAO, BaijiahaoPublisher, priority=10)
 
+    # 搜狐号（Round 2B）— 开源缺口，自建；搜狐媒体矩阵，与百家号/头条号并列
+    # TD-2A-1 闭环（Round 4-P3）：从文件末尾 default_registry.register(...) 搬到此处，
+    # 让任何 build_default_registry() 调用都包含 SOHUHAO（之前只有 module 级
+    # default_registry 才装上，新建 registry 实例会丢）。
+    from .sohuhao import SohuhaoPublisher
+    reg.register(Platform.SOHUHAO, SohuhaoPublisher, priority=10)
+
     return reg
 
 
 default_registry = build_default_registry()
-
-
-# ---------------- Round 2B 增量：搜狐号 ----------------
-# 与 baijiahao Round 2A 并行 P7 任务，物理分区在 registry.py 末尾各加各的注册块，
-# 互不干涉、互不重复 import；git merge 时按"先后追加"语义保留两块即可。
-from .sohuhao import SohuhaoPublisher  # noqa: E402
-default_registry.register(Platform.SOHUHAO, SohuhaoPublisher, priority=10)

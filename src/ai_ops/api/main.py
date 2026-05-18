@@ -49,6 +49,36 @@ async def lifespan(app: FastAPI):
         # observability 自身炸了不能阻塞主启动；裸 print 兜底（此时日志可能未就绪）
         import sys
         print(f'[startup] observability init failed (swallowed): {e}', file=sys.stderr)
+
+    # === DEPLOY-CHECK · 启动期非阻塞自检 ===
+    # 底层逻辑：生产环境最常见的"启动起来但配错了"——FERNET_KEY/API_KEY 没设——
+    # 不能 raise（会让 dev / pytest 全废，运维也没机会进容器排查），
+    # 但必须显眼 log 提示，否则运维不知道。结构化日志已就绪，warning 级别能进 ELK。
+    try:
+        from ..config import settings as _deploy_settings
+        from ..observability import get_logger as _deploy_get_logger
+        _deploy_logger = _deploy_get_logger("ai_ops.deploy_check")
+        if not (_deploy_settings.fernet_key or "").strip():
+            _deploy_logger.error(
+                "[DEPLOY-CHECK] FERNET_KEY 未设置！cookies/凭证加密依赖此密钥，"
+                "生产环境必须通过 env FERNET_KEY=... 注入。生成命令："
+                "python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'"
+            )
+        if not (_deploy_settings.api_key or "").strip():
+            _deploy_logger.warning(
+                "[DEPLOY-CHECK] API_KEY 未设置 —— 当前为 dev 自动放行模式，"
+                "生产环境必须设非空值（X-API-Key 鉴权），否则任何人可写数据。"
+            )
+        if not (_deploy_settings.feishu_webhook_url or "").strip():
+            _deploy_logger.warning(
+                "[DEPLOY-CHECK] FEISHU_WEBHOOK_URL 未设置 —— 失败/风控告警不会通知，"
+                "运维变盲人。建议配上群机器人 webhook（详见 docs/deployment.md §8.2）"
+            )
+    except Exception as _deploy_err:
+        # 自检自己炸了绝不能阻塞启动 —— 裸 print 兜底
+        import sys as _sys
+        print(f"[DEPLOY-CHECK] self-check failed (swallowed): {_deploy_err}", file=_sys.stderr)
+
     init_db()
     queue.start()
     try:
@@ -293,6 +323,42 @@ async def api_run_job(job_id: int):
     """同步触发一个 PublishJob（用于调试 / 手动重跑）。"""
     result = await execute_job(job_id)
     return result.model_dump()
+
+
+@app.post(
+    "/jobs/{job_id}/republish",
+    response_model=JobOut,
+    dependencies=[Depends(require_api_key)],
+)
+def api_republish_job(job_id: int, s: Session = Depends(get_session)):
+    """重发覆盖（publishing-sop §五）：基于失败 job 创建 v2 + 标 v1 superseded。
+
+    - 入参：旧 job_id（必须 status ∈ {FAILED, DEAD}）
+    - 行为：建 v2（status=PENDING）+ v1.superseded_by_job_id ← v2.id；**不立刻执行 v2**，
+      由 scheduler 按现有节奏拉起，复用风控 / 限流 / dedup 全套兜底。
+    - 错误：旧 job 不存在 / 状态不允许重发 → 400
+    """
+    from ..scheduler.worker import republish_job
+
+    try:
+        new_job = republish_job(s, job_id, reason="manual")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return JobOut(
+        id=new_job.id,
+        article_id=new_job.article_id,
+        account_id=new_job.account_id,
+        platform=new_job.platform,
+        status=new_job.status,
+        attempts=new_job.attempts,
+        platform_post_id=new_job.platform_post_id,
+        platform_url=new_job.platform_url,
+        error=new_job.error,
+        scheduled_at=new_job.scheduled_at,
+        started_at=new_job.started_at,
+        finished_at=new_job.finished_at,
+    )
 
 
 @app.post("/jobs/{job_id}/collect", dependencies=[Depends(require_api_key)])

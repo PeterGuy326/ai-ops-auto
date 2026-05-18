@@ -1,5 +1,7 @@
 # ai-ops-auto
 
+> 生产部署见 [docs/deployment.md](docs/deployment.md) —— Dockerfile + 环境变量清单 + alembic upgrade head SOP。
+
 AI 运营自动化中台。一句话：**内容生产 → 视频剪辑 → 多平台多账号分发** 全链路自动化。
 
 > 本项目是 **编排层**，发布和剪辑都集成成熟开源工具，不重复造轮子。
