@@ -17,6 +17,8 @@ from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..accounts import manager as account_mgr
+from ..observability import init_observability
+from .auth import require_api_key
 from ..content import manager as content_mgr
 from ..core.db import SessionLocal, init_db
 from ..core.enums import ArticleStatus, JobStatus, Platform
@@ -40,6 +42,13 @@ from ..scheduler.worker import execute_job
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Task G · 可观测性必须最先初始化，确保后续 init_db / queue 的日志走结构化通道
+    try:
+        init_observability()
+    except Exception as e:
+        # observability 自身炸了不能阻塞主启动；裸 print 兜底（此时日志可能未就绪）
+        import sys
+        print(f'[startup] observability init failed (swallowed): {e}', file=sys.stderr)
     init_db()
     queue.start()
     try:
@@ -98,12 +107,12 @@ def get_session() -> Session:
 
 # ---------------- Topics ----------------
 
-@app.post("/topics", response_model=TopicOut)
+@app.post("/topics", response_model=TopicOut, dependencies=[Depends(require_api_key)])
 def api_create_topic(data: TopicIn, s: Session = Depends(get_session)):
     return content_mgr.create_topic(s, data)
 
 
-@app.get("/topics", response_model=list[TopicStats])
+@app.get("/topics", response_model=list[TopicStats], dependencies=[Depends(require_api_key)])
 def api_list_topics(s: Session = Depends(get_session)):
     """带 account_count / article_count 统计的 topic 列表。
 
@@ -113,7 +122,7 @@ def api_list_topics(s: Session = Depends(get_session)):
     return content_mgr.list_topic_stats(s)
 
 
-@app.patch("/topics/{topic_id}", response_model=TopicOut)
+@app.patch("/topics/{topic_id}", response_model=TopicOut, dependencies=[Depends(require_api_key)])
 def api_update_topic(topic_id: int, data: TopicUpdate, s: Session = Depends(get_session)):
     try:
         return content_mgr.update_topic(s, topic_id, data)
@@ -123,7 +132,7 @@ def api_update_topic(topic_id: int, data: TopicUpdate, s: Session = Depends(get_
 
 # ---------------- Articles ----------------
 
-@app.get("/articles", response_model=list[ArticleOut])
+@app.get("/articles", response_model=list[ArticleOut], dependencies=[Depends(require_api_key)])
 def api_list_articles(
     limit: int = 100,
     topic_id: Optional[int] = None,
@@ -132,12 +141,12 @@ def api_list_articles(
     return content_mgr.list_articles(s, limit=limit, topic_id=topic_id)
 
 
-@app.post("/articles", response_model=ArticleOut)
+@app.post("/articles", response_model=ArticleOut, dependencies=[Depends(require_api_key)])
 def api_create_article(data: ArticleIn, s: Session = Depends(get_session)):
     return content_mgr.create_article(s, data)
 
 
-@app.post("/articles/{article_id}/transition", response_model=ArticleOut)
+@app.post("/articles/{article_id}/transition", response_model=ArticleOut, dependencies=[Depends(require_api_key)])
 def api_transition_article(
     article_id: int,
     target: ArticleStatus,
@@ -151,12 +160,12 @@ def api_transition_article(
 
 # ---------------- Accounts ----------------
 
-@app.post("/accounts", response_model=AccountOut)
+@app.post("/accounts", response_model=AccountOut, dependencies=[Depends(require_api_key)])
 def api_create_account(data: AccountIn, s: Session = Depends(get_session)):
     return account_mgr.create_account(s, data)
 
 
-@app.get("/accounts", response_model=list[AccountOut])
+@app.get("/accounts", response_model=list[AccountOut], dependencies=[Depends(require_api_key)])
 def api_list_accounts(
     platform: Optional[Platform] = None,
     topic_id: Optional[int] = None,
@@ -165,7 +174,7 @@ def api_list_accounts(
     return account_mgr.list_accounts(s, platform=platform, by_topic=topic_id)
 
 
-@app.patch("/accounts/{account_id}", response_model=AccountOut)
+@app.patch("/accounts/{account_id}", response_model=AccountOut, dependencies=[Depends(require_api_key)])
 def api_update_account(account_id: int, data: AccountUpdate, s: Session = Depends(get_session)):
     try:
         return account_mgr.update_account(s, account_id, data)
@@ -173,14 +182,14 @@ def api_update_account(account_id: int, data: AccountUpdate, s: Session = Depend
         raise HTTPException(404, str(e))
 
 
-@app.delete("/accounts/{account_id}")
+@app.delete("/accounts/{account_id}", dependencies=[Depends(require_api_key)])
 def api_delete_account(account_id: int, s: Session = Depends(get_session)):
     if not account_mgr.delete_account(s, account_id):
         raise HTTPException(404, f"account {account_id} 不存在")
     return {"ok": True, "deleted": account_id}
 
 
-@app.post("/accounts/import")
+@app.post("/accounts/import", dependencies=[Depends(require_api_key)])
 def api_import_accounts(items: list[AccountIn], s: Session = Depends(get_session)):
     """批量导入账号（从 cookie 文件 / 其它系统迁移过来时用）。"""
     created = []
@@ -193,7 +202,7 @@ def api_import_accounts(items: list[AccountIn], s: Session = Depends(get_session
     return {"created": len(created), "failed": failed, "ids": [a.id for a in created]}
 
 
-@app.post("/accounts/{account_id}/login")
+@app.post("/accounts/{account_id}/login", dependencies=[Depends(require_api_key)])
 async def api_login_account(account_id: int):
     """触发 publisher.login()，启动扫码流程。
 
@@ -238,7 +247,7 @@ async def api_login_account(account_id: int):
     return {"ok": ok, "account_id": account_id}
 
 
-@app.get("/accounts/{account_id}/dispatch-preview")
+@app.get("/accounts/{account_id}/dispatch-preview", dependencies=[Depends(require_api_key)])
 def api_dispatch_preview(account_id: int, count: int = 1, s: Session = Depends(get_session)):
     """预览分发结果（不实际发布），用于 UI 上验证策略。
 
@@ -256,7 +265,7 @@ def api_dispatch_preview(account_id: int, count: int = 1, s: Session = Depends(g
 
 # ---------------- Jobs ----------------
 
-@app.get("/jobs", response_model=list[JobOut])
+@app.get("/jobs", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
 def api_list_jobs(limit: int = 100, s: Session = Depends(get_session)):
     return [
         JobOut(
@@ -279,21 +288,21 @@ def api_list_jobs(limit: int = 100, s: Session = Depends(get_session)):
     ]
 
 
-@app.post("/jobs/{job_id}/run")
+@app.post("/jobs/{job_id}/run", dependencies=[Depends(require_api_key)])
 async def api_run_job(job_id: int):
     """同步触发一个 PublishJob（用于调试 / 手动重跑）。"""
     result = await execute_job(job_id)
     return result.model_dump()
 
 
-@app.post("/jobs/{job_id}/collect")
+@app.post("/jobs/{job_id}/collect", dependencies=[Depends(require_api_key)])
 async def api_collect_metrics(job_id: int):
     """手动触发一次数据采集（不等飞轮调度）。"""
     from ..scheduler.metrics import collect_one
     return await collect_one(job_id)
 
 
-@app.get("/topics/heat-rank")
+@app.get("/topics/heat-rank", dependencies=[Depends(require_api_key)])
 def api_heat_rank(limit: int = 10, s: Session = Depends(get_session)):
     """按 heat_score 倒排取热门主题（数据回流飞轮的反馈输入）。"""
     from ..content.heat_engine import top_topics

@@ -81,5 +81,20 @@ class Settings(BaseSettings):
     # 滑窗内第 N 次聚合放行（首条 + 第 N 次 = 5 min 内最多 2 条，对齐 publishing-sop §八）
     notify_dedup_threshold: int = 3
 
+    # ====== Task F · API 鉴权 ======
+    # 写操作 / 敏感读路由的 X-API-Key 校验值；空字符串 = dev 模式自动放行（仅本地调试用）。
+    # 生产部署必须设非空值，且通过 env (API_KEY=...) 注入，避免落 .env 仓库。
+    api_key: str = ""
+
+    # ====== Task G · 可观测性 ======
+    # Sentry DSN；空 = 不启用 Sentry（sentry-sdk 为软依赖，未装也不报错）
+    sentry_dsn: str = ""
+    # Sentry environment 标签（dev / staging / prod）
+    sentry_environment: str = "dev"
+    # 日志格式：text = 人类可读（默认，本地调试友好）；json = 结构化（生产推荐，配 ELK/Datadog）
+    log_format: Literal["text", "json"] = "text"
+    # 日志级别：DEBUG / INFO / WARNING / ERROR
+    log_level: str = "INFO"
+
 
 settings = Settings()
