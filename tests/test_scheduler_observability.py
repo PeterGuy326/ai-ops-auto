@@ -226,10 +226,21 @@ class TestHealthObservabilityHooks:
 def _mk_metrics_job(SessionLocal):
     """构造一个 collect_one 能跑到 metric_count==2 节点的 job。
 
-    需要先塞 1 条已存在的 Metrics（让本次 collect 后 count=2），
-    job 必须有 platform_post_id。
+    TD-Z3-followup-A 后语义升级：metric_count 改基于"真实时间窗"
+    （Metrics.collected_at > job.finished_at + 30min）而非裸计数。
+    fixture 需配合：
+      - job.finished_at 显式设过去时间（让 cutoff 有锚点）
+      - 预塞的 metric.collected_at 显式设在 cutoff 之后（模拟"已经跑过的飞轮采集"，
+        不是 initial 行）
+      - collect_one 本次写的新 metric collected_at 默认 _now() > cutoff → count == 2 触发
     """
+    from datetime import datetime, timedelta
+
     from ai_ops.core.models import Metrics
+
+    # 把 job 锚点设到足够过去：保证 cutoff = finished_at + 30min 也仍是过去时间
+    now = datetime.utcnow()
+    finished_at = now - timedelta(hours=2)
 
     with SessionLocal() as s:
         topic = Topic(name="t", keywords=[], persona={}, target_platforms=[])
@@ -263,11 +274,22 @@ def _mk_metrics_job(SessionLocal):
             max_attempts=3,
             platform_post_id="post_123",
             platform_url="http://x/post_123",
+            started_at=finished_at - timedelta(minutes=2),
+            finished_at=finished_at,
         )
         s.add(job)
         s.flush()
-        # 已经有 1 条 metric，本次 collect 后 count=2 触发 health_eval
-        s.add(Metrics(job_id=job.id, likes=0, comments=0, shares=0, views=0, raw={}))
+        # 已经跑过 1 次飞轮采集（collected_at 在 cutoff 之后，模拟 1h 飞轮已落库）；
+        # 本次 collect_one 跑完后 count 应为 2，触发 health_eval。
+        s.add(Metrics(
+            job_id=job.id,
+            likes=0,
+            comments=0,
+            shares=0,
+            views=0,
+            collected_at=finished_at + timedelta(hours=1),
+            raw={},
+        ))
         s.commit()
         return job.id, article.id
 

@@ -57,10 +57,27 @@ async def collect_one(job_id: int) -> dict:
         )
         s.add(m)
         s.flush()
-        # 数到这是该 job 累计第几条 metric——第 2 条 = 24h 节点（1h/24h/7d 三次采集）
-        metric_count = (
-            s.query(Metrics).filter(Metrics.job_id == job_id).count()
-        )
+        # 触发节点判定：用"真实时间窗"代替"metric 计数"——
+        # TD-Z3 后 Metrics 表会有 initial 行（≈ job.finished_at，publish 完成瞬间落库），
+        # 飞轮采集（1h/24h/7d）的 collected_at 是飞轮真正跑的时刻；
+        # 取 finished_at + 30min 做 cutoff，只数飞轮采集、排除 initial 行——
+        # 30min 阈值兼顾调度抖动（1h 飞轮可能 ±10 分钟跑）；
+        # 否则 publish + 1h 就会被误判为 24h 节点，刚发 1h 数据没起来就误降权 / 暂停账号。
+        job = s.get(PublishJob, job_id)
+        job_anchor = (job.finished_at or job.created_at) if job is not None else None
+        if job_anchor is not None:
+            cutoff = job_anchor + timedelta(minutes=30)
+            metric_count = (
+                s.query(Metrics)
+                .filter(Metrics.job_id == job_id, Metrics.collected_at > cutoff)
+                .count()
+            )
+        else:
+            # 极端兜底：job 被并发删 / 时间字段全空。退回旧行为不阻塞主流程；
+            # 这条路径理论不可达（能跑到 collect_one 的 job 都已 finished）。
+            metric_count = (
+                s.query(Metrics).filter(Metrics.job_id == job_id).count()
+            )
 
     # 24h 节点：触发健康度评估（曝光异常 → 降级 + 暂停）
     if metric_count == 2:

@@ -14,11 +14,16 @@ from ..accounts.manager import check_rate_limit, get_credential, mark_published,
 from ..core.db import session_scope
 from ..core.dedup import is_too_similar
 from ..core.enums import AccountHealth, ArticleStatus, ContentType, JobStatus, Platform
-from ..core.models import Account, Article, PublishJob
+from ..core.models import Account, Article, Metrics, PublishJob
 from ..core.schemas import PublishContent, PublishResult
 from ..observability import get_logger
 from ..observability.sentry import capture_exception
 from ..publishers.registry import default_registry
+# _parse_count 复用 toutiao publisher 已经验证的 UI 数字解析（"1.2万" / "3.5k" → int）。
+# 当前 publisher 侧只有 toutiao 把 initial_metadata 塞进 raw_response，且字段是字符串；
+# 复用比重写一遍稳。TODO[debt]: 后续若 ≥2 个 publisher 都返 initial_metadata，
+# 把 _parse_count 上移到 core/parsers.py，解除 worker → toutiao 反向依赖。
+from ..publishers.toutiao import _parse_count
 
 logger = get_logger(__name__)
 
@@ -121,6 +126,28 @@ async def execute_job(job_id: int) -> PublishResult:
             job.platform_url = result.platform_url
             job.raw_response = result.raw_response
             mark_published(s, job.account_id)
+
+            # 闭环最后一公里：把 publisher 主动塞进 raw_response 的第一份指标快照落库。
+            # 不接入 = publisher 白做；接入后 dashboard / report 立刻有数（不用等 1h 飞轮）。
+            # 同 session 内 add，依靠 session_scope commit。
+            # 双层防御：helper 内已 try/except + capture；这里再套一层，防 helper
+            # 被未来重构 / mock 替换破坏自吞契约后把 publish 主流程拖垮
+            try:
+                _persist_initial_metrics(
+                    s,
+                    job.id,
+                    (result.raw_response or {}).get("initial_metadata") or {},
+                )
+            except Exception as e:
+                logger.warning(
+                    "worker.persist_initial_metrics_outer: swallowed",
+                    extra={"job_id": job.id, "error": str(e)},
+                )
+                capture_exception(
+                    e,
+                    scope="worker.persist_initial_metrics_outer",
+                    job_id=job.id,
+                )
 
             article = s.get(Article, job.article_id)
             if article and article.status == ArticleStatus.PUBLISHING:
@@ -316,3 +343,97 @@ def _pre_publish_check(
         )
 
     return True, None
+
+
+# ---------------------------------------------------------------------------
+# initial_metadata → Metrics 落库（TD-Z3, 2026 Q2）
+# ---------------------------------------------------------------------------
+
+
+def _coerce_count(value) -> int:
+    """把 initial_metadata 里的 count 字段统一收敛为 int。
+
+    宽容输入：
+      - int → 直接返回（其他 publisher 后续可能直接返 int）
+      - str → 走 _parse_count（兼容 "1.2万" / "3.5k" 等 UI 缩写，头条当前路径）
+      - None / 其他 → 0
+    """
+    if isinstance(value, bool):
+        # bool 是 int 子类，必须先排除——不然 True/False 会被当 1/0 静默吃掉
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return _parse_count(value)
+    return 0
+
+
+def _persist_initial_metrics(
+    session,
+    job_id: int,
+    initial_metadata: dict,
+) -> "Metrics | None":
+    """publish 成功后落第一份 Metrics 快照。
+
+    数据流闭环：publisher._do_publish 抓到的 view/comment/like 已塞进
+    raw_response["initial_metadata"]——本函数把它真正写到 Metrics 表，
+    省下游 collect_metrics 飞轮 1h 后才出第一份数据的等待窗口。
+
+    Args:
+        session: SQLAlchemy session（worker 已持有；这里不开新连接、不 commit，
+            commit 由 worker 外层 session_scope 统一管）。
+        job_id: PublishJob.id，作为 Metrics.job_id 外键。
+        initial_metadata: publisher 塞进 raw_response 的 dict，常见字段：
+            {url, view_count, comment_count, like_count, share_count, publish_time}
+            字段值可能是 int 或 UI 字符串（如 "1.2万"），统一走 _coerce_count 收敛。
+
+    Returns:
+        Metrics 实例（已 add 进 session），或 None（数据为空 / 全 0 / 异常）。
+
+    短路策略：
+      - initial_metadata 为空 dict → 返回 None（其它 publisher 不返 metadata 即此路径）
+      - 所有计数都解析为 0 → 返回 None（避免污染数据；下游飞轮 1h 后还会跑）
+
+    容错策略：
+      - 任何异常 → logger.warning + capture_exception + 返回 None
+      - publish 主流程不受影响（哪怕 Metrics 表写挂了，job 已落 SUCCESS）
+    """
+    if not initial_metadata:
+        return None
+
+    try:
+        views = _coerce_count(initial_metadata.get("view_count"))
+        likes = _coerce_count(initial_metadata.get("like_count"))
+        comments = _coerce_count(initial_metadata.get("comment_count"))
+        shares = _coerce_count(initial_metadata.get("share_count"))
+
+        if views == 0 and likes == 0 and comments == 0 and shares == 0:
+            # 全 0 → 不落库。这是新发布常态（刚发出去还没人看到），让飞轮 1h 后再落
+            # 第一行非 0 数据；避免 dashboard 看到"发了 = 全 0"的歧义信号
+            return None
+
+        metric = Metrics(
+            job_id=job_id,
+            views=views,
+            likes=likes,
+            comments=comments,
+            shares=shares,
+            raw=dict(initial_metadata),  # 浅拷贝隔离，避免后续修改 raw_response 时联动
+        )
+        session.add(metric)
+        session.flush()
+        return metric
+    except Exception as e:
+        # 落库失败不影响 publish 主流程——但飞轮永远 1h 后才有第一份数据 = 仪表盘
+        # 体感差。必须 capture 让 Sentry 兜底告警
+        logger.warning(
+            "worker.persist_initial_metrics: swallowed",
+            extra={"job_id": job_id, "error": str(e)},
+        )
+        capture_exception(
+            e,
+            scope="worker.persist_initial_metrics",
+            job_id=job_id,
+        )
+        return None
+
