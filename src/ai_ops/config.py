@@ -110,4 +110,12 @@ class Settings(BaseSettings):
     lark_cli_timeout_seconds: int = 15
 
 
+    # ====== Round 5 · schema 漂移自检 ======
+    # 应用进程内是否在 lifespan startup 自动跑 alembic upgrade head。
+    # 生产默认 False —— prod 走 Dockerfile entrypoint 的 subprocess alembic upgrade
+    # （已稳定），应用进程不该擅自动 schema（会绕过运维审批 + 多进程并发竞争）。
+    # dev 可设 AUTO_UPGRADE_DB=true 让本地 uvicorn 启动期自愈，避免开发者
+    # git pull 拿到新 model 后启动直接炸（Round 5 事故重现）。
+    auto_upgrade_db: bool = False
+
 settings = Settings()

@@ -79,6 +79,53 @@ async def lifespan(app: FastAPI):
         import sys as _sys
         print(f"[DEPLOY-CHECK] self-check failed (swallowed): {_deploy_err}", file=_sys.stderr)
 
+    # === SCHEMA-CHECK · Round 5 启动期 schema 漂移自检 + 自动升级 ===
+    # 底层逻辑：dev/prod schema parity。早期 dev DB 是 `Base.metadata.create_all()` 建的，
+    # 后续 model 加字段后 create_all 不会自动 ALTER，启动 INSERT 直接炸（Round 5 P9 事故重现）。
+    # 生产已由 Dockerfile entrypoint 自动跑 alembic upgrade head 兜底（auto_upgrade_db=False 默认）；
+    # dev 设 AUTO_UPGRADE_DB=true 后此处自动愈合。与 DEPLOY-CHECK 一致：**不 raise**，
+    # 启动继续，但日志显眼，开发者第一时间能看到。
+    try:
+        from ..core.db import check_schema_drift as _check_schema_drift
+        from ..core.db import try_auto_upgrade as _try_auto_upgrade
+        from ..config import settings as _schema_settings
+        from ..observability import get_logger as _schema_get_logger
+        _schema_logger = _schema_get_logger("ai_ops.schema_check")
+        _drift = _check_schema_drift()
+        if _drift["in_sync"]:
+            _schema_logger.info(
+                "[SCHEMA-CHECK] schema 与 code 对齐 (rev=%s)", _drift["code_head"]
+            )
+        elif _schema_settings.auto_upgrade_db:
+            _schema_logger.warning(
+                "[SCHEMA-CHECK] schema 漂移：db=%s code=%s missing=%s，"
+                "auto_upgrade_db=True，尝试自动升级…",
+                _drift["db_head"], _drift["code_head"], _drift["missing_migrations"],
+            )
+            _up = _try_auto_upgrade()
+            if _up["ok"]:
+                _schema_logger.warning(
+                    "[SCHEMA-CHECK] 已自动升级 schema %s -> %s（dev 模式）",
+                    _up["from_rev"], _up["to_rev"],
+                )
+            else:
+                _schema_logger.error(
+                    "[SCHEMA-CHECK] 自动升级失败 (reason=%s, error=%s)，启动可能炸，"
+                    "运维请手动跑：alembic upgrade head",
+                    _up["reason"], _up["error"],
+                )
+        else:
+            _schema_logger.error(
+                "[SCHEMA-CHECK] schema 漂移：DB 在 %s，代码在 %s，待跑 migration: %s。"
+                "请跑 `alembic upgrade head`（生产）或设 AUTO_UPGRADE_DB=true 后重启（dev）。"
+                "启动继续，但相关表的 INSERT/SELECT 可能直接炸（详见 docs/deployment.md）。",
+                _drift["db_head"], _drift["code_head"], _drift["missing_migrations"],
+            )
+    except Exception as _schema_err:
+        # 自检自己炸了绝不阻塞启动 —— 裸 print 兜底（与 DEPLOY-CHECK 一致）
+        import sys as _sys
+        print(f"[SCHEMA-CHECK] self-check failed (swallowed): {_schema_err}", file=_sys.stderr)
+
     init_db()
     queue.start()
     try:
