@@ -75,47 +75,12 @@ ARTICLE_CARD_COMMENT_SELECTOR = ".article-card-data-comment"
 ARTICLE_CARD_LIKE_SELECTOR = ".article-card-data-like"
 
 
-# ---------------- 数字解析（头条 UI 把大数缩写为 "1.2万" / "3.5k"）----------------
-_COUNT_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*([万亿wWkK]?)")
-
-
-def _parse_count(text) -> int:
-    """把头条 UI 显示的计数文本解析成 int。
-
-    支持格式：
-      "1234"   -> 1234
-      "1.2万"  -> 12000
-      "3.5k"   -> 3500
-      "3.5K"   -> 3500
-      "1.2w"   -> 12000
-      "2亿"    -> 200000000
-      "  234 " -> 234（容忍前后空格）
-      None / "" / "abc" / "--" -> 0（统一降级，不抛）
-
-    设计原则：头条 UI 显示精度就是 1.2 万（12000），业务接受这个精度——
-    抓取的指标本就是估算值，不追求 sub-thousand 精确度。
-    任何无法解析的输入返回 0，调用方不需要 try/catch。
-    """
-    if text is None:
-        return 0
-    s = str(text).strip()
-    if not s:
-        return 0
-    m = _COUNT_RE.search(s)
-    if not m:
-        return 0
-    try:
-        num = float(m.group(1))
-    except (ValueError, TypeError):
-        return 0
-    unit = m.group(2).lower()
-    if unit in ("万", "w"):
-        num *= 10000
-    elif unit == "k":
-        num *= 1000
-    elif unit == "亿":
-        num *= 100000000
-    return int(num)
+# ---------------- 数字解析（统一沉到 core/parsers，保留别名兼容旧调用方）----------------
+# TD-Z3-debt 闭环（2026 Q2）：通用 UI 数字解析逻辑搬到 core/parsers.py 作为基础设施层，
+# 让 scheduler 也能正向 import，解除 worker → toutiao 反向依赖。
+# 这里保留 `_parse_count` 别名 → 模块内 4 处调用 + tests/test_toutiao_publisher.py
+# 的 `from ai_ops.publishers.toutiao import _parse_count` 全部零改动继续工作。
+from ..core.parsers import parse_count as _parse_count  # noqa: E402,F401
 
 
 async def _random_delay(lo: float, hi: float) -> None:

@@ -21,9 +21,36 @@ logger = get_logger(__name__)
 # 发布后采集时间点
 DEFAULT_INTERVALS_SECONDS = (3600, 86400, 604800)  # 1h / 24h / 7d
 
+# 24h 健康度评估触发节点对应的 interval index（与 DEFAULT_INTERVALS_SECONDS 对齐）。
+# TD-P0-debt2：上一轮 P0 把"24h 节点"从裸 `metric_count == 2` 改成"cutoff + count",
+# 解决了 P0 但仍隐含"第 2 个飞轮节点 = 24h"。如未来给 DEFAULT_INTERVALS_SECONDS 加
+# 30min 实时档位（如 (1800, 3600, 86400, 604800)），第 2 个就是 1h 节点了——P0 再次触发。
+# 把判定升级成显式 interval_index，配合此常量解耦：
+#   - 改飞轮档位时，记得同时更新这两个常量（test_health_eval_interval_index_constant_exists 守护）
+#   - DEFAULT_INTERVALS_SECONDS[HEALTH_EVAL_INTERVAL_INDEX] 必须语义上等于 24h（86400）
+HEALTH_EVAL_INTERVAL_INDEX = 1
 
-async def collect_one(job_id: int) -> dict:
-    """采集单个 job 的最新数据，写 Metrics 表，触发热度重算。"""
+
+async def collect_one(
+    job_id: int,
+    *,
+    interval_index: int | None = None,
+) -> dict:
+    """采集单个 job 的最新数据，写 Metrics 表，触发热度重算。
+
+    Parameters
+    ----------
+    job_id : int
+        要采集的 PublishJob.id
+    interval_index : int | None, keyword-only
+        - None（默认）：手动触发 / 不知道是哪一档飞轮，走旧的 cutoff + count 兜底路径。
+          兼容 api/main.py 的手动触发、observability 测试桩、上 sprint P0 守护测试。
+        - int：第 N 档飞轮（0-indexed，与 DEFAULT_INTERVALS_SECONDS 对齐）。
+          触发判定改为 `interval_index == HEALTH_EVAL_INTERVAL_INDEX` 显式比对，
+          跳过 cutoff 查询（既省一次 SQL 也让"显式=不依赖时间"语义干净）。
+
+    keyword-only 防误传：避免后续加参数时位置漂移导致悄悄 break。
+    """
     with session_scope() as s:
         job = s.get(PublishJob, job_id)
         if job is None or not job.platform_post_id:
@@ -57,30 +84,38 @@ async def collect_one(job_id: int) -> dict:
         )
         s.add(m)
         s.flush()
-        # 触发节点判定：用"真实时间窗"代替"metric 计数"——
-        # TD-Z3 后 Metrics 表会有 initial 行（≈ job.finished_at，publish 完成瞬间落库），
-        # 飞轮采集（1h/24h/7d）的 collected_at 是飞轮真正跑的时刻；
-        # 取 finished_at + 30min 做 cutoff，只数飞轮采集、排除 initial 行——
-        # 30min 阈值兼顾调度抖动（1h 飞轮可能 ±10 分钟跑）；
-        # 否则 publish + 1h 就会被误判为 24h 节点，刚发 1h 数据没起来就误降权 / 暂停账号。
-        job = s.get(PublishJob, job_id)
-        job_anchor = (job.finished_at or job.created_at) if job is not None else None
-        if job_anchor is not None:
-            cutoff = job_anchor + timedelta(minutes=30)
-            metric_count = (
-                s.query(Metrics)
-                .filter(Metrics.job_id == job_id, Metrics.collected_at > cutoff)
-                .count()
-            )
+
+        # 触发节点判定：优先用显式 interval_index（飞轮路径），兜底用 cutoff + count（兼容路径）。
+        if interval_index is not None:
+            # 显式路径：飞轮调度直接告诉我们"我是第几档"，不需要回表数 metric
+            is_health_eval_node = interval_index == HEALTH_EVAL_INTERVAL_INDEX
         else:
-            # 极端兜底：job 被并发删 / 时间字段全空。退回旧行为不阻塞主流程；
-            # 这条路径理论不可达（能跑到 collect_one 的 job 都已 finished）。
-            metric_count = (
-                s.query(Metrics).filter(Metrics.job_id == job_id).count()
-            )
+            # 兼容路径（手动触发 / 老调用方 / observability 测试）：
+            # 用"真实时间窗"代替"metric 计数"——
+            # TD-Z3 后 Metrics 表会有 initial 行（≈ job.finished_at，publish 完成瞬间落库），
+            # 飞轮采集（1h/24h/7d）的 collected_at 是飞轮真正跑的时刻；
+            # 取 finished_at + 30min 做 cutoff，只数飞轮采集、排除 initial 行——
+            # 30min 阈值兼顾调度抖动（1h 飞轮可能 ±10 分钟跑）；
+            # 否则 publish + 1h 就会被误判为 24h 节点，刚发 1h 数据没起来就误降权 / 暂停账号。
+            job = s.get(PublishJob, job_id)
+            job_anchor = (job.finished_at or job.created_at) if job is not None else None
+            if job_anchor is not None:
+                cutoff = job_anchor + timedelta(minutes=30)
+                metric_count = (
+                    s.query(Metrics)
+                    .filter(Metrics.job_id == job_id, Metrics.collected_at > cutoff)
+                    .count()
+                )
+            else:
+                # 极端兜底：job 被并发删 / 时间字段全空。退回旧行为不阻塞主流程；
+                # 这条路径理论不可达（能跑到 collect_one 的 job 都已 finished）。
+                metric_count = (
+                    s.query(Metrics).filter(Metrics.job_id == job_id).count()
+                )
+            is_health_eval_node = metric_count == 2
 
     # 24h 节点：触发健康度评估（曝光异常 → 降级 + 暂停）
-    if metric_count == 2:
+    if is_health_eval_node:
         try:
             from ..accounts.health_monitor import evaluate_after_metrics
             with session_scope() as s2:
@@ -123,15 +158,22 @@ def schedule_after_publish(
     job_id: int,
     intervals: tuple[int, ...] = DEFAULT_INTERVALS_SECONDS,
 ) -> list[str]:
-    """发布成功后调度 N 次采集任务。返回 scheduler job ids。"""
+    """发布成功后调度 N 次采集任务。返回 scheduler job ids。
+
+    每次回调把"我是第几档"（interval_index）显式传给 collect_one——
+    让 24h 节点判定不再依赖"恰好第 2 条 metric 落库"这种隐式约定。
+
+    闭包陷阱注意：for 内 lambda 必须用默认参数 early-binding 捕获 jid + i，
+    否则 Python late-binding 会让 3 个 lambda 全部捕获最后一次的 (job_id, idx)。
+    """
     import asyncio
 
     ids = []
-    for delay in intervals:
+    for idx, delay in enumerate(intervals):
         when = datetime.utcnow() + timedelta(seconds=delay)
         sid = queue.schedule_once(
             when,
-            (lambda jid=job_id: asyncio.create_task(collect_one(jid))),
+            (lambda jid=job_id, i=idx: asyncio.create_task(collect_one(jid, interval_index=i))),
             job_id=f"metrics-{job_id}-{delay}",
         )
         ids.append(sid)

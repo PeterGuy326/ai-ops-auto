@@ -19,11 +19,12 @@ from ..core.schemas import PublishContent, PublishResult
 from ..observability import get_logger
 from ..observability.sentry import capture_exception
 from ..publishers.registry import default_registry
-# _parse_count 复用 toutiao publisher 已经验证的 UI 数字解析（"1.2万" / "3.5k" → int）。
-# 当前 publisher 侧只有 toutiao 把 initial_metadata 塞进 raw_response，且字段是字符串；
-# 复用比重写一遍稳。TODO[debt]: 后续若 ≥2 个 publisher 都返 initial_metadata，
-# 把 _parse_count 上移到 core/parsers.py，解除 worker → toutiao 反向依赖。
-from ..publishers.toutiao import _parse_count
+# parse_count 已沉到 core/parsers（TD-Z3-debt 闭环, 2026 Q2）：
+# 通用 UI 数字解析（"1.2万" / "3.5k" → int）是基础设施层，不该绑在 publisher 实现里。
+# 上 sprint 用 `from ..publishers.toutiao import _parse_count` 是反向依赖（L5 调 L4），
+# 本次改为从 core 正向 import，scheduler 和 publisher 双向解耦。
+# 留 `_parse_count` 别名 → 模块内 _coerce_count 调用零改动。
+from ..core.parsers import parse_count as _parse_count
 
 logger = get_logger(__name__)
 
