@@ -296,7 +296,18 @@ def _pre_publish_check(
     except Exception as e:
         # 查重失败不阻断主流程：宁可发出去也不要因为 dedup bug 卡住运营节奏
         # （生产路径用 is_too_similar 内部已 try 兜底；这里再加一层防御）
-        return True, None  # 静默放行，错误已被吞——下个 sprint 接入观测后再考虑改 hard-fail
+        # 静默放行 + 观测兜底——dedup 长期失效 = 重复内容溢出 + 平台限流风险升级
+        logger.warning(
+            "worker.simhash_check: swallowed",
+            extra={"job_id": job.id, "account_id": job.account_id, "error": str(e)},
+        )
+        capture_exception(
+            e,
+            scope="worker.simhash_check",
+            job_id=job.id,
+            account_id=job.account_id,
+        )
+        return True, None
     if too_similar:
         return False, (
             f"simhash 重复: 与账号 {job.account_id} 近 "

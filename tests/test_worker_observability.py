@@ -25,7 +25,6 @@ from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
 from ai_ops.core.enums import (
     AccountHealth,
@@ -128,20 +127,24 @@ def db_engine_with_worker(monkeypatch):
 
     返回 (SessionLocal, capture_calls)：
       - SessionLocal：测试中用来构造 Account/Article/PublishJob 等 fixture 数据
+        （即生产 `ai_ops.core.db.SessionLocal`，已 rebind 到 in-memory engine，
+        保留生产所有 kwargs——特别是 `expire_on_commit=False`）
       - capture_calls：list，所有 capture_exception 调用都会 append 到这里
+
+    历史注释：之前这里临时构造 `sessionmaker(... expire_on_commit=False)` 绕开
+    生产 SessionLocal 的 detached 风险——Task A · TD-X4 已在 `core/db.py` 把生产
+    SessionLocal 改为 expire_on_commit=False，绕开代码因此移除，直接用生产
+    SessionLocal rebind 到 in-memory engine。
     """
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
-    # 注：本地测试用 expire_on_commit=False，避开 worker.py line 111 在 session
-    # 退出后访问 job.account_id 的 detached lazy-load（生产的 session_scope 行为
-    # 与默认略有出入；本测试只关注 observability hooks，不复现完整 session 语义）
-    SessionLocal = sessionmaker(
-        bind=engine,
-        autoflush=False,
-        autocommit=False,
-        future=True,
-        expire_on_commit=False,
-    )
+
+    from ai_ops.core import db as db_mod
+
+    # rebind 生产 SessionLocal 到 in-memory engine；teardown 还原
+    original_bind = db_mod.SessionLocal.kw.get("bind")
+    db_mod.SessionLocal.configure(bind=engine)
+    SessionLocal = db_mod.SessionLocal  # 复用生产 sessionmaker，所有 kwargs 自带
 
     # mock session_scope —— worker.py 顶部 `from ..core.db import session_scope`
     # 已绑定到 worker 模块内的名字；同时核心的 mark_published / check_rate_limit
@@ -186,7 +189,12 @@ def db_engine_with_worker(monkeypatch):
 
     monkeypatch.setattr(worker_mod, "capture_exception", fake_capture)
 
-    return SessionLocal, capture_calls
+    try:
+        yield SessionLocal, capture_calls
+    finally:
+        # 还原生产 SessionLocal.bind，避免污染其它 test（如新加的 integration test）
+        db_mod.SessionLocal.configure(bind=original_bind)
+        engine.dispose()
 
 
 def _mk_job(SessionLocal, *, content_type=ContentType.IMAGE_TEXT, with_images=True):

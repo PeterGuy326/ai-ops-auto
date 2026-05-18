@@ -13,7 +13,18 @@ _engine = create_engine(
     future=True,
     connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {},
 )
-SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
+# expire_on_commit=False 是 production-safe 的关键约定：
+# 默认 True 时 commit 后所有 ORM attribute 会被 expire，下次 access 触发 auto-refresh；
+# 若此时 session 已关闭（如 worker 跳出 session_scope 后读 job.account_id 拼日志/
+# notify 快照），就抛 DetachedInstanceError —— 真发布会直接炸。
+# 业界共识（FastAPI / SQLAlchemy 官方文档）web 服务统一用 False，refresh 按需手动。
+SessionLocal = sessionmaker(
+    bind=_engine,
+    autoflush=False,
+    autocommit=False,
+    future=True,
+    expire_on_commit=False,
+)
 
 
 def init_db() -> None:

@@ -12,6 +12,7 @@ from ..core.enums import Platform
 from ..core.models import Article, Metrics, PublishJob
 from ..publishers.registry import default_registry
 from ..observability import get_logger
+from ..observability.sentry import capture_exception
 from .queue import queue
 
 logger = get_logger(__name__)
@@ -71,15 +72,32 @@ async def collect_one(job_id: int) -> dict:
                     "decision": action.decision,
                     "reason": action.reason,
                 }
-        except Exception:
-            pass  # 健康评估失败不影响采集主流程
+        except Exception as e:
+            # 健康评估失败不影响采集主流程——但 24h 节点降级逻辑长期失效会让风控判
+            # 断慢半拍，必须 capture 让 Sentry 兜底告警
+            logger.warning(
+                "scheduler.metrics.health_eval: swallowed",
+                extra={"job_id": job_id, "error": str(e)},
+            )
+            capture_exception(e, scope="scheduler.metrics.health_eval", job_id=job_id)
 
     # 异步刷新主题热度（fire and forget）
     try:
         from ..content.heat_engine import recompute_topic_heat_for_article
         recompute_topic_heat_for_article(article_id)
-    except Exception:
-        pass
+    except Exception as e:
+        # 热度刷新失败不影响采集主路径——但飞轮上的内容选题环节会拿到旧热度，
+        # 选题质量长期劣化无人察觉。必须 capture
+        logger.warning(
+            "scheduler.metrics.heat_refresh: swallowed",
+            extra={"job_id": job_id, "article_id": article_id, "error": str(e)},
+        )
+        capture_exception(
+            e,
+            scope="scheduler.metrics.heat_refresh",
+            job_id=job_id,
+            article_id=article_id,
+        )
 
     return data
 

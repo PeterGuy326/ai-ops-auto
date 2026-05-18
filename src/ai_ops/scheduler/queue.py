@@ -8,6 +8,7 @@ from typing import Callable, Coroutine
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from ..observability import get_logger
+from ..observability.sentry import capture_exception
 from .jitter import jitter_publish_time
 
 logger = get_logger(__name__)
@@ -122,8 +123,14 @@ class TaskQueue:
     def cancel(self, job_id: str) -> None:
         try:
             self._scheduler.remove_job(job_id)
-        except Exception:
-            pass
+        except Exception as e:
+            # cancel 失败常见于 job 已被消费/不存在——业务路径上是幂等吞掉，但若是
+            # APScheduler 内部状态损坏（如调度器关停中调 cancel）就会无声泄漏 job
+            logger.warning(
+                "scheduler.queue.cancel: swallowed",
+                extra={"job_id": job_id, "error": str(e)},
+            )
+            capture_exception(e, scope="scheduler.queue.cancel", job_id=job_id)
 
     def schedule_publish(
         self,
