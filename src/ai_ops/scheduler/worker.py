@@ -438,3 +438,51 @@ def _persist_initial_metrics(
         )
         return None
 
+
+# ---------------------------------------------------------------------------
+# 重发覆盖追踪 helper（publishing-sop §五 / §九 #7）
+# ---------------------------------------------------------------------------
+
+
+def _mark_job_superseded(session, old_job_id: int, new_job_id: int) -> bool:
+    """把旧 PublishJob 标记为被新 job 覆盖。
+
+    使用场景（本 Task 暂不创建调用方，仅暴露字段 + helper 给后续重发流程用）：
+      - worker / 运营手动创建新 job 替代旧 job（旧 job 内容错 / 失败需重发）
+      - 调用方先创建新 job，再调本 helper 把旧 job.superseded_by_job_id 指向新 job
+      - 后台 UI / 周报 / 数据分析据此追踪"旧 job 被谁覆盖"，运营复盘有据
+
+    Args:
+        session: SQLAlchemy session（调用方负责 commit；本函数不开新连接、不 commit）
+        old_job_id: 被覆盖的旧 PublishJob.id
+        new_job_id: 覆盖它的新 PublishJob.id
+
+    Returns:
+        True  = 旧 job 存在且字段已 set
+        False = 旧 job 不存在（调用方应日志告警）
+
+    防御：
+        - old == new → 拒绝（自指 = 数据污染）。返回 False 不抛，让上游决定降级
+        - 不校验 new_job_id 是否真存在（FK 在 DB 侧兜底；helper 保持薄）
+    """
+    if old_job_id == new_job_id:
+        # 自指防御：旧 job 指向自己 = 语义错乱。不抛异常以免阻塞主流程，
+        # 但返回 False 让调用方有机会观测到。
+        logger.warning(
+            "worker._mark_job_superseded: refused self-reference",
+            extra={"old_job_id": old_job_id, "new_job_id": new_job_id},
+        )
+        return False
+
+    old = session.get(PublishJob, old_job_id)
+    if old is None:
+        logger.warning(
+            "worker._mark_job_superseded: old job not found",
+            extra={"old_job_id": old_job_id, "new_job_id": new_job_id},
+        )
+        return False
+
+    old.superseded_by_job_id = new_job_id
+    session.flush()
+    return True
+
