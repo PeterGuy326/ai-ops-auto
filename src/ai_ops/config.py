@@ -73,5 +73,13 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path("./data"))
 
+    # ====== 通知模块（Task B）======
+    # 飞书 custom robot webhook（钉钉/企微留 adapters.py 空壳，out of scope, follow-up）
+    feishu_webhook_url: str = ""
+    # 同事件去重滑窗（秒）
+    notify_dedup_window_seconds: int = 300
+    # 滑窗内第 N 次聚合放行（首条 + 第 N 次 = 5 min 内最多 2 条，对齐 publishing-sop §八）
+    notify_dedup_threshold: int = 3
+
 
 settings = Settings()

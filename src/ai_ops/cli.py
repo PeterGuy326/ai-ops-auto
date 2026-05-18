@@ -5,6 +5,7 @@ import typer
 
 from .config import settings
 from .core.db import init_db as _init_db
+from .reports.cli_commands import report_app
 
 app = typer.Typer(help="ai-ops-auto CLI")
 
@@ -30,6 +31,10 @@ def cmd_gen_fernet_key():
     from cryptography.fernet import Fernet
 
     typer.echo(Fernet.generate_key().decode())
+
+
+# 数据回流自动出报子组：`python -m ai_ops.cli report daily/weekly`
+app.add_typer(report_app, name="report")
 
 
 if __name__ == "__main__":

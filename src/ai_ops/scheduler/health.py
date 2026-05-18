@@ -48,7 +48,27 @@ async def check_all_accounts() -> dict:
 
         with session_scope() as s:
             update_health(s, account_id, health)
+            # 通知模块（Task B）：登录态失效/被封 → 推 IM 提醒账号负责人
+            # 在 session 内组装 snapshot，避免 detached account 在出块后查询失败
+            notify_snapshot = None
+            if health in (AccountHealth.EXPIRED, AccountHealth.BANNED):
+                acc = s.get(Account, account_id)
+                if acc is not None:
+                    notify_snapshot = {
+                        "id": acc.id,
+                        "nickname": acc.nickname,
+                        "platform": acc.platform,
+                        "health": health,
+                    }
         results[account_id] = health.value if hasattr(health, "value") else str(health)
+
+        # 出 session 后调通知，notify 内部容错——不影响下一个账号的探活循环
+        if notify_snapshot is not None:
+            try:
+                from ..notify import account_expired
+                account_expired(notify_snapshot)
+            except Exception:
+                pass
 
     return {
         "checked_at": datetime.utcnow().isoformat(),

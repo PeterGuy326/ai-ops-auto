@@ -12,10 +12,20 @@ from datetime import datetime
 from ..accounts.health_monitor import get_paused_until, is_paused
 from ..accounts.manager import check_rate_limit, get_credential, mark_published, update_health
 from ..core.db import session_scope
+from ..core.dedup import is_too_similar
 from ..core.enums import AccountHealth, ArticleStatus, ContentType, JobStatus, Platform
 from ..core.models import Account, Article, PublishJob
 from ..core.schemas import PublishContent, PublishResult
 from ..publishers.registry import default_registry
+
+# 发布前置兜底污点词清单（命中即 fail-fast，防止 TODO / 未替换占位符 / 错版本号溜出）。
+# 注：暂不进 config.py（Task B 在那条战线，避免合并冲突），下个 sprint 再迁移。
+TAINT_PATTERNS: tuple[str, ...] = ("TODO", "未替换占位符", "过期版本号", "XXX")
+
+# simhash 拦截阈值：与该账号 7d 内已发布 article.body 的 hamming 距离 < 此值即视为重复。
+# 对齐 docs/anti-risk.md §63 设定的"相似度 > 0.85"，64 位 simhash 下约 8 bit。
+SIMHASH_HAMMING_THRESHOLD = 8
+SIMHASH_LOOKBACK_DAYS = 7
 
 
 async def execute_job(job_id: int) -> PublishResult:
@@ -45,6 +55,15 @@ async def execute_job(job_id: int) -> PublishResult:
             job.status = JobStatus.FAILED
             job.error = f"账号暂停中至 {until.isoformat() if until else 'unknown'}"
             return PublishResult(success=False, error=job.error)
+
+        # 内容层前置兜底：TAINT 词 + simhash 查重。
+        # 任何一个命中即 fail-fast，不再消耗下游的解密 / 浏览器开销。
+        ok, pre_err = _pre_publish_check(s, job, article)
+        if not ok:
+            job.status = JobStatus.FAILED
+            job.error = pre_err
+            job.finished_at = datetime.utcnow()
+            return PublishResult(success=False, error=pre_err)
 
         try:
             credential = get_credential(s, job.account_id)
@@ -100,6 +119,16 @@ async def execute_job(job_id: int) -> PublishResult:
                 schedule_after_publish(job.id)
             except Exception:
                 pass  # 采集失败不影响主流程
+            # 通知模块快照（Task B）：在 session 内拼好数据，出块后再发——
+            # 避免 notify 调用失败/慢回写影响 job 状态落库
+            notify_snapshot = {
+                "kind": "success",
+                "id": job.id,
+                "account_id": job.account_id,
+                "platform": job.platform,
+                "platform_url": job.platform_url,
+                "title": (article.title if article else "（无标题）"),
+            }
         else:
             job.error = result.error or "unknown"
             job.raw_response = result.raw_response
@@ -109,6 +138,26 @@ async def execute_job(job_id: int) -> PublishResult:
                 job.status = JobStatus.DEAD
                 # 失败联动：先降级到 DEGRADED；近 24h 内连续 3 次 DEAD → 升级到 BANNED
                 _escalate_health_on_failure(s, job.account_id)
+            # 通知模块快照（Task B）：失败也快照，session 外调 notify.publish_failed
+            notify_snapshot = {
+                "kind": "failed",
+                "id": job.id,
+                "account_id": job.account_id,
+                "platform": job.platform,
+                "error": job.error,
+            }
+
+    # 出 session 后异步通知——session_scope 已 commit，notify 异常不会回滚 job 状态
+    try:
+        from ..notify import publish_success, publish_failed
+        if notify_snapshot["kind"] == "success":
+            publish_success(notify_snapshot)
+        else:
+            publish_failed(notify_snapshot)
+    except Exception:
+        # 通知是辅助通道，任何异常都不能影响主业务返回值
+        pass
+
     return result
 
 
@@ -168,3 +217,59 @@ def _build_content(article: Article) -> PublishContent:
         tags=article.extra.get("tags", []) if article.extra else [],
         extra=article.extra or {},
     )
+
+
+def _pre_publish_check(
+    session,
+    job: PublishJob,
+    article: Article,
+    *,
+    similarity_checker=None,
+) -> tuple[bool, str | None]:
+    """发布前置内容兜底：TAINT 词 grep + simhash 查重。
+
+    Args:
+        session: SQLAlchemy session（worker 已持有；这里不开新连接）。当前 TAINT 检查
+            只读 article.body，simhash 通过 similarity_checker 走（默认调
+            ``core.dedup.is_too_similar``，内部自带 session_scope）。
+        job: PublishJob，提供 account_id 作为 simhash 查重的 scope key。
+        article: Article，提供 body 作为待检测文本。
+        similarity_checker: 可注入的相似度检测函数（签名同 is_too_similar），
+            主要给单测注入 mock 用；生产路径默认 = is_too_similar。
+
+    Returns:
+        (ok, error_message)：ok=False 时 error_message 给 worker 写入 job.error。
+
+    职责单一：只判断"能不能发"，不动 job / article 任何字段——状态机由调用方处理。
+    """
+    body = (article.body or "")
+
+    # TAINT 词 grep：命中第一个即返回，避免拼接所有命中浪费日志位
+    for pattern in TAINT_PATTERNS:
+        if pattern in body:
+            return False, f"污点拦截: 正文含 {pattern}"
+
+    # simhash 查重：空 body 直接放行（不报错，让下游自己决定要不要发空内容）
+    if not body.strip():
+        return True, None
+
+    checker = similarity_checker if similarity_checker is not None else is_too_similar
+    try:
+        too_similar = checker(
+            text=body,
+            account_id=job.account_id,
+            days=SIMHASH_LOOKBACK_DAYS,
+            threshold=SIMHASH_HAMMING_THRESHOLD,
+        )
+    except Exception as e:
+        # 查重失败不阻断主流程：宁可发出去也不要因为 dedup bug 卡住运营节奏
+        # （生产路径用 is_too_similar 内部已 try 兜底；这里再加一层防御）
+        return True, None  # 静默放行，错误已被吞——下个 sprint 接入观测后再考虑改 hard-fail
+    if too_similar:
+        return False, (
+            f"simhash 重复: 与账号 {job.account_id} 近 "
+            f"{SIMHASH_LOOKBACK_DAYS}d 已发布内容相似度过高"
+            f"（hamming < {SIMHASH_HAMMING_THRESHOLD}）"
+        )
+
+    return True, None

@@ -47,6 +47,12 @@ async def lifespan(app: FastAPI):
         schedule_daily_health_check()  # 默认每天 02:00
     except Exception:
         pass  # 调度注册失败不阻塞启动
+    # === 数据回流自动出报 cron（daily 18:00 / weekly Mon 09:00）===
+    try:
+        from ..reports.cron import schedule_report_crons
+        schedule_report_crons()
+    except Exception:
+        pass  # 报表 cron 注册失败不阻塞启动
     yield
     queue.shutdown()
 

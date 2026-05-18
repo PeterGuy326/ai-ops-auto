@@ -42,6 +42,9 @@ external/
 logs/
 *.log
 
+# 运营报告产物（运行时生成，不入仓）
+/reports/
+
 # 前端
 frontend/node_modules/
 frontend/dist/
