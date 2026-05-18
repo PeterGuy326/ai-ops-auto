@@ -4,13 +4,11 @@
 - daily : 每日 18:00 → cron(hour=18, minute=0)
 - weekly: 每周一 09:00 → cron(day_of_week='mon', hour=9, minute=0)
 
-实现说明（避坑）：
-  不走 scheduler.queue.TaskQueue.schedule_cron 的 5 段字符串路径。
-  原因：queue.schedule_cron 把 "0 9 * * 1" 透传给 APScheduler 时，
-  APScheduler 的 day_of_week 语义是 mon=0..sun=6，与 Linux cron 的 sun=0..sat=6 错位，
-  会把 "* * 1" 解析为周二而非周一。
-  → 用 APScheduler 原生 day_of_week='mon' 字面量最稳。
-  详见 P7-COMPLETION 中的"技术债"段。
+实现说明：
+  使用显式 day_of_week='mon' 字面量，比 5 段 cron 字符串更明确，
+  阅读时一眼能看出"周一"语义。TaskQueue.schedule_cron 自身已根治
+  Linux cron→APScheduler dow 语义错位（TD-A1 已收口，见 tests/test_queue_cron.py），
+  本文件保留显式字面量是出于可读性，不是 workaround。
 """
 from __future__ import annotations
 

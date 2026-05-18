@@ -269,3 +269,40 @@ def test_schedule_report_crons_smoke():
             queue._scheduler.remove_job(jid)
         except Exception:
             pass
+
+
+# ---------- TD-A3 收口：真函数切换验证 ----------
+
+def test_report_ready_real_no_raise():
+    """TD-A3：A 切到 ai_ops.notify.report_ready 后，在飞书 webhook URL 空时不抛。
+
+    底层逻辑：notify.report_ready 已经 @_safe 兜底 + webhook 层吞网络异常；
+    无 FEISHU_WEBHOOK_URL 时应静默 logger.debug 而不向上抛——这是闭环交付的
+    红线，发布主流程绝不能因为通知模块自身配置缺失炸掉。
+    """
+    import os
+    from ai_ops.notify import report_ready as real_report_ready
+
+    # 强制清空 webhook URL 走"不发"分支
+    old = os.environ.pop("FEISHU_WEBHOOK_URL", None)
+    try:
+        # daily / weekly 各打一次，确保 kind 分支都覆盖
+        real_report_ready("daily", "/tmp/td_a3_daily_test.md")
+        real_report_ready("weekly", "/tmp/td_a3_weekly_test.md")
+    finally:
+        if old is not None:
+            os.environ["FEISHU_WEBHOOK_URL"] = old
+
+
+def test_reports_init_report_ready_is_real():
+    """TD-A3：reports/__init__.py re-export 的 report_ready 必须是真函数。
+
+    防回归：避免有人把 import 切回 stub。
+    """
+    from ai_ops.reports import report_ready as reports_re_export
+    from ai_ops.notify import report_ready as notify_real
+    # 同一对象 —— re-export 必须是真函数
+    assert reports_re_export is notify_real, (
+        "reports.__init__ re-export 的 report_ready 不是 ai_ops.notify 的真函数，"
+        "TD-A3 切换失败"
+    )

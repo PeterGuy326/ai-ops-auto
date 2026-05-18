@@ -7,7 +7,7 @@ from pathlib import Path
 import typer
 
 from .daily import write_daily_report
-from .notifier_stub import report_ready
+from ..notify import report_ready
 from .weekly import parse_iso_week, write_weekly_report
 
 report_app = typer.Typer(help="数据回流自动出报（日报 / 周报）")
@@ -25,7 +25,7 @@ def cmd_daily(
     ),
     notify: bool = typer.Option(
         True, "--notify/--no-notify",
-        help="是否调 notifier_stub（默认 True；Task B 完成后切真实 notify）",
+        help="是否调 ai_ops.notify.report_ready（默认 True；走飞书 webhook）",
     ),
 ):
     """生成日报到 ./reports/daily-YYYY-MM-DD.md。"""

@@ -320,7 +320,7 @@ def write_weekly_report(
 
 async def run_weekly_report_job() -> dict:
     """cron 入口 — 默认当前 ISO 周（按 UTC date）。"""
-    from .notifier_stub import report_ready
+    from ..notify import report_ready
 
     today = datetime.utcnow().date()
     iso = today.isocalendar()

@@ -29,6 +29,8 @@ dependencies = [
     "markdown>=3.6",
     # 图片反指纹处理（asset_processor：EXIF/微裁剪/微旋转/调色）
     "Pillow>=10",
+    # FastAPI Jinja2Templates 渲染 /ui/* 页面（api/main.py 直接 import）
+    "jinja2>=3",
 ]
 
 [project.optional-dependencies]

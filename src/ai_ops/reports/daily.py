@@ -268,7 +268,7 @@ def write_daily_report(d: date_cls, out_dir: Path | str = "./reports") -> Path:
 
 async def run_daily_report_job() -> dict:
     """cron 入口 — 默认今日（UTC date）。"""
-    from .notifier_stub import report_ready
+    from ..notify import report_ready
 
     d = datetime.utcnow().date()
     try:
