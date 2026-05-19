@@ -110,6 +110,18 @@ class Settings(BaseSettings):
     lark_cli_timeout_seconds: int = 15
 
 
+    # ====== Video Clipper · FunClip（智能视频剪辑，阿里达摩院/ModelScope 开源）======
+    # 外置 FunClip 仓库路径（git clone https://github.com/modelscope/FunClip）
+    funclip_path: Path = Path("./external/FunClip")
+    # FunClip 专用 venv 的 python（推荐独立 venv，依赖体积大且与主项目冲突风险高）
+    # 留空则使用系统 python；典型值 "./external/FunClip/.venv/bin/python"
+    funclip_python: str = ""
+    # subprocess 超时（秒）—— ASR + 剪辑都受这个上限管，长视频转写慢，默认 30 min
+    funclip_timeout_seconds: int = 1800
+    # 默认输出根目录（每次调用会在下面建 run_<ts>/ 子目录隔离产物）
+    funclip_output_root: Path = Path("./data/clips")
+
+
     # ====== Round 5 · schema 漂移自检 ======
     # 应用进程内是否在 lifespan startup 自动跑 alembic upgrade head。
     # 生产默认 False —— prod 走 Dockerfile entrypoint 的 subprocess alembic upgrade

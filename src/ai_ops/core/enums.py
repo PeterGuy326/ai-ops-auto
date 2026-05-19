@@ -79,3 +79,10 @@ class VideoEngineKind(str, Enum):
     MONEY_PRINTER_TURBO = "money_printer_turbo"
     NARRATO_AI = "narrato_ai"
     FFMPEG_RAW = "ffmpeg_raw"
+
+
+class VideoClipperKind(str, Enum):
+    """视频剪辑器实现类型 —— 与 VideoEngineKind（生成）正交：
+    Engine = 从 brief 造视频；Clipper = 从已有长视频切短片段。
+    """
+    FUNCLIP = "funclip"

@@ -187,6 +187,60 @@ class VideoArtifact(BaseModel):
     meta: dict = Field(default_factory=dict)
 
 
+class TranscriptCue(BaseModel):
+    """一条 SRT 字幕 cue（ASR 转写产物）。"""
+    index: int
+    start_ms: int
+    end_ms: int
+    text: str
+
+
+class TranscriptResult(BaseModel):
+    """clipper.transcribe() 的产物：字幕 + 原始文本。"""
+    srt_path: str
+    cues: list[TranscriptCue] = Field(default_factory=list)
+    full_text: str = ""
+    meta: dict = Field(default_factory=dict)
+
+
+class ClipSegment(BaseModel):
+    """单次剪辑请求段——按文本匹配 OR 按时间段，二选一。
+    dest_text 优先；同时给则以 dest_text 为准（FunClip Stage 2 语义）。
+    """
+    dest_text: Optional[str] = None
+    start_ms: Optional[int] = None
+    end_ms: Optional[int] = None
+    # 前后扩展（毫秒），对应 FunClip --start_ost / --end_ost
+    start_ost_ms: int = 0
+    end_ost_ms: int = 0
+
+
+class ClipRequest(BaseModel):
+    """喂给 clipper.clip() 的统一请求。"""
+    input_video: str
+    segments: list[ClipSegment] = Field(default_factory=list)
+    output_dir: str = "./data/clips"
+    lang: str = "zh"
+    hotwords: list[str] = Field(default_factory=list)
+    extra: dict = Field(default_factory=dict)
+
+
+class ClipArtifact(BaseModel):
+    """单条切片产物。"""
+    video_path: str
+    dest_text: Optional[str] = None
+    start_ms: Optional[int] = None
+    end_ms: Optional[int] = None
+    meta: dict = Field(default_factory=dict)
+
+
+class ClipResult(BaseModel):
+    """clipper.clip() 的产物：N 个切片 + transcript（如有）。"""
+    clips: list[ClipArtifact] = Field(default_factory=list)
+    transcript: Optional[TranscriptResult] = None
+    meta: dict = Field(default_factory=dict)
+
+
 class JobOut(BaseModel):
     id: int
     article_id: int
