@@ -187,8 +187,10 @@ class FunClipClipper(VideoClipperBase):
     async def transcribe(
         self, input_video: str, output_dir: str, lang: str = "zh"
     ) -> TranscriptResult:
-        out = self._ensure_dir(Path(output_dir).resolve())
-        argv = self._build_stage1_argv(str(Path(input_video).resolve()), out)
+        # 路径一律走 os.path.abspath（不跟随 symlink，理由见 _python）——
+        # 子进程 cwd 在 FunClip 根，传相对路径会被叠成嵌套路径而找不到。
+        out = self._ensure_dir(Path(os.path.abspath(output_dir)))
+        argv = self._build_stage1_argv(os.path.abspath(input_video), out)
         code, stdout, stderr = await self._run(argv, cwd=self._funclip_root())
         if code != 0:
             raise RuntimeError(
@@ -216,8 +218,11 @@ class FunClipClipper(VideoClipperBase):
             raise ValueError("ClipRequest.segments must contain at least one segment")
 
         ts = int(time.time())
-        run_dir = self._ensure_dir((Path(request.output_dir) / f"funclip_{ts}").resolve())
-        input_video = str(Path(request.input_video).resolve())
+        # 路径一律 abspath，与 transcribe / _python 对齐（理由见 _python）。
+        run_dir = self._ensure_dir(
+            Path(os.path.abspath(Path(request.output_dir) / f"funclip_{ts}"))
+        )
+        input_video = os.path.abspath(request.input_video)
 
         # 先跑 stage 1 拿字幕（即便 segments 都给的是时间区间，也保留 transcript 元信息）
         transcript: Optional[TranscriptResult] = None
@@ -244,9 +249,13 @@ class FunClipClipper(VideoClipperBase):
                     f"stderr=\n{stderr[-2000:]}"
                 )
             # FunClip 不按 --output_file 原样写：实际产物是 <stem>_no<N>.mp4
-            # （videoclipper.py video_clip()，N=GLOBAL_COUNT，CLI 单次调用恒为 0）。
-            # dest_text 命中多个语音段时会 concat 进同一个文件，仍是单产物。
-            produced = sorted(run_dir.glob(f"{output_file.stem}_no*.mp4"))
+            # （videoclipper.py video_clip()，N=GLOBAL_COUNT，CLI 单次调用通常为 0；
+            # dest_text 命中多段会 concat 进同一文件）。对外部行为不做强假设：
+            # glob 限定 _no 后必有数字，再按 N 数字序排，避免 sorted 字典序错位。
+            produced = sorted(
+                run_dir.glob(f"{output_file.stem}_no[0-9]*.mp4"),
+                key=lambda p: int(re.search(r"_no(\d+)", p.stem).group(1)),
+            )
             if not produced:
                 # FunClip 对 dest_text 无命中的 else 分支不写文件、退出码仍是 0。
                 raise RuntimeError(
