@@ -141,8 +141,38 @@ async def demo():
 - clip：`dest_text='试错的过程很简单'` → 产出 1.76s 切片 `clip_001_no0.mp4`（h264+aac）+ 同名 `.srt`
 - 注意 FunClip 实际产物名是 `<output_file_stem>_no0.mp4`（wrapper 已自动扫描真实产物，调用方拿到的 `ClipArtifact.video_path` 即真实路径）
 
-## 6. 后续接入点（不在本次范围）
+## 6. clip → publish 发布流水线
 
-- `pipeline/`：长视频 → FunClip 切片 → 自动喂 publishers 多平台分发
+`src/ai_ops/pipeline/clip_to_publish.py` 的 `ClipToPublishPipeline` 把切片产物
+编排成多平台发布计划：
+
+```python
+from ai_ops.pipeline import ClipToPublishPipeline
+from ai_ops.core.schemas import ClipPublishRequest, ClipRequest, ClipSegment
+from ai_ops.core.enums import Platform
+
+pipe = ClipToPublishPipeline()  # 默认用 FunClipClipper
+plan = await pipe.plan(ClipPublishRequest(
+    clip_request=ClipRequest(
+        input_video="/path/to/long.mp4",
+        segments=[ClipSegment(dest_text="试错的过程很简单")],
+    ),
+    platforms=[Platform.DOUYIN, Platform.XIAOHONGSHU],
+    title="3 分钟讲透 X",
+    tags=["干货", "AI"],
+))
+for item in plan.items:
+    print(item.platform, item.content.videos)  # 每条 = 一切片 × 一平台
+```
+
+**边界（刻意为之）**：流水线只产出 `ClipPublishPlan`（dry-run 发布计划），
+**不触发真发布**。真发布走 `PublishJob` + `scheduler.worker`——那条路带
+rate limit / 风控间隔 / pre_publish_check / metrics 闭环，pipeline 直接调
+`publisher.publish` 会全绕过。下游拿 `plan.items` 为每条建 Article + PublishJob
+入库，worker 自然会发。
+
+## 7. 后续接入点（不在本次范围）
+
 - `api/`：POST /clip 端点，给前端 UI 用
-- `core/dispatch.py`：按平台时长偏好（抖音 60s、视频号 90s、B 站 不限）自动挑切片
+- 自动选段：transcribe 后用 LLM 挑精华 cue，免手填 dest_text
+- 平台特化：按平台时长偏好（抖音 60s / 视频号 90s / B 站 不限）筛切片

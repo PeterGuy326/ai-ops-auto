@@ -241,6 +241,33 @@ class ClipResult(BaseModel):
     meta: dict = Field(default_factory=dict)
 
 
+class ClipPublishRequest(BaseModel):
+    """clip→publish 流水线入参：切片任务 + 目标平台 + 文案。"""
+    clip_request: ClipRequest
+    platforms: list[Platform]
+    title: str
+    body: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class PublishPlanItem(BaseModel):
+    """一条发布计划项：目标平台 + 待发标准化内容 + 溯源切片路径。"""
+    platform: Platform
+    content: PublishContent
+    source_clip_path: str
+
+
+class ClipPublishPlan(BaseModel):
+    """clip→publish 流水线产物——dry-run 发布计划。
+
+    只编排到「内容就绪」为止，不触发真发布：真发布走 PublishJob + worker，
+    以免绕过 rate limit / 风控间隔 / metrics 闭环。
+    """
+    items: list[PublishPlanItem] = Field(default_factory=list)
+    clip_count: int = 0
+    meta: dict = Field(default_factory=dict)
+
+
 class JobOut(BaseModel):
     id: int
     article_id: int
