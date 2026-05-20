@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 import sys
@@ -79,11 +80,34 @@ class FunClipClipper(VideoClipperBase):
 
     # ---------- 内部工具 ----------
 
+    def _funclip_root(self) -> Path:
+        """FunClip 仓库根的绝对路径。
+
+        子进程 cwd 必须设在这里——FunClip 内部用相对路径找 font/ 等资源。
+        正因为 cwd 会变，所有传给子进程的路径（python / entry / file /
+        output_dir / output_file）都必须先转成绝对路径，否则相对路径
+        会被叠加成 external/FunClip/external/FunClip/... 而找不到。
+
+        用 os.path.abspath 而非 Path.resolve()：resolve() 会跟随符号链接，
+        见 _python() 的说明。
+        """
+        return Path(os.path.abspath(settings.funclip_path))
+
     def _python(self) -> str:
-        return settings.funclip_python or sys.executable
+        """FunClip venv 的 python 解释器，绝对路径。
+
+        关键：必须用 os.path.abspath，不能用 Path.resolve()。venv 的
+        bin/python 是指向系统 python 的符号链接，resolve() 会跟随它解析成
+        /usr/bin/pythonX.Y——一旦用系统 python 启动就脱离 venv 的
+        site-packages，FunClip 装在 venv 里的 librosa/funasr 等会全部
+        ModuleNotFoundError。abspath 只转绝对、不跟随 symlink，保住 venv 上下文。
+        """
+        if settings.funclip_python:
+            return os.path.abspath(settings.funclip_python)
+        return sys.executable
 
     def _entry(self) -> Path:
-        return Path(settings.funclip_path) / "funclip" / "videoclipper.py"
+        return self._funclip_root() / "funclip" / "videoclipper.py"
 
     def _ensure_dir(self, p: Path) -> Path:
         p.mkdir(parents=True, exist_ok=True)
@@ -163,9 +187,9 @@ class FunClipClipper(VideoClipperBase):
     async def transcribe(
         self, input_video: str, output_dir: str, lang: str = "zh"
     ) -> TranscriptResult:
-        out = self._ensure_dir(Path(output_dir))
-        argv = self._build_stage1_argv(input_video, out)
-        code, stdout, stderr = await self._run(argv, cwd=Path(settings.funclip_path))
+        out = self._ensure_dir(Path(output_dir).resolve())
+        argv = self._build_stage1_argv(str(Path(input_video).resolve()), out)
+        code, stdout, stderr = await self._run(argv, cwd=self._funclip_root())
         if code != 0:
             raise RuntimeError(
                 f"FunClip stage 1 failed (code={code}). stderr=\n{stderr[-2000:]}"
@@ -192,13 +216,14 @@ class FunClipClipper(VideoClipperBase):
             raise ValueError("ClipRequest.segments must contain at least one segment")
 
         ts = int(time.time())
-        run_dir = self._ensure_dir(Path(request.output_dir) / f"funclip_{ts}")
+        run_dir = self._ensure_dir((Path(request.output_dir) / f"funclip_{ts}").resolve())
+        input_video = str(Path(request.input_video).resolve())
 
         # 先跑 stage 1 拿字幕（即便 segments 都给的是时间区间，也保留 transcript 元信息）
         transcript: Optional[TranscriptResult] = None
         try:
             transcript = await self.transcribe(
-                request.input_video, str(run_dir), lang=request.lang
+                input_video, str(run_dir), lang=request.lang
             )
         except RuntimeError:
             # transcript 失败不阻断纯时间段剪辑（dest_text 模式下必须，调用方该感知）
@@ -210,23 +235,39 @@ class FunClipClipper(VideoClipperBase):
         for idx, seg in enumerate(request.segments, start=1):
             output_file = run_dir / f"clip_{idx:03d}.mp4"
             argv = self._build_stage2_argv(
-                request.input_video, run_dir, seg, output_file
+                input_video, run_dir, seg, output_file
             )
-            code, stdout, stderr = await self._run(argv, cwd=Path(settings.funclip_path))
+            code, stdout, stderr = await self._run(argv, cwd=self._funclip_root())
             if code != 0:
                 raise RuntimeError(
                     f"FunClip stage 2 failed at seg #{idx} (code={code}). "
                     f"stderr=\n{stderr[-2000:]}"
                 )
-            clips.append(
-                ClipArtifact(
-                    video_path=str(output_file),
-                    dest_text=seg.dest_text,
-                    start_ms=seg.start_ms,
-                    end_ms=seg.end_ms,
-                    meta={"start_ost_ms": seg.start_ost_ms, "end_ost_ms": seg.end_ost_ms},
+            # FunClip 不按 --output_file 原样写：实际产物是 <stem>_no<N>.mp4
+            # （videoclipper.py video_clip()，N=GLOBAL_COUNT，CLI 单次调用恒为 0）。
+            # dest_text 命中多个语音段时会 concat 进同一个文件，仍是单产物。
+            produced = sorted(run_dir.glob(f"{output_file.stem}_no*.mp4"))
+            if not produced:
+                # FunClip 对 dest_text 无命中的 else 分支不写文件、退出码仍是 0。
+                raise RuntimeError(
+                    f"FunClip stage 2 produced no clip for seg #{idx}: dest_text "
+                    f"{seg.dest_text!r} likely matched no speech period. "
+                    f"stdout tail=\n{stdout[-800:]}"
                 )
-            )
+            for actual in produced:
+                clips.append(
+                    ClipArtifact(
+                        video_path=str(actual),
+                        dest_text=seg.dest_text,
+                        start_ms=seg.start_ms,
+                        end_ms=seg.end_ms,
+                        meta={
+                            "start_ost_ms": seg.start_ost_ms,
+                            "end_ost_ms": seg.end_ost_ms,
+                            "seg_index": idx,
+                        },
+                    )
+                )
 
         return ClipResult(
             clips=clips,

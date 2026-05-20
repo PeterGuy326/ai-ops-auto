@@ -28,33 +28,57 @@
 
 ## 2. 安装步骤
 
+一键脚本：`bash scripts/install_external.sh` 会 clone FunClip 并自动打 stage2 patch（见 2.4）。
+之后按下面 2.2 建 venv、装依赖。
+
 ### 2.1 Clone FunClip 到 external/
 
 ```bash
 mkdir -p external && cd external
 git clone https://github.com/modelscope/FunClip.git
+# WSL/弱网下 GitHub HTTPS 持续 TLS 中断时，改用镜像：
+# git -c http.version=HTTP/1.1 clone https://kkgithub.com/modelscope/FunClip.git
 cd FunClip
 ```
 
 ### 2.2 为 FunClip 创建独立 venv（强烈推荐）
 
-FunClip 依赖 `torch`、`funasr`、`modelscope`，体积 GB 级，与主项目的 playwright/camoufox 共存极易出现 numpy/protobuf 版本冲突。**必须独立 venv**。
+FunClip 依赖 `torch`、`funasr`、`modelscope`，体积约 5.6 GB，与主项目的 playwright/camoufox 共存极易出现 numpy/protobuf 版本冲突。**必须独立 venv**。
 
 ```bash
 # 在 external/FunClip 目录下
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-# ffmpeg 系统包（Ubuntu/Debian）
-sudo apt-get install -y ffmpeg
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-### 2.3 模型预热（首次跑会自动下载 ~1.5GB）
+### 2.3 ffmpeg —— 用 venv 自带的 imageio-ffmpeg，无需 sudo
+
+FunClip 切片走 moviepy，依赖 `ffmpeg`。装 requirements 时已顺带装上 `imageio-ffmpeg`，它**自带一个静态编译的全功能 ffmpeg 二进制**，把它软链进 PATH 即可，不需要 `sudo apt`：
 
 ```bash
-# 用一段短视频试跑一次 stage 1，把模型缓存到 ~/.cache/modelscope/
-python funclip/videoclipper.py --stage 1 --file <短视频路径> --output_dir ./tmp
+FF=$(.venv/bin/python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+mkdir -p ~/.local/bin && ln -sf "$FF" ~/.local/bin/ffmpeg
+which ffmpeg   # 应输出 ~/.local/bin/ffmpeg
 ```
+
+> 注：`~/.local/bin` 需在 `PATH` 中。该 symlink 指向 venv 内的二进制，删 venv 会失链——重装 venv 后重跑此步即可。
+
+### 2.4 FunClip 上游 patch（stage 2 lang bug）
+
+FunClip 的 `funclip/videoclipper.py` 有个 bug：CLI `--stage 2` 单独调用时新建
+`VideoClipper(None)` 却漏设 `.lang`，导致 `video_clip()` 内 `self.lang == 'en'`
+抛 `AttributeError`。`scripts/install_external.sh` 会自动幂等修复；手动打则在
+`audio_clipper = VideoClipper(None)` 下一行补：
+
+```python
+        audio_clipper.lang = lang
+```
+
+### 2.5 模型自动下载（首次 stage 1 自动拉 ~1.3GB）
+
+无需预热脚本——首次 `transcribe`/`clip` 会自动把 4 个模型
+（Paraformer-large 944M + VAD + 标点 + CAM++ 说话人）下载到
+`~/.cache/modelscope/`，之后命中缓存。
 
 ## 3. 主项目配置
 
@@ -100,10 +124,22 @@ async def demo():
 
 | 现象 | 排查 |
 |------|------|
-| `health()` 返回 False | 检查 `FUNCLIP_PATH` 下是否有 `funclip/videoclipper.py`，`FUNCLIP_PYTHON` 是否存在 |
+| `health()` 返回 False | 检查 `FUNCLIP_PATH` 下是否有 `funclip/videoclipper.py`，`FUNCLIP_PYTHON` 指向的文件是否存在 |
+| `ModuleNotFoundError: librosa` 等 | `FUNCLIP_PYTHON` 必须指向 venv 的 `bin/python`；wrapper 已避免 `resolve()` 跟随 symlink，自定义调用时也别解析它，否则会脱离 venv |
+| stage 1 `IndexError: list index out of range` | 输入视频无可识别人声（纯音乐/静音），ASR 空结果。换有清晰语音的素材 |
 | stage 1 报模型下载失败 | 国内网络去 ModelScope 拉，或 `export MODELSCOPE_CACHE=...` 指本地缓存 |
-| stage 2 报 `dest_text not found` | 文本必须严格命中 SRT 里的某条 cue，建议先 transcribe 拿 cues 后挑文本 |
+| stage 2 报 `produced no clip` | `dest_text` 未命中任何语音段，必须严格匹配 SRT 里某条 cue 的文字——先 `transcribe()` 拿 `cues` 再挑文本 |
+| `AttributeError: 'VideoClipper' object has no attribute 'lang'` | FunClip stage2 lang patch 未打，见 2.4 |
+| `Couldn't find ffmpeg` | 见 2.3，把 imageio-ffmpeg 二进制软链进 PATH |
 | TimeoutError | 调大 `FUNCLIP_TIMEOUT_SECONDS`，30 min 视频建议给 3600+ |
+
+## 5.1 实测验证（2026-05-20）
+
+整条链路已在 WSL2 / Python 3.10 / CPU 实测打通：
+
+- transcribe：70s 中文语音 → 33 条 cue，时间戳与文本准确
+- clip：`dest_text='试错的过程很简单'` → 产出 1.76s 切片 `clip_001_no0.mp4`（h264+aac）+ 同名 `.srt`
+- 注意 FunClip 实际产物名是 `<output_file_stem>_no0.mp4`（wrapper 已自动扫描真实产物，调用方拿到的 `ClipArtifact.video_path` 即真实路径）
 
 ## 6. 后续接入点（不在本次范围）
 

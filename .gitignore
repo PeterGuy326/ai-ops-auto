@@ -32,6 +32,7 @@ data/*.db
 data/assets/*
 data/outputs/*
 data/cookies/
+data/clips/
 !data/assets/.gitkeep
 !data/outputs/.gitkeep
 

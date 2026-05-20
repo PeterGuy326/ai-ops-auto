@@ -13,8 +13,8 @@
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -97,6 +97,48 @@ def test_build_stage2_argv_without_dest_text_omits_flag():
     seg = ClipSegment(start_ms=1000, end_ms=3000)
     argv = c._build_stage2_argv("/tmp/a.mp4", Path("/tmp/out"), seg, Path("/tmp/out/clip_001.mp4"))
     assert "--dest_text" not in argv
+
+
+def test_python_entry_root_are_absolute(monkeypatch):
+    """回归：子进程 cwd 会切到 FunClip 仓库根，所以 _python / _entry /
+    _funclip_root 必须返绝对路径——否则相对路径会被叠成
+    external/FunClip/external/FunClip/... 触发 FileNotFoundError。
+    """
+    from ai_ops.video.clipper import funclip as mod
+
+    monkeypatch.setattr(mod.settings, "funclip_path", Path("./external/FunClip"))
+    monkeypatch.setattr(
+        mod.settings, "funclip_python", "./external/FunClip/.venv/bin/python"
+    )
+    c = FunClipClipper()
+    assert c._funclip_root().is_absolute()
+    assert c._entry().is_absolute()
+    assert Path(c._python()).is_absolute()
+
+
+def test_python_falls_back_to_sys_executable(monkeypatch):
+    from ai_ops.video.clipper import funclip as mod
+
+    monkeypatch.setattr(mod.settings, "funclip_python", "")
+    assert FunClipClipper()._python() == sys.executable
+
+
+def test_python_does_not_follow_symlink(tmp_path, monkeypatch):
+    """回归：venv 的 bin/python 是指向系统 python 的 symlink。若 _python()
+    用 resolve() 跟随该 symlink，子进程就用系统 python 启动、脱离 venv
+    site-packages，FunClip 装在 venv 里的 librosa 等会 ModuleNotFoundError。
+    _python() 必须保留 symlink 路径本身。
+    """
+    from ai_ops.video.clipper import funclip as mod
+
+    real = tmp_path / "real_python"
+    real.write_text("#!/bin/sh\n")
+    link = tmp_path / "venv_python"
+    link.symlink_to(real)
+    monkeypatch.setattr(mod.settings, "funclip_python", str(link))
+    c = FunClipClipper()
+    assert c._python() == str(link)
+    assert c._python() != str(real)
 
 
 # ---------------- health ----------------
@@ -214,12 +256,14 @@ async def test_clip_happy_path_two_segments(tmp_path, monkeypatch):
 
     async def fake_run(argv, cwd=None):
         call_log.append(argv)
-        # 第一次（stage 1）写 SRT，后续 stage 2 不需写
-        if "--stage" in argv and argv[argv.index("--stage") + 1] == "1":
-            idx = argv.index("--output_dir")
-            out_dir = Path(argv[idx + 1])
+        if argv[argv.index("--stage") + 1] == "1":
+            out_dir = Path(argv[argv.index("--output_dir") + 1])
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "res.srt").write_text(SRT_SAMPLE, encoding="utf-8")
+        else:  # stage 2：FunClip 实际产物是 <stem>_no0.mp4，不是 --output_file 原名
+            of = Path(argv[argv.index("--output_file") + 1])
+            of.parent.mkdir(parents=True, exist_ok=True)
+            (of.parent / f"{of.stem}_no0.mp4").write_bytes(b"fake mp4")
         return 0, "ok", ""
 
     c = FunClipClipper()
@@ -236,10 +280,42 @@ async def test_clip_happy_path_two_segments(tmp_path, monkeypatch):
     result = await c.clip(req)
     assert len(result.clips) == 2
     assert result.clips[0].dest_text == "乡村振兴"
+    assert result.clips[0].video_path.endswith("_no0.mp4")
+    assert Path(result.clips[0].video_path).exists()
     assert result.clips[1].meta["start_ost_ms"] == 100
     # 至少触发 stage1 + 2 次 stage2 = 3 次 _run
     assert len(call_log) == 3
     assert result.transcript is not None and len(result.transcript.cues) == 3
+
+
+@pytest.mark.asyncio
+async def test_clip_raises_when_stage2_produces_no_file(tmp_path, monkeypatch):
+    """回归：FunClip dest_text 无命中时走 else 分支——不写切片文件，但退出码
+    仍是 0。wrapper 必须扫描真实产物、察觉空结果并报错，而不是返回一个
+    根本不存在的预期路径。
+    """
+    from ai_ops.video.clipper import funclip as mod
+
+    monkeypatch.setattr(mod.settings, "funclip_path", tmp_path)
+
+    async def fake_run(argv, cwd=None):
+        if argv[argv.index("--stage") + 1] == "1":
+            out = Path(argv[argv.index("--output_dir") + 1])
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "res.srt").write_text(SRT_SAMPLE, encoding="utf-8")
+        # stage 2：退出码 0 但不写任何 _no*.mp4
+        return 0, "No period found in the audio", ""
+
+    c = FunClipClipper()
+    monkeypatch.setattr(c, "_run", fake_run)
+
+    req = ClipRequest(
+        input_video="/tmp/in.mp4",
+        segments=[ClipSegment(dest_text="转写里不存在的句子")],
+        output_dir=str(tmp_path / "clips"),
+    )
+    with pytest.raises(RuntimeError, match="produced no clip"):
+        await c.clip(req)
 
 
 @pytest.mark.asyncio
