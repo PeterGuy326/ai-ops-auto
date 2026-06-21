@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -558,7 +558,66 @@ def ui_articles(request: Request, s: Session = Depends(get_session)):
         "request": request, "title": "文章",
         "columns": ["id", "topic_id", "title", "content_type", "status", "scheduled_at", "created_at"],
         "rows": rows, "empty_hint": "POST /articles 创建一篇",
+        "link_col": "title", "link_id_col": "id", "link_prefix": "/ui/articles/",
     })
+
+
+@app.get("/ui/articles/{article_id}", response_class=HTMLResponse)
+def ui_article_detail(article_id: int, request: Request, message: str = "", s: Session = Depends(get_session)):
+    """素材详情 + 审核/分发操作页（先审后发）。"""
+    art = s.get(Article, article_id)
+    if art is None:
+        raise HTTPException(404, "素材不存在")
+    assets = list(art.assets)
+    # 候选账号：素材目标平台下的账号
+    plats = [Platform(p) for p in (art.target_platforms or [])]
+    candidate_accounts = []
+    if plats:
+        candidate_accounts = s.execute(
+            select(Account).where(Account.platform.in_([p.value for p in plats]))
+        ).scalars().all()
+    jobs = [
+        {"id": j.id, "account": (s.get(Account, j.account_id).nickname if s.get(Account, j.account_id) else j.account_id),
+         "platform": j.platform, "status": j.status, "platform_url": j.platform_url,
+         "finished_at": j.finished_at, "created_at": j.created_at}
+        for j in s.execute(select(PublishJob).where(PublishJob.article_id == article_id).order_by(PublishJob.id.desc())).scalars().all()
+    ]
+    return _templates.TemplateResponse(request, "article_detail.html", {
+        "request": request, "article": art, "assets": assets,
+        "candidate_accounts": candidate_accounts, "jobs": jobs, "message": message,
+    })
+
+
+@app.post("/ui/articles/{article_id}/approve")
+def ui_article_approve(article_id: int, s: Session = Depends(get_session)):
+    """后台按钮：审核通过，回素材详情。"""
+    from fastapi.responses import RedirectResponse
+    from ..content import distributor
+
+    try:
+        distributor.approve(s, article_id)
+        msg = "已审核通过，可分发"
+    except ValueError as e:
+        msg = f"操作失败：{e}"
+    return RedirectResponse(f"/ui/articles/{article_id}?message={msg}", status_code=303)
+
+
+@app.post("/ui/articles/{article_id}/distribute")
+def ui_article_distribute(
+    article_id: int,
+    account_ids: list[int] = Form(default=[]),
+    s: Session = Depends(get_session),
+):
+    """后台按钮：分发到所选账号（表单 account_ids 多选；空=按目标平台全选），回素材详情。"""
+    from fastapi.responses import RedirectResponse
+    from ..content import distributor
+
+    try:
+        jobs = distributor.distribute(s, article_id, account_ids=account_ids or None)
+        msg = f"已分发到 {len(jobs)} 个账号"
+    except ValueError as e:
+        msg = f"分发失败：{e}"
+    return RedirectResponse(f"/ui/articles/{article_id}?message={msg}", status_code=303)
 
 
 @app.get("/ui/accounts", response_class=HTMLResponse)
@@ -573,6 +632,7 @@ def ui_accounts(request: Request, s: Session = Depends(get_session)):
         "request": request, "title": "账号",
         "columns": ["id", "platform", "nickname", "health", "daily_quota", "last_publish_at", "created_at"],
         "rows": rows, "empty_hint": "POST /accounts 添加账号",
+        "link_col": "nickname", "link_id_col": "id", "link_prefix": "/ui/accounts/",
     })
 
 

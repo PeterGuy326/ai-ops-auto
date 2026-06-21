@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}{{ article.title }} · 素材详情{% endblock %}
+{% block body %}
+<h2>📄 {{ article.title }}　<span class="badge badge-{{ article.status }}">{{ article.status }}</span></h2>
+
+<div>
+  <div class="meta-card"><div class="label">素材 id</div><div class="value">{{ article.id }}</div></div>
+  <div class="meta-card"><div class="label">类型</div><div class="value" style="font-size:16px">{{ article.content_type }}</div></div>
+  <div class="meta-card"><div class="label">目标平台</div><div class="value" style="font-size:14px">{{ article.target_platforms | join(", ") or "-" }}</div></div>
+  <div class="meta-card"><div class="label">资产文件</div><div class="value">{{ assets | length }}</div></div>
+</div>
+
+{% if message %}<div style="margin-top:16px;padding:10px 14px;background:#1f6feb22;border:1px solid #1f6feb55;border-radius:6px;color:#79c0ff">{{ message }}</div>{% endif %}
+
+<h2 style="margin-top:28px">⚙️ 操作（先审后发）</h2>
+<div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+  {% if article.status == 'draft' %}
+    <form method="post" action="/ui/articles/{{ article.id }}/approve">
+      <button type="submit" style="background:#238636;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:14px;cursor:pointer">✓ 审核通过 → READY</button>
+    </form>
+    <span style="color:#8b949e;align-self:center">待审核。通过后才能分发，不会直发平台。</span>
+  {% elif article.status == 'ready' %}
+    <form method="post" action="/ui/articles/{{ article.id }}/distribute" class="meta-card" style="display:block">
+      <div class="label" style="margin-bottom:8px">选择分发账号（不选=按目标平台全选）</div>
+      {% for acc in candidate_accounts %}
+        <label style="display:block;margin:4px 0;font-size:13px">
+          <input type="checkbox" name="account_ids" value="{{ acc.id }}"> {{ acc.nickname }}
+          <span class="badge badge-{{ acc.health }}">{{ acc.platform }}</span>
+        </label>
+      {% else %}
+        <div style="color:#8b949e">该平台暂无账号，去 /ui/accounts 添加。</div>
+      {% endfor %}
+      <button type="submit" style="margin-top:10px;background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:14px;cursor:pointer">📤 分发到所选账号</button>
+    </form>
+  {% else %}
+    <span style="color:#8b949e">当前状态 <span class="badge badge-{{ article.status }}">{{ article.status }}</span>，无可用操作（已分发/已发布）。</span>
+  {% endif %}
+</div>
+
+{% if assets %}
+<h2 style="margin-top:28px">📎 资产文件</h2>
+<table><thead><tr><th>类型</th><th>路径</th><th>来源</th></tr></thead><tbody>
+{% for a in assets %}<tr><td>{{ a.asset_type }}</td><td><code>{{ a.local_path }}</code></td><td>{{ a.source }}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+
+<h2 style="margin-top:28px">📤 分发记录（按账号）</h2>
+{% if jobs %}
+<table><thead><tr><th>job</th><th>账号</th><th>平台</th><th>状态</th><th>链接</th><th>时间</th></tr></thead><tbody>
+{% for j in jobs %}<tr>
+  <td>{{ j.id }}</td><td>{{ j.account }}</td><td>{{ j.platform }}</td>
+  <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
+  <td>{% if j.platform_url %}<a href="{{ j.platform_url }}" target="_blank" style="color:#58a6ff">查看</a>{% else %}-{% endif %}</td>
+  <td>{{ j.finished_at or j.created_at }}</td>
+</tr>{% endfor %}
+</tbody></table>
+{% else %}
+<div class="empty">还没分发。{% if article.status == 'ready' %}用上面的按钮分发。{% else %}先审核通过。{% endif %}</div>
+{% endif %}
+<p style="margin-top:20px"><a href="/ui/articles" style="color:#58a6ff">← 返回素材列表</a></p>
+{% endblock %}

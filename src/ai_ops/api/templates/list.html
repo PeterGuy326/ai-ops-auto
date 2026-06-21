@@ -16,7 +16,9 @@
     {% for col in columns %}
       {% set v = row[col] %}
       <td>
-        {% if col == 'status' or col == 'health' %}
+        {% if link_col is defined and col == link_col and link_prefix %}
+          <a href="{{ link_prefix }}{{ row[link_id_col if link_id_col is defined else 'id'] }}" style="color:#58a6ff">{{ v if v is not none else "-" }}</a>
+        {% elif col == 'status' or col == 'health' %}
           <span class="badge badge-{{ v }}">{{ v }}</span>
         {% elif v is mapping or v is iterable and v is not string %}
           <code>{{ v }}</code>

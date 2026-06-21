@@ -86,3 +86,31 @@ def test_full_flow_history_and_distribute(client):
     assert "抖音老号" in html
     assert "去年爆款" in html and "逆袭短剧·第一集" in html
     assert "历史" in html and "系统" in html  # 来源标记
+
+
+def test_ui_interactive_approve_distribute(client):
+    """后台可点操作：素材详情页 → 审核按钮 → 分发按钮（纯表单 POST）。"""
+    tid = client.post("/topics", json={"name": "短剧", "category": "drama"}).json()["id"]
+    aid = client.post("/accounts", json={"platform": "douyin", "nickname": "抖音号X"}).json()["id"]
+    art_id = client.post("/articles", json={
+        "topic_id": tid, "title": "可点短剧", "content_type": "video", "target_platforms": ["douyin"],
+    }).json()["id"]
+
+    # 详情页（DRAFT）：应有"审核通过"按钮
+    page = client.get(f"/ui/articles/{art_id}")
+    assert page.status_code == 200 and "审核通过" in page.text
+
+    # 点"审核通过"（表单 POST，303 重定向回详情）
+    r = client.post(f"/ui/articles/{art_id}/approve", follow_redirects=False)
+    assert r.status_code == 303
+    page = client.get(f"/ui/articles/{art_id}")
+    assert "分发到所选账号" in page.text and "抖音号X" in page.text  # READY 显示分发表单+候选账号
+
+    # 点"分发"（勾选账号）
+    r = client.post(f"/ui/articles/{art_id}/distribute", data={"account_ids": [aid]}, follow_redirects=False)
+    assert r.status_code == 303
+    recs = client.get(f"/accounts/{aid}/jobs").json()
+    assert len(recs) == 1 and recs[0]["article_id"] == art_id
+
+    # 素材列表标题可点进详情
+    assert "/ui/articles/" in client.get("/ui/articles").text
