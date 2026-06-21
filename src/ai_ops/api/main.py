@@ -235,6 +235,58 @@ def api_transition_article(
         raise HTTPException(400, str(e))
 
 
+# ---------------- 素材分发中台（审核 → 按账号分发 → 留痕）----------------
+
+def _job_out(j: PublishJob) -> JobOut:
+    return JobOut(
+        id=j.id, article_id=j.article_id, account_id=j.account_id, platform=j.platform,
+        status=j.status, attempts=j.attempts, platform_post_id=j.platform_post_id,
+        platform_url=j.platform_url, error=j.error, scheduled_at=j.scheduled_at,
+        started_at=j.started_at, finished_at=j.finished_at,
+    )
+
+
+@app.post("/articles/{article_id}/approve", response_model=ArticleOut, dependencies=[Depends(require_api_key)])
+def api_approve_article(article_id: int, s: Session = Depends(get_session)):
+    """人工审核通过：DRAFT(待审) → READY(可分发)。"""
+    from ..content import distributor
+
+    try:
+        art = distributor.approve(s, article_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return content_mgr._to_article_out(art)
+
+
+@app.post("/articles/{article_id}/distribute", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
+def api_distribute_article(
+    article_id: int,
+    account_ids: Optional[list[int]] = None,
+    s: Session = Depends(get_session),
+):
+    """把审过的素材按账号扇出成分发记录（PublishJob）。
+
+    - 仅 READY 素材可分发（DRAFT 会 400，防误直发）。
+    - account_ids 为空 → 按素材 target_platforms 自动选号。
+    - 真发布由 scheduler.worker 消费（含风控闭环），本接口只建记录。
+    """
+    from ..content import distributor
+
+    try:
+        jobs = distributor.distribute(s, article_id, account_ids=account_ids)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return [_job_out(j) for j in jobs]
+
+
+@app.get("/accounts/{account_id}/jobs", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
+def api_account_jobs(account_id: int, limit: int = 100, s: Session = Depends(get_session)):
+    """按个人账号查全部分发记录（留痕）。"""
+    from ..content import distributor
+
+    return [_job_out(j) for j in distributor.list_account_jobs(s, account_id, limit=limit)]
+
+
 # ---------------- Accounts ----------------
 
 @app.post("/accounts", response_model=AccountOut, dependencies=[Depends(require_api_key)])
