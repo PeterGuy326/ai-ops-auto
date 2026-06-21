@@ -157,6 +157,97 @@ def stage_blog_content(
     )
 
 
+_BACKFILL_TOPIC_NAME = "历史导入"
+
+
+def _get_or_create_backfill_topic(session: Session) -> int:
+    from ..core.models import Topic
+
+    t = session.execute(
+        select(Topic).where(Topic.name == _BACKFILL_TOPIC_NAME)
+    ).scalar_one_or_none()
+    if t is None:
+        t = Topic(name=_BACKFILL_TOPIC_NAME, category="backfill", notes="历史/手动已发内容回填")
+        session.add(t)
+        session.flush()
+    return t.id
+
+
+def import_published_post(
+    session: Session,
+    account_id: int,
+    *,
+    title: str,
+    content_type: ContentType = ContentType.IMAGE_TEXT,
+    body: str = "",
+    platform_url: Optional[str] = None,
+    platform_post_id: Optional[str] = None,
+    published_at: Optional[datetime] = None,
+    topic_id: Optional[int] = None,
+    extra: Optional[dict] = None,
+) -> PublishJob:
+    """回填一条「历史/手动已发」内容，纳入按账号管理 + 喂查重。
+
+    底层逻辑：历史内容没走过本系统，但要让「按账号留痕 / dedup 查重 / 数据统计」
+    看到它。因此造一份 Article(status=PUBLISHED) + 一条 PublishJob(status=SUCCESS,
+    挂 account_id + platform_url)。平台取自账号；published_at 记到 finished_at。
+
+    幂等：同账号 + 同 platform_post_id（或 platform_url）已存在则不重复导入。
+    """
+    acc = session.get(Account, account_id)
+    if acc is None:
+        raise ValueError(f"账号 {account_id} 不存在")
+
+    # 幂等去重：按 (account_id, platform_post_id|platform_url)
+    if platform_post_id or platform_url:
+        existing = session.execute(
+            select(PublishJob).where(
+                PublishJob.account_id == account_id,
+                (PublishJob.platform_post_id == platform_post_id)
+                if platform_post_id
+                else (PublishJob.platform_url == platform_url),
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+
+    art = Article(
+        topic_id=topic_id or _get_or_create_backfill_topic(session),
+        title=title,
+        body=body,
+        content_type=content_type,
+        status=ArticleStatus.PUBLISHED,  # 历史已发 → 终态
+        target_platforms=[acc.platform.value if isinstance(acc.platform, Platform) else acc.platform],
+        extra={**(extra or {}), "backfill": True},
+    )
+    session.add(art)
+    session.flush()
+
+    job = PublishJob(
+        article_id=art.id,
+        account_id=account_id,
+        platform=acc.platform,
+        status=JobStatus.SUCCESS,  # 历史已成功发布
+        platform_url=platform_url,
+        platform_post_id=platform_post_id,
+        finished_at=published_at,
+        raw_response={"backfill": True},
+    )
+    session.add(job)
+    session.flush()
+    return job
+
+
+def import_published_bulk(
+    session: Session, account_id: int, posts: Sequence[dict]
+) -> list[PublishJob]:
+    """批量回填历史发布。posts 每项是 import_published_post 的 kwargs（不含 account_id）。"""
+    out: list[PublishJob] = []
+    for p in posts:
+        out.append(import_published_post(session, account_id, **p))
+    return out
+
+
 def approve(session: Session, article_id: int) -> Article:
     """人工审核通过：DRAFT → READY。"""
     art = session.get(Article, article_id)

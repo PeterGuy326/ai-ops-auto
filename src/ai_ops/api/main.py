@@ -281,10 +281,30 @@ def api_distribute_article(
 
 @app.get("/accounts/{account_id}/jobs", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
 def api_account_jobs(account_id: int, limit: int = 100, s: Session = Depends(get_session)):
-    """按个人账号查全部分发记录（留痕）。"""
+    """按个人账号查全部分发记录（含历史回填，留痕）。"""
     from ..content import distributor
 
     return [_job_out(j) for j in distributor.list_account_jobs(s, account_id, limit=limit)]
+
+
+@app.post("/accounts/{account_id}/import-published", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
+def api_import_published(
+    account_id: int,
+    posts: list[dict],
+    s: Session = Depends(get_session),
+):
+    """回填该账号「历史/手动已发」内容，纳入按账号管理 + 喂查重。
+
+    posts 每项：{title, content_type?, body?, platform_url?, platform_post_id?, published_at?}。
+    幂等：同账号 + 同 platform_post_id/url 不重复导入。
+    """
+    from ..content import distributor
+
+    try:
+        jobs = distributor.import_published_bulk(s, account_id, posts)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return [_job_out(j) for j in jobs]
 
 
 # ---------------- Accounts ----------------
