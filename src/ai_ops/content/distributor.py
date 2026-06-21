@@ -76,6 +76,87 @@ def stage_to_library(
     return art
 
 
+def stage_clip_plan(
+    session: Session,
+    topic_id: int,
+    plan,
+    *,
+    title: str,
+    tags: Sequence[str] = (),
+) -> list[Article]:
+    """ScriptToDramaPipeline/ClipToPublishPipeline 的 ClipPublishPlan → 素材库(DRAFT)。
+
+    一条切片(视频) = 一份素材，target_platforms = 该切片在计划里覆盖的所有平台。
+    生成即入库待审，不直发。
+    """
+    # 按 source_clip_path 归并：同一切片多平台 → 一份素材，多目标平台
+    by_clip: dict[str, dict] = {}
+    for item in plan.items:
+        clip = item.source_clip_path
+        slot = by_clip.setdefault(clip, {"platforms": [], "content": item.content})
+        if item.platform not in slot["platforms"]:
+            slot["platforms"].append(item.platform)
+
+    arts: list[Article] = []
+    for clip, slot in by_clip.items():
+        content = slot["content"]
+        arts.append(
+            stage_to_library(
+                session,
+                topic_id=topic_id,
+                title=title,
+                content_type=ContentType.VIDEO,
+                body=content.body,
+                video_paths=[clip],
+                target_platforms=slot["platforms"],
+                extra={**(content.extra or {}), "tags": list(tags) or list(content.tags)},
+            )
+        )
+    return arts
+
+
+def stage_podcast_result(
+    session: Session, topic_id: int, result, *, target_platforms: Sequence[Platform] = ()
+) -> Article:
+    """TopicToPodcastPipeline 的 PodcastResult → 素材库(DRAFT，AUDIO)。"""
+    art = result.artifact
+    audio = art.audio_path or art.audio_url
+    pc = result.publish_content
+    return stage_to_library(
+        session,
+        topic_id=topic_id,
+        title=(pc.title if pc else art.title) or "AI 播客",
+        content_type=ContentType.AUDIO,
+        body=(pc.body if pc else ""),
+        audio_paths=[audio] if audio else (),
+        target_platforms=target_platforms,
+        extra={"episode_id": art.episode_id, "audio_url": art.audio_url, "credits": art.credits},
+    )
+
+
+def stage_blog_content(
+    session: Session,
+    topic_id: int,
+    *,
+    title: str,
+    body: str,
+    target_platforms: Sequence[Platform] = (),
+    image_paths: Sequence[str] = (),
+    extra: Optional[dict] = None,
+) -> Article:
+    """博客/长文正文 → 素材库(DRAFT，LONG_ARTICLE)。"""
+    return stage_to_library(
+        session,
+        topic_id=topic_id,
+        title=title,
+        content_type=ContentType.LONG_ARTICLE,
+        body=body,
+        image_paths=image_paths,
+        target_platforms=target_platforms,
+        extra=extra or {},
+    )
+
+
 def approve(session: Session, article_id: int) -> Article:
     """人工审核通过：DRAFT → READY。"""
     art = session.get(Article, article_id)
