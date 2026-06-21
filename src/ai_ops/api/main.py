@@ -524,7 +524,7 @@ def ui_dashboard(request: Request, s: Session = Depends(get_session)):
     recent_jobs = s.execute(
         select(PublishJob).order_by(PublishJob.created_at.desc()).limit(10)
     ).scalars().all()
-    return _templates.TemplateResponse("dashboard.html", {
+    return _templates.TemplateResponse(request, "dashboard.html", {
         "request": request,
         "counts": counts,
         "hot_topics": top_topics(s, limit=5),
@@ -539,7 +539,7 @@ def ui_topics(request: Request, s: Session = Depends(get_session)):
          "heat_score": round(t.heat_score, 3), "created_at": t.created_at}
         for t in s.execute(select(Topic).order_by(Topic.id.desc())).scalars().all()
     ]
-    return _templates.TemplateResponse("list.html", {
+    return _templates.TemplateResponse(request, "list.html", {
         "request": request, "title": "主题",
         "columns": ["id", "name", "keywords", "heat_score", "created_at"],
         "rows": rows, "empty_hint": "POST /topics 创建第一个主题",
@@ -554,7 +554,7 @@ def ui_articles(request: Request, s: Session = Depends(get_session)):
          "scheduled_at": a.scheduled_at, "created_at": a.created_at}
         for a in s.execute(select(Article).order_by(Article.id.desc())).scalars().all()
     ]
-    return _templates.TemplateResponse("list.html", {
+    return _templates.TemplateResponse(request, "list.html", {
         "request": request, "title": "文章",
         "columns": ["id", "topic_id", "title", "content_type", "status", "scheduled_at", "created_at"],
         "rows": rows, "empty_hint": "POST /articles 创建一篇",
@@ -569,10 +569,39 @@ def ui_accounts(request: Request, s: Session = Depends(get_session)):
          "last_publish_at": a.last_publish_at, "created_at": a.created_at}
         for a in s.execute(select(Account).order_by(Account.id.desc())).scalars().all()
     ]
-    return _templates.TemplateResponse("list.html", {
+    return _templates.TemplateResponse(request, "list.html", {
         "request": request, "title": "账号",
         "columns": ["id", "platform", "nickname", "health", "daily_quota", "last_publish_at", "created_at"],
         "rows": rows, "empty_hint": "POST /accounts 添加账号",
+    })
+
+
+@app.get("/ui/accounts/{account_id}", response_class=HTMLResponse)
+def ui_account_detail(account_id: int, request: Request, s: Session = Depends(get_session)):
+    """账号详情：账号信息 + 该号全部发布记录（历史回填 + 系统新发，按账号留痕）。"""
+    from ..content import distributor
+
+    acc = s.get(Account, account_id)
+    if acc is None:
+        raise HTTPException(404, "账号不存在")
+    jobs = distributor.list_account_jobs(s, account_id, limit=500)
+    rows = []
+    backfill_count = 0
+    for j in jobs:
+        art = s.get(Article, j.article_id)
+        is_backfill = bool((art.extra or {}).get("backfill")) if art else False
+        if is_backfill:
+            backfill_count += 1
+        rows.append({
+            "id": j.id, "article_id": j.article_id,
+            "title": art.title if art else "-",
+            "content_type": art.content_type if art else "-",
+            "status": j.status, "backfill": is_backfill,
+            "platform_url": j.platform_url,
+            "finished_at": j.finished_at, "created_at": j.created_at,
+        })
+    return _templates.TemplateResponse(request, "account_detail.html", {
+        "request": request, "account": acc, "rows": rows, "backfill_count": backfill_count,
     })
 
 
@@ -585,7 +614,7 @@ def ui_jobs(request: Request, s: Session = Depends(get_session)):
          "started_at": j.started_at, "platform_url": j.platform_url or "-"}
         for j in s.execute(select(PublishJob).order_by(PublishJob.id.desc()).limit(50)).scalars().all()
     ]
-    return _templates.TemplateResponse("list.html", {
+    return _templates.TemplateResponse(request, "list.html", {
         "request": request, "title": "任务",
         "columns": ["id", "article_id", "account_id", "platform", "status", "attempts", "started_at", "platform_url"],
         "rows": rows, "empty_hint": "POST /jobs/{id}/run 触发任务",

@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}{{ account.nickname }} · 账号详情{% endblock %}
+{% block body %}
+<h2>📇 {{ account.nickname }}　<span class="badge badge-{{ account.health }}">{{ account.platform }}</span></h2>
+
+<div>
+  <div class="meta-card"><div class="label">平台</div><div class="value">{{ account.platform }}</div></div>
+  <div class="meta-card"><div class="label">健康度</div><div class="value">{{ account.health }}</div></div>
+  <div class="meta-card"><div class="label">日配额</div><div class="value">{{ account.daily_quota }}</div></div>
+  <div class="meta-card"><div class="label">总发布记录</div><div class="value">{{ rows | length }}</div></div>
+  <div class="meta-card"><div class="label">其中历史回填</div><div class="value">{{ backfill_count }}</div></div>
+  <div class="meta-card"><div class="label">最近发布</div><div class="value" style="font-size:14px">{{ account.last_publish_at or "-" }}</div></div>
+</div>
+
+<h2 style="margin-top:32px">📜 发布记录（历史 + 新发，按账号留痕）</h2>
+{% if rows %}
+<table>
+  <thead><tr>
+    <th>job</th><th>素材</th><th>标题</th><th>类型</th><th>状态</th><th>来源</th>
+    <th>链接</th><th>时间</th>
+  </tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td>{{ r.id }}</td>
+      <td>{{ r.article_id }}</td>
+      <td>{{ r.title }}</td>
+      <td>{{ r.content_type }}</td>
+      <td><span class="badge badge-{{ r.status }}">{{ r.status }}</span></td>
+      <td>{% if r.backfill %}<span class="badge badge-dead">历史</span>{% else %}<span class="badge badge-ready">系统</span>{% endif %}</td>
+      <td>{% if r.platform_url %}<a href="{{ r.platform_url }}" target="_blank" style="color:#58a6ff">查看</a>{% else %}-{% endif %}</td>
+      <td>{{ r.finished_at or r.created_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">这个账号还没有发布记录。<br>历史内容可 POST /accounts/{{ account.id }}/import-published 回填。</div>
+{% endif %}
+{% endblock %}
