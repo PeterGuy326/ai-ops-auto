@@ -14,9 +14,29 @@ class Settings(BaseSettings):
     llm_default: Literal["openai", "anthropic", "deepseek", "dashscope"] = "openai"
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
+    # 默认对话模型；指向阿里内网 IdeaLab 网关时设为 qwen3.7-max（OpenAI 兼容）
+    # 例：OPENAI_BASE_URL=https://idealab.alibaba-inc.com/api/openai/v1
+    #     OPENAI_MODEL=qwen3.7-max
+    openai_model: str = "gpt-4o-mini"
     anthropic_api_key: str = ""
     deepseek_api_key: str = ""
     dashscope_api_key: str = ""
+
+    # ====== AI 短剧视频 · 悟空开放平台 HappyHorse（内网，DashScope 异步协议）======
+    # 子AK aiopsauto，可用 happyhorse-1.0-t2v / sora-2 / veo-3.1 等，本地零算力
+    wukong_api_key: str = ""
+    wukong_video_model: str = "happyhorse-1.0-t2v"
+    # 内网 idealab 网关视频端点（实测可用）：
+    #   建任务  POST {base}            body {model, extendParams:{input:{prompt}, parameters:{...}}}
+    #   轮询    POST {base}/{job_id}   body {model}  → generations[0].url（done）/ status=running
+    wukong_video_jobs_url: str = (
+        "https://idealab.alibaba-inc.com/api/openai/v1/video/generations/jobs"
+    )
+    wukong_video_resolution: str = "720P"
+    wukong_video_ratio: str = "9:16"  # 竖屏短剧
+    wukong_timeout_seconds: int = 1800
+    wukong_poll_interval_seconds: int = 15
+    wukong_download: bool = True
 
     external_sau_path: Path = Path("./external/social-auto-upload")
     external_mpt_path: Path = Path("./external/MoneyPrinterTurbo")
@@ -121,6 +141,31 @@ class Settings(BaseSettings):
     # 默认输出根目录（每次调用会在下面建 run_<ts>/ 子目录隔离产物）
     funclip_output_root: Path = Path("./data/clips")
 
+
+    # ====== AI 短剧 · 可灵 Kling（云视频生成，快手；本地零算力）======
+    # 鉴权走 JWT(HS256)：iss=access_key，用 secret_key 签名，token 30min 过期。
+    kling_access_key: str = ""
+    kling_secret_key: str = ""
+    # 区域域名：api.klingai.com / api-beijing.klingai.com / api-singapore.klingai.com
+    kling_api_base: str = "https://api.klingai.com"
+    kling_model: str = "kling-v2-6"
+    # 生成清晰度档：std（性价比）/ pro（高画质）
+    kling_mode: str = "pro"
+    # 异步任务总超时 + 轮询间隔（秒）
+    kling_timeout_seconds: int = 1800
+    kling_poll_interval_seconds: int = 5
+    # 成片是否下载到本地（发布器要本地文件；Kling 生成物 30 天后清理，建议转存）
+    kling_download: bool = True
+
+    # ====== AI 播客 · ListenHub（云播客生成，ListenHub/Marswave）======
+    listenhub_api_key: str = ""
+    listenhub_api_base: str = "https://api.marswave.ai/openapi"
+    listenhub_timeout_seconds: int = 1800
+    # 文档建议首轮等 60s 再以 10s 间隔轮询
+    listenhub_poll_initial_seconds: int = 60
+    listenhub_poll_interval_seconds: int = 10
+    # 音频是否下载到本地（投流到视频平台时需要）
+    listenhub_download: bool = True
 
     # ====== Round 5 · schema 漂移自检 ======
     # 应用进程内是否在 lifespan startup 自动跑 alembic upgrade head。

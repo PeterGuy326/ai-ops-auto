@@ -21,6 +21,7 @@ class ContentType(str, Enum):
     IMAGE_TEXT = "image_text"
     VIDEO = "video"
     LONG_ARTICLE = "long_article"
+    AUDIO = "audio"  # AI 播客等音频内容
 
 
 class ArticleStatus(str, Enum):
@@ -79,6 +80,12 @@ class VideoEngineKind(str, Enum):
     MONEY_PRINTER_TURBO = "money_printer_turbo"
     NARRATO_AI = "narrato_ai"
     FFMPEG_RAW = "ffmpeg_raw"
+    KLING = "kling"  # 可灵（快手）云视频生成，AI 短剧主力，本地零算力
+
+
+class PodcastProviderKind(str, Enum):
+    """AI 播客生成提供方类型（云 API，本地零算力）。"""
+    LISTENHUB = "listenhub"  # ListenHub / Marswave 云播客 API
 
 
 class VideoClipperKind(str, Enum):

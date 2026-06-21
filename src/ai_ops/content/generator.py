@@ -50,7 +50,7 @@ class OpenAIDriver(LLMDriver):
 
         client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
         resp = await client.chat.completions.create(
-            model=kwargs.get("model", "gpt-4o-mini"),
+            model=kwargs.get("model", settings.openai_model),
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=kwargs.get("temperature", 0.7),
         )

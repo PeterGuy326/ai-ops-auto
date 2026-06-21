@@ -268,6 +268,37 @@ class ClipPublishPlan(BaseModel):
     meta: dict = Field(default_factory=dict)
 
 
+# ============ AI 播客（ListenHub 这类云播客）============
+class PodcastSpeaker(BaseModel):
+    """播客说话人——speaker_id 由 provider 的音色列表给出。"""
+    speaker_id: str
+    name: str = ""
+
+
+class PodcastBrief(BaseModel):
+    """喂给 PodcastProviderBase.generate 的标准化任务。"""
+    query: str                                   # 主题 / prompt
+    speakers: list[PodcastSpeaker] = Field(default_factory=list)
+    language: str = "zh"
+    mode: str = "deep"                           # quick / deep / debate
+    # 参考素材（URL 或文本），对应 ListenHub sources
+    source_urls: list[str] = Field(default_factory=list)
+    extra: dict = Field(default_factory=dict)
+
+
+class PodcastArtifact(BaseModel):
+    """播客生成产物：音频 + 文稿。"""
+    episode_id: str
+    title: str = ""
+    audio_url: Optional[str] = None              # 远端 MP3（可能有时效）
+    audio_stream_url: Optional[str] = None       # m3u8 流
+    audio_path: Optional[str] = None             # 下载到本地后的路径
+    scripts: list[dict] = Field(default_factory=list)  # [{speakerId,speakerName,content}]
+    credits: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    meta: dict = Field(default_factory=dict)
+
+
 class JobOut(BaseModel):
     id: int
     article_id: int
