@@ -38,6 +38,31 @@ SIMHASH_HAMMING_THRESHOLD = 8
 SIMHASH_LOOKBACK_DAYS = 7
 
 
+def schedule_job_runs(jobs, *, default_when: datetime | None = None) -> list[tuple[int, datetime]]:
+    """把一批 PublishJob 排期到调度器自动执行（分发→真发布的接线）。
+
+    复用 queue.schedule_publish 的 jitter + 凌晨保护 + 风控间隔；每条 job 按其
+    scheduled_at（缺省用 default_when 或 now）排期，到点自动调 execute_job。
+
+    容错：调度后端未启动 / 无事件循环（如单测、CLI）时静默跳过，不阻塞建记录——
+    真发布在 API 进程（lifespan 已 queue.start()）里才需要。
+    """
+    from .queue import queue
+
+    planned_base = default_when or datetime.utcnow()
+    out: list[tuple[int, datetime]] = []
+    for j in jobs:
+        when = getattr(j, "scheduled_at", None) or planned_base
+        try:
+            _sid, actual = queue.schedule_publish(
+                when, (lambda jid=j.id: execute_job(jid)), job_id=f"pub-{j.id}"
+            )
+            out.append((j.id, actual))
+        except Exception as e:  # 无 loop / 调度器未启 → 跳过，不影响记录
+            logger.warning("schedule_job_runs: skipped job %s (%s)", getattr(j, "id", "?"), e)
+    return out
+
+
 async def execute_job(job_id: int) -> PublishResult:
     """执行一个 PublishJob。"""
     with session_scope() as s:

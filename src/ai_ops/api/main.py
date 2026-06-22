@@ -276,6 +276,9 @@ def api_distribute_article(
         jobs = distributor.distribute(s, article_id, account_ids=account_ids)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # 分发→真发布接线：排期自动执行（jitter/风控/夜间保护复用）
+    from ..scheduler.worker import schedule_job_runs
+    schedule_job_runs(jobs)
     return [_job_out(j) for j in jobs]
 
 
@@ -672,7 +675,9 @@ def ui_article_distribute(
 
     try:
         jobs = distributor.distribute(s, article_id, account_ids=account_ids or None)
-        msg = f"已分发到 {len(jobs)} 个账号"
+        from ..scheduler.worker import schedule_job_runs
+        schedule_job_runs(jobs)
+        msg = f"已分发到 {len(jobs)} 个账号（已排期自动发布）"
     except ValueError as e:
         msg = f"分发失败：{e}"
     return RedirectResponse(f"/ui/articles/{article_id}?message={msg}", status_code=303)
