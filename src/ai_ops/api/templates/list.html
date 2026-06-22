@@ -3,6 +3,15 @@
 {% block body %}
 <h2>{{ title }}（{{ rows | length }}）</h2>
 
+{% if filters %}
+<div style="margin:12px 0;display:flex;gap:8px;flex-wrap:wrap">
+  {% for f in filters %}
+    <a href="{{ f.href }}" style="text-decoration:none;font-size:13px;padding:5px 12px;border-radius:14px;
+       {% if f.active %}background:#1f6feb;color:#fff{% else %}background:#21262d;color:#c9d1d9{% endif %}">{{ f.label }}</a>
+  {% endfor %}
+</div>
+{% endif %}
+
 {% if rows %}
 <table>
   <thead>

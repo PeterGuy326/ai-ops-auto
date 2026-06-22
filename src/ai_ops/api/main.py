@@ -21,7 +21,7 @@ from ..observability import init_observability
 from .auth import require_api_key
 from ..content import manager as content_mgr
 from ..core.db import SessionLocal, init_db
-from ..core.enums import ArticleStatus, JobStatus, Platform
+from ..core.enums import ArticleStatus, ContentType, JobStatus, Platform
 from ..core.models import Account, Article, PublishJob, Topic
 from ..core.schemas import (
     AccountIn,
@@ -547,18 +547,54 @@ def ui_topics(request: Request, s: Session = Depends(get_session)):
 
 
 @app.get("/ui/articles", response_class=HTMLResponse)
-def ui_articles(request: Request, s: Session = Depends(get_session)):
+def ui_articles(
+    request: Request,
+    status: Optional[str] = None,
+    content_type: Optional[str] = None,
+    s: Session = Depends(get_session),
+):
+    """素材库统一入口：文章/视频/博客/播客一处管，按状态 + 类型筛选（含「待审」专属视图）。"""
+    q = select(Article).order_by(Article.id.desc())
+    if status:
+        q = q.where(Article.status == status)
+    if content_type:
+        q = q.where(Article.content_type == content_type)
     rows = [
         {"id": a.id, "topic_id": a.topic_id, "title": a.title,
          "content_type": a.content_type, "status": a.status,
          "scheduled_at": a.scheduled_at, "created_at": a.created_at}
-        for a in s.execute(select(Article).order_by(Article.id.desc())).scalars().all()
+        for a in s.execute(q).scalars().all()
+    ]
+
+    def _chip(label, key, val):
+        cur = {"status": status, "content_type": content_type}
+        if val is None:
+            cur[key] = None
+        else:
+            cur[key] = val
+        qs = "&".join(f"{k}={v}" for k, v in cur.items() if v)
+        href = "/ui/articles" + (f"?{qs}" if qs else "")
+        active = (status if key == "status" else content_type) == val
+        return {"label": label, "href": href, "active": active}
+
+    filters = [
+        _chip("全部状态", "status", None),
+        _chip("🕒 待审", "status", ArticleStatus.DRAFT.value),
+        _chip("✓ 已审", "status", ArticleStatus.READY.value),
+        _chip("📤 已分发", "status", ArticleStatus.SCHEDULED.value),
+        _chip("✅ 已发布", "status", ArticleStatus.PUBLISHED.value),
+        _chip("｜全部类型", "content_type", None),
+        _chip("🎬 视频", "content_type", ContentType.VIDEO.value),
+        _chip("📝 长文/博客", "content_type", ContentType.LONG_ARTICLE.value),
+        _chip("🖼 图文", "content_type", ContentType.IMAGE_TEXT.value),
+        _chip("🎙 音频/播客", "content_type", ContentType.AUDIO.value),
     ]
     return _templates.TemplateResponse(request, "list.html", {
-        "request": request, "title": "文章",
+        "request": request, "title": "素材库",
         "columns": ["id", "topic_id", "title", "content_type", "status", "scheduled_at", "created_at"],
-        "rows": rows, "empty_hint": "POST /articles 创建一篇",
+        "rows": rows, "empty_hint": "POST /articles 创建，或生成/回填后自动入库",
         "link_col": "title", "link_id_col": "id", "link_prefix": "/ui/articles/",
+        "filters": filters,
     })
 
 

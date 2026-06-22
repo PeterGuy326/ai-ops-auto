@@ -114,3 +114,26 @@ def test_ui_interactive_approve_distribute(client):
 
     # 素材列表标题可点进详情
     assert "/ui/articles/" in client.get("/ui/articles").text
+
+
+def test_ui_library_filters(client):
+    """素材库统一入口：按类型/状态筛选 + 待审专属视图。"""
+    tid = client.post("/topics", json={"name": "混合", "category": "g"}).json()["id"]
+    # 造不同类型 + 不同状态的素材
+    v = client.post("/articles", json={"topic_id": tid, "title": "视频草稿", "content_type": "video"}).json()["id"]
+    client.post("/articles", json={"topic_id": tid, "title": "长文草稿", "content_type": "long_article"})
+    client.post("/articles", json={"topic_id": tid, "title": "音频草稿", "content_type": "audio"})
+    client.post(f"/articles/{v}/approve")  # 视频 → READY
+
+    # 全部：3 条都在
+    allp = client.get("/ui/articles").text
+    assert "视频草稿" in allp and "长文草稿" in allp and "音频草稿" in allp
+    assert "素材库" in allp  # 标题改名
+
+    # 按类型筛选：只看视频
+    vid = client.get("/ui/articles?content_type=video").text
+    assert "视频草稿" in vid and "长文草稿" not in vid and "音频草稿" not in vid
+
+    # 待审专属视图(draft)：视频已 READY 不在，长文/音频在
+    draft = client.get("/ui/articles?status=draft").text
+    assert "长文草稿" in draft and "音频草稿" in draft and "视频草稿" not in draft
