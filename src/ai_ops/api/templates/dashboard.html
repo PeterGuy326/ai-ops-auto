@@ -1,16 +1,48 @@
 {% extends "base.html" %}
 {% block title %}总览 · ai-ops-auto{% endblock %}
 {% block body %}
-<h2>总览</h2>
+<h2>📊 运营看板</h2>
 
+<div style="margin-bottom:8px;color:#8b949e;font-size:13px">待办 · 今日</div>
 <div>
-  <div class="meta-card"><div class="label">主题</div><div class="value">{{ counts.topics }}</div></div>
-  <div class="meta-card"><div class="label">文章</div><div class="value">{{ counts.articles }}</div></div>
-  <div class="meta-card"><div class="label">账号</div><div class="value">{{ counts.accounts }}</div></div>
-  <div class="meta-card"><div class="label">任务</div><div class="value">{{ counts.jobs }}</div></div>
-  <div class="meta-card"><div class="label">已发布</div><div class="value">{{ counts.published }}</div></div>
-  <div class="meta-card"><div class="label">失败</div><div class="value">{{ counts.failed }}</div></div>
+  <a href="/ui/articles?status=draft" style="text-decoration:none">
+    <div class="meta-card" style="border-color:{{ '#d29922' if counts.pending_review else '#30363d' }}">
+      <div class="label">🕒 待审素材</div>
+      <div class="value" style="color:{{ '#d29922' if counts.pending_review else '#58a6ff' }}">{{ counts.pending_review }}</div>
+    </div>
+  </a>
+  <a href="/ui/articles?status=ready" style="text-decoration:none">
+    <div class="meta-card"><div class="label">✓ 待分发</div><div class="value">{{ counts.ready }}</div></div>
+  </a>
+  <div class="meta-card"><div class="label">📤 今日分发</div><div class="value">{{ counts.today_jobs }}</div></div>
+  <div class="meta-card"><div class="label">✅ 今日成功</div><div class="value">{{ counts.today_success }}</div></div>
+  <div class="meta-card"><div class="label">💀 累计失败</div><div class="value" style="color:{{ '#da3633' if counts.failed else '#58a6ff' }}">{{ counts.failed }}</div></div>
 </div>
+
+<div style="margin:16px 0 8px;color:#8b949e;font-size:13px">资产 · 账号</div>
+<div>
+  <a href="/ui/articles" style="text-decoration:none"><div class="meta-card"><div class="label">素材库</div><div class="value">{{ counts.articles }}</div></div></a>
+  <div class="meta-card"><div class="label">已发布</div><div class="value">{{ counts.published }}</div></div>
+  <a href="/ui/accounts" style="text-decoration:none"><div class="meta-card"><div class="label">账号</div><div class="value">{{ counts.accounts }}</div></div></a>
+  <div class="meta-card"><div class="label">主题</div><div class="value">{{ counts.topics }}</div></div>
+</div>
+
+<h2 style="margin-top:40px">🩺 各平台账号健康</h2>
+{% if platform_health %}
+<table>
+  <thead><tr><th>平台</th><th>健康度分布</th></tr></thead>
+  <tbody>
+  {% for plat, hmap in platform_health.items() %}
+    <tr>
+      <td>{{ plat }}</td>
+      <td>{% for h, n in hmap.items() %}<span class="badge badge-{{ h }}">{{ h }} × {{ n }}</span> {% endfor %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">还没有账号。POST /accounts 添加。</div>
+{% endif %}
 
 <h2 style="margin-top: 40px;">🔥 热门主题（heat_score 倒排）</h2>
 {% if hot_topics %}

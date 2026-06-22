@@ -137,3 +137,24 @@ def test_ui_library_filters(client):
     # 待审专属视图(draft)：视频已 READY 不在，长文/音频在
     draft = client.get("/ui/articles?status=draft").text
     assert "长文草稿" in draft and "音频草稿" in draft and "视频草稿" not in draft
+
+
+def test_ui_dashboard_operations(client):
+    """运营看板：待审计数 + 今日分发 + 各平台账号健康。"""
+    tid = client.post("/topics", json={"name": "看板", "category": "g"}).json()["id"]
+    acc = client.post("/accounts", json={"platform": "douyin", "nickname": "看板号"}).json()["id"]
+    # 2 个待审 + 1 个走到分发
+    client.post("/articles", json={"topic_id": tid, "title": "待审1", "content_type": "video"})
+    client.post("/articles", json={"topic_id": tid, "title": "待审2", "content_type": "audio"})
+    art = client.post("/articles", json={"topic_id": tid, "title": "要发", "content_type": "video", "target_platforms": ["douyin"]}).json()["id"]
+    client.post(f"/articles/{art}/approve")
+    client.post(f"/articles/{art}/distribute", json=[acc])
+
+    page = client.get("/ui")
+    assert page.status_code == 200
+    html = page.text
+    assert "运营看板" in html
+    assert "🕒 待审素材" in html and "各平台账号健康" in html
+    assert "douyin" in html  # 平台健康行
+    # 待审视图链接可达
+    assert '/ui/articles?status=draft' in html

@@ -513,6 +513,10 @@ def health():
 def ui_dashboard(request: Request, s: Session = Depends(get_session)):
     from ..content.heat_engine import top_topics
 
+    from datetime import datetime
+    from ..core.enums import AccountHealth
+
+    today_start = datetime(datetime.utcnow().year, datetime.utcnow().month, datetime.utcnow().day)
     counts = {
         "topics": s.scalar(select(func.count(Topic.id))) or 0,
         "articles": s.scalar(select(func.count(Article.id))) or 0,
@@ -520,13 +524,31 @@ def ui_dashboard(request: Request, s: Session = Depends(get_session)):
         "jobs": s.scalar(select(func.count(PublishJob.id))) or 0,
         "published": s.scalar(select(func.count(Article.id)).where(Article.status == ArticleStatus.PUBLISHED)) or 0,
         "failed": s.scalar(select(func.count(PublishJob.id)).where(PublishJob.status == JobStatus.DEAD)) or 0,
+        # 运营看板关键指标
+        "pending_review": s.scalar(select(func.count(Article.id)).where(Article.status == ArticleStatus.DRAFT)) or 0,
+        "ready": s.scalar(select(func.count(Article.id)).where(Article.status == ArticleStatus.READY)) or 0,
+        "today_jobs": s.scalar(select(func.count(PublishJob.id)).where(PublishJob.created_at >= today_start)) or 0,
+        "today_success": s.scalar(
+            select(func.count(PublishJob.id)).where(
+                PublishJob.created_at >= today_start, PublishJob.status == JobStatus.SUCCESS
+            )
+        ) or 0,
     }
+    # 各平台账号健康（platform → {health: n}）
+    health_rows = s.execute(
+        select(Account.platform, Account.health, func.count(Account.id)).group_by(Account.platform, Account.health)
+    ).all()
+    platform_health: dict = {}
+    for plat, health, n in health_rows:
+        platform_health.setdefault(plat, {})[health] = n
+
     recent_jobs = s.execute(
         select(PublishJob).order_by(PublishJob.created_at.desc()).limit(10)
     ).scalars().all()
     return _templates.TemplateResponse(request, "dashboard.html", {
         "request": request,
         "counts": counts,
+        "platform_health": platform_health,
         "hot_topics": top_topics(s, limit=5),
         "recent_jobs": recent_jobs,
     })
