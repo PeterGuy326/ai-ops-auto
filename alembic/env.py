@@ -31,6 +31,7 @@ if _SRC.exists() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from ai_ops.core.models import Base  # noqa: E402
+import ai_ops.jobhunt.models  # noqa: E402,F401  (注册 jobhunt 四张表到 Base.metadata)
 
 config = context.config
 

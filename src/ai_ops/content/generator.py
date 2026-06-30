@@ -71,7 +71,76 @@ class AnthropicDriver(LLMDriver):
         return resp.content[0].text if resp.content else ""
 
 
+class ClaudeCliDriver(LLMDriver):
+    """通过本地 `claude` CLI(headless) 调用 —— 复用用户已登录的 Claude Code。
+
+    动机：自用工具不想再单独配 OpenAI/Anthropic API key、也不想简历数据流向第三方。
+    走 `claude -p --output-format json`，鉴权/额度全用本机 Claude Code 现有配置。
+    与项目里 notify/lark_cli.py 的 subprocess-wrapper 同款模式。
+
+    注意：每次调用 spawn 一个 claude 子进程，比直连 API 慢；额度计入用户的 Claude 订阅。
+    """
+
+    async def complete(self, system: str, user: str, **kwargs) -> str:
+        import asyncio
+
+        model = kwargs.get("model") or settings.claude_cli_model
+        cmd = [settings.claude_cli_bin, "-p", "--output-format", "json"]
+        if system:
+            cmd += ["--system-prompt", system]
+        if model:
+            cmd += ["--model", model]
+        json_schema = kwargs.get("json_schema")
+        if json_schema:
+            import json as _json
+            cmd += ["--json-schema", _json.dumps(json_schema, ensure_ascii=False)]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(user.encode("utf-8")),
+                timeout=settings.claude_cli_timeout_seconds,
+            )
+        except asyncio.TimeoutError as e:
+            proc.kill()
+            raise RuntimeError(
+                f"claude CLI 超时（>{settings.claude_cli_timeout_seconds}s）"
+            ) from e
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"claude CLI 退出码 {proc.returncode}：{err.decode('utf-8', 'ignore')[:500]}"
+            )
+        return _parse_cli_envelope(out)
+
+
+def _parse_cli_envelope(stdout: bytes) -> str:
+    """从 `claude -p --output-format json` 的信封里抠出 result 文本。
+
+    信封形如 {"type":"result","subtype":"success","is_error":false,"result":"...",...}。
+    is_error=true 或解析失败 → 抛错（让上游按失败处理，不返回脏数据）。
+    """
+    import json
+
+    raw = stdout.decode("utf-8", "ignore").strip()
+    if not raw:
+        raise RuntimeError("claude CLI 无输出")
+    try:
+        env = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"claude CLI 输出非 JSON 信封：{raw[:300]}") from e
+    if env.get("is_error"):
+        raise RuntimeError(f"claude CLI 返回错误：{env.get('result') or env.get('subtype')}")
+    return env.get("result", "") or ""
+
+
 def get_driver() -> LLMDriver:
+    if settings.llm_default == "claude_cli":
+        return ClaudeCliDriver()
     if settings.llm_default == "anthropic":
         return AnthropicDriver()
     return OpenAIDriver()

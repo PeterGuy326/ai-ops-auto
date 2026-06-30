@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/ai_ops.db"
     fernet_key: str = ""
 
-    llm_default: Literal["openai", "anthropic", "deepseek", "dashscope"] = "openai"
+    llm_default: Literal["openai", "anthropic", "deepseek", "dashscope", "claude_cli"] = "openai"
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     # 默认对话模型；指向阿里内网 IdeaLab 网关时设为 qwen3.7-max（OpenAI 兼容）
@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     deepseek_api_key: str = ""
     dashscope_api_key: str = ""
+
+    # ====== 本地 Claude Code 作为 LLM 后端（LLM_DEFAULT=claude_cli）======
+    # 走本机 `claude -p` headless，复用已登录的 Claude Code 鉴权/额度，
+    # 无需单独 OpenAI/Anthropic key，简历数据不流向第三方。
+    claude_cli_bin: str = "claude"          # claude 可执行文件（不在 PATH 时填绝对路径）
+    claude_cli_model: str = ""              # 空=用 Claude Code 默认模型；可填 sonnet/opus/haiku
+    claude_cli_timeout_seconds: int = 120   # 单次 subprocess 超时（兜底防卡死）
 
     # ====== AI 短剧视频 · 悟空开放平台 HappyHorse（内网，DashScope 异步协议）======
     # 子AK aiopsauto，可用 happyhorse-1.0-t2v / sora-2 / veo-3.1 等，本地零算力
@@ -58,6 +65,10 @@ class Settings(BaseSettings):
     browser_headless: bool = False
     # 代理（每账号绑定独立 IP 是反风控核心。格式：http://user:pass@host:port）
     browser_proxy: str = ""
+    # CDP 远程调试端点：配了就不自启浏览器，转而 connect_over_cdp 复用用户已登录的真 Chrome。
+    # 高风控平台（Boss 直聘）最稳：直接借你本人浏览器的登录态，无需导出/注入 cookie。
+    # 形如 "http://127.0.0.1:9333"；留空=老路子（自启浏览器 + 注入 cookie）。
+    browser_cdp_url: str = ""
     # 发布间隔下限（秒）— 同账号两次发布最小间隔，规避频率检测
     publish_min_interval_seconds: int = 14400  # 默认 4 小时
     # 单账号每日发布上限（小红书新号 1，养号期后 2-3 最稳）

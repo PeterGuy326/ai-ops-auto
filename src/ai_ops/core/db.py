@@ -6,6 +6,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import settings
 from .models import Base
+# 把分散在子包的 ORM 模型显式注册到 Base.metadata——
+# 否则 init_db() 的 create_all 扫不到 jobhunt 四张表（仅 import 副作用，故 noqa）。
+from ..jobhunt import models as _jobhunt_models  # noqa: E402,F401
 
 _engine = create_engine(
     settings.database_url,

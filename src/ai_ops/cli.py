@@ -5,6 +5,7 @@ import typer
 
 from .config import settings
 from .core.db import init_db as _init_db
+from .jobhunt.cli_commands import jobhunt_app
 from .reports.cli_commands import report_app
 
 app = typer.Typer(help="ai-ops-auto CLI")
@@ -35,6 +36,9 @@ def cmd_gen_fernet_key():
 
 # 数据回流自动出报子组：`python -m ai_ops.cli report daily/weekly`
 app.add_typer(report_app, name="report")
+
+# 求职投递专题：`python -m ai_ops.cli jobhunt parse-resume ...`
+app.add_typer(jobhunt_app, name="jobhunt")
 
 
 if __name__ == "__main__":

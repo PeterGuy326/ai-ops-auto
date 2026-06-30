@@ -43,6 +43,8 @@ stealth = ["patchright>=1.40"]
 # 反检测顶配档：Firefox + C++ 层指纹欺骗，小红书首选
 # 安装后需跑：python -m camoufox fetch
 stealth-pro = ["camoufox[geoip]>=0.4"]
+# 求职投递专题（jobhunt）：解析 PDF / Word 简历。txt/md 无需此档。
+jobhunt = ["pypdf>=4", "python-docx>=1.1"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

@@ -48,6 +48,7 @@ class AssetType(str, Enum):
     VIDEO = "video"
     AUDIO = "audio"
     SUBTITLE = "subtitle"
+    DOCUMENT = "document"  # 简历 PDF/Word 等文档（jobhunt 专题）
 
 
 class AssetSource(str, Enum):
