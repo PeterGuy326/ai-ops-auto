@@ -174,11 +174,14 @@ def build_dry_run_plan(
 
 
 def _new_session_factory(database_path: Path):
+    from ..core.db import enable_sqlite_foreign_keys
+
     engine = create_engine(
         URL.create("sqlite+pysqlite", database=str(database_path)),
         future=True,
         connect_args={"check_same_thread": False},
     )
+    enable_sqlite_foreign_keys(engine)
     factory = sessionmaker(
         bind=engine,
         autoflush=False,

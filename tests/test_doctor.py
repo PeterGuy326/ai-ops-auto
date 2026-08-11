@@ -9,6 +9,7 @@ from cryptography.fernet import Fernet
 import pytest
 from sqlalchemy import create_engine, text
 
+from ai_ops.core.models import Base
 from ai_ops.doctor import (
     CheckOutcome,
     DoctorCheck,
@@ -23,6 +24,7 @@ from ai_ops.doctor import (
     _resource_check,
     _runtime_check,
     _scheduler_check,
+    _security_checks,
     run_doctor,
 )
 
@@ -42,6 +44,7 @@ def _config(tmp_path: Path, **overrides):
         "fernet_key": Fernet.generate_key().decode(),
         "api_host": "127.0.0.1",
         "api_key": "test-api-key",
+        "legacy_dev_auth_bypass": False,
         "scheduler_backend": "apscheduler",
         "scheduler_timezone": "Asia/Shanghai",
         "scheduler_poll_seconds": 15,
@@ -76,21 +79,21 @@ def _create_at_head_database(config) -> None:
     head = _migration_heads(_source_resource_root())[0]
     engine = create_engine(config.database_url)
     try:
+        Base.metadata.create_all(engine)
         with engine.begin() as connection:
+            # These feature models live in separate modules and are irrelevant
+            # to the Agent-contract shape assertions below.  Doctor still
+            # treats their migrated tables as core deployment resources.
             for table_name in (
-                "topics",
-                "articles",
-                "assets",
-                "accounts",
-                "publish_jobs",
-                "metrics",
                 "resume_profiles",
                 "job_postings",
                 "job_matches",
                 "applications",
                 "job_accounts",
             ):
-                connection.execute(text(f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY)"))
+                connection.execute(
+                    text(f"CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY)")
+                )
             connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32))"))
             connection.execute(
                 text("INSERT INTO alembic_version(version_num) VALUES (:head)"),
@@ -223,6 +226,9 @@ def test_postgresql_probe_sets_transaction_read_only_before_catalog_queries(monk
                 "articles",
                 "assets",
                 "accounts",
+                "publication_plans",
+                "approval_requests",
+                "agent_operations",
                 "publish_jobs",
                 "metrics",
                 "resume_profiles",
@@ -232,6 +238,40 @@ def test_postgresql_probe_sets_transaction_read_only_before_catalog_queries(monk
                 "job_accounts",
                 "alembic_version",
             ]
+
+        def get_columns(self, table_name):
+            from ai_ops.doctor import _AGENT_CONTRACT_REQUIRED_COLUMNS
+
+            return [{"name": name} for name in _AGENT_CONTRACT_REQUIRED_COLUMNS.get(table_name, ())]
+
+        def get_foreign_keys(self, table_name):
+            from ai_ops.doctor import _AGENT_CONTRACT_REQUIRED_FOREIGN_KEYS
+
+            return [
+                {
+                    "constrained_columns": constrained,
+                    "referred_table": referred_table,
+                    "referred_columns": referred,
+                }
+                for source, constrained, referred_table, referred in (
+                    _AGENT_CONTRACT_REQUIRED_FOREIGN_KEYS
+                )
+                if source == table_name
+            ]
+
+        def get_unique_constraints(self, table_name):
+            from ai_ops.doctor import _AGENT_CONTRACT_REQUIRED_UNIQUES
+
+            return [
+                {"column_names": columns}
+                for source, columns in _AGENT_CONTRACT_REQUIRED_UNIQUES
+                if source == table_name
+            ]
+
+        def get_check_constraints(self, table_name):
+            from ai_ops.doctor import _AGENT_CONTRACT_REQUIRED_CHECKS
+
+            return [{"name": name} for name in _AGENT_CONTRACT_REQUIRED_CHECKS]
 
     monkeypatch.setattr("ai_ops.doctor.create_engine", lambda *_args, **_kwargs: FakeEngine())
     monkeypatch.setattr("ai_ops.doctor.inspect", lambda _connection: FakeInspector())
@@ -278,6 +318,29 @@ def test_schema_at_head_still_fails_when_a_migrated_table_is_missing(tmp_path):
 
     assert schema.outcome == CheckOutcome.FAIL
     assert schema.details["missing_core_tables"] == ["job_accounts"]
+
+
+def test_schema_at_head_fails_when_agent_contract_columns_are_missing(tmp_path):
+    config = _config(tmp_path)
+    _create_at_head_database(config)
+    engine = create_engine(config.database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("DROP TABLE agent_operations"))
+            connection.execute(
+                text(
+                    "CREATE TABLE agent_operations ("
+                    "id INTEGER PRIMARY KEY, principal_id VARCHAR(128) NOT NULL)"
+                )
+            )
+    finally:
+        engine.dispose()
+
+    report = run_doctor(config, module_probe=lambda _name: True)
+    schema = {check.check_id: check for check in report.checks}["database.schema"]
+
+    assert schema.outcome == CheckOutcome.FAIL
+    assert "response_json" in schema.details["missing_columns"]["agent_operations"]
 
 
 def test_missing_packaged_resources_is_a_core_failure(tmp_path):
@@ -438,9 +501,9 @@ def test_local_video_adapter_requires_repository_isolated_python(tmp_path):
     (mpt_root / "main.py").write_text("", encoding="utf-8")
     config = _config(tmp_path, external_mpt_path=mpt_root, mpt_python="")
 
-    check = {
-        item.check_id: item for item in _adapter_checks(config, lambda _name: None)
-    }["adapter.money_printer_turbo"]
+    check = {item.check_id: item for item in _adapter_checks(config, lambda _name: None)}[
+        "adapter.money_printer_turbo"
+    ]
 
     assert check.outcome == CheckOutcome.WARN
     assert "isolated Python is not configured" in check.details["problems"]
@@ -452,9 +515,9 @@ def test_local_video_adapter_requires_repository_isolated_python(tmp_path):
     (mpt_root / ".venv" / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
     config.mpt_python = str(python)
 
-    ready = {
-        item.check_id: item for item in _adapter_checks(config, lambda _name: None)
-    }["adapter.money_printer_turbo"]
+    ready = {item.check_id: item for item in _adapter_checks(config, lambda _name: None)}[
+        "adapter.money_printer_turbo"
+    ]
     assert ready.outcome == CheckOutcome.PASS
 
 
@@ -503,6 +566,182 @@ def test_report_never_contains_raw_database_proxy_or_endpoint_values(tmp_path):
     assert secret not in rendered
 
 
+def test_agent_contract_security_requires_distinct_principal_ids(tmp_path):
+    one_human = SimpleNamespace(
+        principal_id="same-human",
+        type="human",
+        scopes=("approval:decide", "content:stage"),
+    )
+    config = _config(tmp_path, agent_principals=[one_human])
+
+    check = {item.check_id: item for item in _security_checks(config)}["security.agent_contract"]
+
+    assert check.outcome == CheckOutcome.WARN
+    assert check.details["independent_pair"] is False
+
+
+def test_agent_contract_security_accepts_distinct_caller_and_approver(tmp_path):
+    caller = SimpleNamespace(
+        principal_id="creator-agent",
+        type="agent",
+        scopes=(
+            "content:stage",
+            "plan:create",
+            "approval:request",
+            "schedule:create",
+        ),
+    )
+    approver = SimpleNamespace(
+        principal_id="human-reviewer",
+        type="human",
+        scopes=("approval:read", "approval:decide"),
+    )
+    config = _config(tmp_path, agent_principals=[caller, approver])
+
+    check = {item.check_id: item for item in _security_checks(config)}["security.agent_contract"]
+
+    assert check.outcome == CheckOutcome.PASS
+    assert check.details["independent_pair"] is True
+
+
+def test_agent_principals_with_empty_legacy_key_fail_auth_check_independently(
+    tmp_path,
+):
+    caller = SimpleNamespace(
+        principal_id="creator-agent",
+        type="agent",
+        scopes=(
+            "content:stage",
+            "plan:create",
+            "approval:request",
+            "schedule:create",
+        ),
+    )
+    approver = SimpleNamespace(
+        principal_id="human-reviewer",
+        type="human",
+        scopes=("approval:read", "approval:decide"),
+    )
+    config = _config(
+        tmp_path,
+        api_host="127.0.0.1",
+        api_key="",
+        agent_principals=[caller, approver],
+    )
+
+    by_id = {item.check_id: item for item in _security_checks(config)}
+
+    api_auth = by_id["security.api_auth"]
+    assert api_auth.outcome == CheckOutcome.WARN
+    assert api_auth.details == {
+        "loopback": True,
+        "api_key_configured": False,
+        "configured_principals": 2,
+        "dev_bypass_requested": False,
+        "dev_bypass_effective": False,
+    }
+    assert "fail closed" in api_auth.summary
+
+    agent_contract = by_id["security.agent_contract"]
+    assert agent_contract.outcome == CheckOutcome.PASS
+    assert agent_contract.details["independent_pair"] is True
+
+
+def test_empty_legacy_key_without_principals_fails_closed_by_default(tmp_path):
+    config = _config(
+        tmp_path,
+        api_host="127.0.0.1",
+        api_key="",
+        agent_principals=[],
+    )
+
+    by_id = {item.check_id: item for item in _security_checks(config)}
+
+    assert by_id["security.api_auth"].outcome == CheckOutcome.PASS
+    assert "fail closed" in by_id["security.api_auth"].summary
+    assert by_id["security.agent_contract"].outcome == CheckOutcome.WARN
+
+
+def test_explicit_loopback_legacy_dev_bypass_is_warned(tmp_path):
+    config = _config(
+        tmp_path,
+        api_host="127.0.0.1",
+        api_key="",
+        agent_principals=[],
+        legacy_dev_auth_bypass=True,
+    )
+
+    check = {item.check_id: item for item in _security_checks(config)}["security.api_auth"]
+
+    assert check.outcome == CheckOutcome.WARN
+    assert check.details["dev_bypass_effective"] is True
+
+
+def test_explicit_non_loopback_legacy_dev_bypass_fails(tmp_path):
+    config = _config(
+        tmp_path,
+        api_host="0.0.0.0",
+        api_key="",
+        agent_principals=[],
+        legacy_dev_auth_bypass=True,
+    )
+
+    check = {item.check_id: item for item in _security_checks(config)}["security.api_auth"]
+
+    assert check.outcome == CheckOutcome.FAIL
+    assert check.details["dev_bypass_effective"] is True
+
+
+def test_agent_contract_security_requires_complete_workflow_scopes(tmp_path):
+    caller = SimpleNamespace(
+        principal_id="creator-agent",
+        type="agent",
+        scopes=("content:stage", "plan:create"),
+    )
+    approver = SimpleNamespace(
+        principal_id="human-reviewer",
+        type="human",
+        scopes=("approval:read", "approval:decide"),
+    )
+
+    check = {
+        item.check_id: item
+        for item in _security_checks(_config(tmp_path, agent_principals=[caller, approver]))
+    }["security.agent_contract"]
+
+    assert check.outcome == CheckOutcome.WARN
+    assert check.details["missing_operational_scopes"] == [
+        "approval:request",
+        "schedule:create",
+    ]
+
+
+def test_agent_contract_human_approver_requires_read_and_decide(tmp_path):
+    caller = SimpleNamespace(
+        principal_id="creator-agent",
+        type="agent",
+        scopes=(
+            "content:stage",
+            "plan:create",
+            "approval:request",
+            "schedule:create",
+        ),
+    )
+    approver = SimpleNamespace(
+        principal_id="human-reviewer",
+        type="human",
+        scopes=("approval:decide",),
+    )
+
+    check = {
+        item.check_id: item
+        for item in _security_checks(_config(tmp_path, agent_principals=[caller, approver]))
+    }["security.agent_contract"]
+
+    assert check.outcome == CheckOutcome.WARN
+    assert check.details["human_approvers"] == 0
+
+
 def test_check_order_is_stable(tmp_path):
     report = run_doctor(_config(tmp_path), module_probe=lambda _name: True)
 
@@ -515,6 +754,7 @@ def test_check_order_is_stable(tmp_path):
         "safety.publication",
         "security.credential_key",
         "security.api_auth",
+        "security.agent_contract",
         "scheduler.configuration",
         "browser.runtime",
         "adapter.zhihu_cli",

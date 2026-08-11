@@ -95,7 +95,9 @@ def test_serve_cli_reads_api_settings_and_allows_explicit_override(monkeypatch):
     import uvicorn
 
     calls: list[dict] = []
-    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: calls.append({"args": args, **kwargs}))
+    monkeypatch.setattr(
+        uvicorn, "run", lambda *args, **kwargs: calls.append({"args": args, **kwargs})
+    )
     monkeypatch.setattr(cli.settings, "api_host", "127.0.0.9")
     monkeypatch.setattr(cli.settings, "api_port", 8123)
     monkeypatch.setattr(cli.settings, "api_log_level", "warning")
@@ -125,16 +127,20 @@ def test_zhihu_login_cli_uses_explicit_qrcode_flow(monkeypatch):
     from ai_ops.core.enums import Platform
     from ai_ops.publishers.zhihu_cli import ZhihuCliPublisher
 
+    account = SimpleNamespace(
+        platform=Platform.ZHIHU,
+        profile={"external_account_id": "zhihu:id:old-value"},
+    )
+
     @contextmanager
     def fake_scope():
-        yield SimpleNamespace(
-            get=lambda model, account_id: SimpleNamespace(platform=Platform.ZHIHU)
-        )
+        yield SimpleNamespace(get=lambda model, account_id: account)
 
     calls: list[int] = []
 
     async def fake_login(self, account_id):
         calls.append(account_id)
+        self.last_external_account_id = "zhihu:id:person-id"
         return True
 
     monkeypatch.setattr(db_mod, "session_scope", fake_scope)
@@ -145,3 +151,8 @@ def test_zhihu_login_cli_uses_explicit_qrcode_flow(monkeypatch):
     assert result.exit_code == 0, result.output
     assert calls == [17]
     assert "在线验证" in result.output
+    assert "zhihu:id:person-id" in result.output
+    assert 'PATCH /accounts/17 提交 {"external_account_id":"zhihu:id:person-id"}' in result.output
+    assert "保存到 Account.profile" in result.output
+    assert "不会自动修改数据库" in result.output
+    assert account.profile == {"external_account_id": "zhihu:id:old-value"}

@@ -3,6 +3,7 @@
 No test imports or contacts the real upstream package.  Subprocess behavior is
 faked, except for one local sleeper executable used to prove timeout cleanup.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -13,11 +14,15 @@ import pytest
 from ai_ops.config import settings
 from ai_ops.core.enums import AccountHealth, ContentType, Platform, PublisherKind
 from ai_ops.core.schemas import PublishContent
+from ai_ops.publishers.base import AgentContractRendererUnavailable
 from ai_ops.publishers.registry import build_default_registry
 from ai_ops.publishers.zhihu_cli import (
     ZhihuCliPublisher,
     _CommandResult,
     _parse_article_confirmation,
+    _parse_whoami_external_account_id,
+    normalize_zhihu_external_account_id,
+    project_zhihu_agent_payload,
 )
 from ai_ops.runtime.receipts import read_publish_receipt
 
@@ -29,6 +34,7 @@ def cli_settings(tmp_path, monkeypatch):
     asset_root.mkdir()
     monkeypatch.setattr(settings, "zhihu_cli_profile_root", profile_root)
     monkeypatch.setattr(settings, "zhihu_cli_asset_root", asset_root)
+    monkeypatch.setattr(settings, "agent_asset_vault_root", asset_root)
     monkeypatch.setattr(settings, "zhihu_cli_max_content_bytes", 60_000)
     monkeypatch.setattr(settings, "zhihu_cli_max_image_bytes", 1024 * 1024)
     monkeypatch.setattr(settings, "zhihu_cli_max_total_image_bytes", 2 * 1024 * 1024)
@@ -50,10 +56,118 @@ def _content(**overrides) -> PublishContent:
     return PublishContent(**values)
 
 
+def test_agent_contract_renderer_descriptor_and_projection_are_stable_and_path_free(
+    cli_settings,
+):
+    from PIL import Image
+
+    _, asset_root = cli_settings
+    image_paths = [asset_root / "first.jpg", asset_root / "second.jpg"]
+    for path in image_paths:
+        Image.new("RGB", (2, 2), color=(25, 50, 75)).save(path, format="JPEG")
+    content = _content(
+        images=[str(path) for path in image_paths],
+        exact_approval=True,
+    )
+    publisher = ZhihuCliPublisher()
+
+    projection = project_zhihu_agent_payload(content)
+    material = publisher.agent_contract_digest_material(content)
+    descriptor = publisher.agent_contract_renderer_descriptor
+
+    assert publisher.supports_agent_contract_renderer is True
+    assert descriptor is not None
+    assert descriptor.renderer_id == "zhihu-cli.article-argv"
+    assert descriptor.contract_version == (
+        "4+python-markdown-3.10.3+account-id+bounds-v1+media-preflight-v1"
+    )
+    assert descriptor.adapter_version == "0.2.4"
+    assert descriptor.requires_external_account_id is True
+    assert material["renderer"]["requires_external_account_id"] is True
+    assert descriptor.asset_rules[0].digest_material() == {
+        "asset_type": "image",
+        "min_count": 0,
+        "max_count": 9,
+    }
+    assert projection == material["payload"]
+    assert projection["topic_ids"] == ["123", "456"]
+    assert projection["image_slots"] == [
+        {"asset_type": "image", "index": 0},
+        {"asset_type": "image", "index": 1},
+    ]
+    assert "<strong>加粗</strong>" in projection["body_html"]
+    assert str(asset_root) not in json.dumps(material, ensure_ascii=False)
+
+
+def test_agent_contract_renderer_rejects_media_that_publish_would_reject(
+    cli_settings,
+    monkeypatch,
+):
+    _, asset_root = cli_settings
+    invalid_jpeg = asset_root / "invalid.jpg"
+    invalid_jpeg.write_bytes(b"not-a-jpeg")
+    publisher = ZhihuCliPublisher()
+
+    with pytest.raises(AgentContractRendererUnavailable, match="media preflight"):
+        publisher.agent_contract_digest_material(
+            _content(images=[str(invalid_jpeg)], exact_approval=True)
+        )
+
+    from PIL import Image
+
+    valid_jpeg = asset_root / "valid.jpg"
+    Image.new("RGB", (2, 2), color=(25, 50, 75)).save(valid_jpeg, format="JPEG")
+    monkeypatch.setattr(settings, "zhihu_cli_max_image_bytes", 1)
+    with pytest.raises(AgentContractRendererUnavailable, match="media preflight"):
+        publisher.agent_contract_digest_material(
+            _content(images=[str(valid_jpeg)], exact_approval=True)
+        )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"tags": ["unsupported"]},
+        {"videos": ["/vault/video.mp4"]},
+        {"content_type": ContentType.AUDIO},
+        {"extra": {"zhihu_topic_ids": ["123"], "unknown": True}},
+        {"extra": {"tags": []}},
+    ],
+)
+def test_agent_contract_renderer_rejects_unaccounted_zhihu_fields(updates):
+    content = _content(exact_approval=True).model_copy(update=updates)
+
+    with pytest.raises(AgentContractRendererUnavailable):
+        project_zhihu_agent_payload(content)
+
+
+@pytest.mark.parametrize(
+    "topic_ids",
+    [
+        [str(value) for value in range(1, 22)],
+        ["01"],
+        ["0"],
+        ["1" * 33],
+        ["123", "123"],
+    ],
+)
+def test_agent_projection_bounds_topic_ids(topic_ids):
+    content = _content(extra={"zhihu_topic_ids": topic_ids}, exact_approval=True)
+
+    with pytest.raises(AgentContractRendererUnavailable):
+        project_zhihu_agent_payload(content)
+
+
+def test_agent_projection_bounds_rendered_html_by_configured_utf8_bytes(monkeypatch):
+    monkeypatch.setattr(settings, "zhihu_cli_max_content_bytes", 100)
+
+    with pytest.raises(AgentContractRendererUnavailable, match="content-byte limit"):
+        project_zhihu_agent_payload(_content(body="界" * 40, exact_approval=True))
+
+
 def test_confirmation_requires_matching_numeric_marker_and_url():
     output = (
-        "\x1b[32mArticle published!  ID: 12345\x1b[0m\r\n"
-        "https://zhuanlan.zhihu.com/p/12345\r\n"
+        "\x1b[32mArticle published!  ID: 12345\x1b[0m\r\nhttps://zhuanlan.zhihu.com/p/12345\r\n"
     )
     assert _parse_article_confirmation(output) == (
         "12345",
@@ -61,6 +175,18 @@ def test_confirmation_requires_matching_numeric_marker_and_url():
     )
     assert _parse_article_confirmation(output.replace("/12345", "/99999")) is None
     assert _parse_article_confirmation("Article may have been published but no ID returned") is None
+
+
+def test_whoami_uses_stable_id_and_never_falls_back_to_mutable_url_token():
+    assert _parse_whoami_external_account_id('{"id":"person_123","url_token":"vanity"}') == (
+        "zhihu:id:person_123"
+    )
+    assert _parse_whoami_external_account_id('{"url_token":"vanity"}') is None
+    assert _parse_whoami_external_account_id('{"id":"not:canonical"}') is None
+    assert _parse_whoami_external_account_id("not-json") is None
+    assert normalize_zhihu_external_account_id("zhihu:id:person_123") == ("zhihu:id:person_123")
+    with pytest.raises(ValueError):
+        normalize_zhihu_external_account_id(" person_123 ")
 
 
 def test_account_profiles_are_isolated_and_private(cli_settings):
@@ -105,10 +231,7 @@ def test_publish_builds_argv_without_shell_and_keeps_secrets_out_of_result(
         return _CommandResult(
             started=True,
             returncode=0,
-            stdout=(
-                "Article published!  ID: 7788\n"
-                "https://zhuanlan.zhihu.com/p/7788\n"
-            ),
+            stdout=("Article published!  ID: 7788\nhttps://zhuanlan.zhihu.com/p/7788\n"),
         )
 
     monkeypatch.setattr(pub, "_audited_version_ready", ready)
@@ -134,6 +257,148 @@ def test_publish_builds_argv_without_shell_and_keeps_secrets_out_of_result(
     assert durable["platform_post_id"] == "7788"
 
 
+def test_exact_approval_does_not_trim_the_reviewed_title(cli_settings, monkeypatch):
+    pub = ZhihuCliPublisher()
+    calls: list[tuple[str, ...]] = []
+
+    async def ready(account_id):
+        return True, "0.2.4"
+
+    async def identity(account_id):
+        return AccountHealth.HEALTHY, "", "zhihu:id:person-id"
+
+    async def fake_run(account_id, *args, timeout=None):
+        calls.append(args)
+        return _CommandResult(
+            started=True,
+            returncode=0,
+            stdout=("Article published!  ID: 7788\nhttps://zhuanlan.zhihu.com/p/7788\n"),
+        )
+
+    monkeypatch.setattr(pub, "_audited_version_ready", ready)
+    monkeypatch.setattr(pub, "_session_identity", identity)
+    monkeypatch.setattr(pub, "_run", fake_run)
+    content = _content(
+        title="  Human-approved title  ",
+        exact_approval=True,
+        approved_external_account_id="zhihu:id:person-id",
+        operation_id="f" * 32,
+    )
+    projection = project_zhihu_agent_payload(content)
+
+    result = asyncio.run(pub.publish(7, {}, content))
+
+    assert result.success is True
+    separator = calls[0].index("--")
+    assert calls[0][separator + 1] == "  Human-approved title  "
+    assert calls[0][separator + 2] == projection["body_html"]
+
+
+def test_exact_approval_account_mismatch_fails_before_write_with_constant_time_compare(
+    cli_settings,
+    monkeypatch,
+):
+    from ai_ops.publishers import zhihu_cli as module
+
+    pub = ZhihuCliPublisher()
+    compared: list[tuple[str, str]] = []
+
+    async def ready(account_id):
+        return True, "0.2.4"
+
+    async def identity(account_id):
+        return AccountHealth.HEALTHY, "", "zhihu:id:currently-logged-in"
+
+    async def must_not_write(*args, **kwargs):
+        raise AssertionError("article subprocess must not start")
+
+    def compare_digest(observed, approved):
+        compared.append((observed, approved))
+        return False
+
+    monkeypatch.setattr(pub, "_audited_version_ready", ready)
+    monkeypatch.setattr(pub, "_session_identity", identity)
+    monkeypatch.setattr(pub, "_run", must_not_write)
+    monkeypatch.setattr(module.secrets, "compare_digest", compare_digest)
+
+    result = asyncio.run(
+        pub.publish(
+            7,
+            {},
+            _content(
+                exact_approval=True,
+                approved_external_account_id="zhihu:id:human-approved",
+            ),
+        )
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is False
+    assert "写入未开始" in (result.error or "")
+    assert compared == [("zhihu:id:currently-logged-in", "zhihu:id:human-approved")]
+
+
+def test_interactive_login_holds_account_operation_lease(cli_settings, monkeypatch):
+    from ai_ops.publishers import zhihu_cli as module
+
+    pub = ZhihuCliPublisher()
+    events: list[object] = []
+
+    class FakeLease:
+        def __init__(self, account_id, *, timeout_seconds):
+            events.append(("lease", account_id, timeout_seconds))
+
+        async def __aenter__(self):
+            events.append("enter")
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            events.append("exit")
+
+    async def locked(account_id):
+        events.append(("login", account_id))
+        pub.last_external_account_id = "zhihu:id:person-id"
+        return True
+
+    monkeypatch.setattr(module, "AccountOperationLease", FakeLease)
+    monkeypatch.setattr(pub, "_login_interactive_locked", locked)
+    monkeypatch.setattr(settings, "account_operation_lock_timeout_seconds", 23)
+
+    assert asyncio.run(pub.login_interactive(9)) is True
+    assert events == [("lease", 9, 23), "enter", ("login", 9), "exit"]
+    assert pub.last_external_account_id == "zhihu:id:person-id"
+
+
+def test_interactive_login_fails_safely_when_account_operation_lease_is_busy(
+    cli_settings,
+    monkeypatch,
+):
+    from ai_ops.publishers import zhihu_cli as module
+
+    pub = ZhihuCliPublisher()
+
+    class BusyLease:
+        def __init__(self, account_id, *, timeout_seconds):
+            pass
+
+        async def __aenter__(self):
+            raise module.AccountOperationLeaseTimeout("busy")
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            raise AssertionError("a failed enter must not call exit")
+
+    async def must_not_login(account_id):
+        raise AssertionError("login must not start without the account lease")
+
+    monkeypatch.setattr(module, "AccountOperationLease", BusyLease)
+    monkeypatch.setattr(pub, "_login_interactive_locked", must_not_login)
+
+    assert asyncio.run(pub.login_interactive(9)) is False
+    assert "其他操作" in (pub.last_login_error or "")
+
+
 @pytest.mark.parametrize(
     ("returncode", "stdout"),
     [
@@ -142,9 +407,7 @@ def test_publish_builds_argv_without_shell_and_keeps_secrets_out_of_result(
         (1, "Failed to publish article: connection reset"),
     ],
 )
-def test_started_but_unconfirmed_write_is_uncertain(
-    cli_settings, monkeypatch, returncode, stdout
-):
+def test_started_but_unconfirmed_write_is_uncertain(cli_settings, monkeypatch, returncode, stdout):
     pub = ZhihuCliPublisher()
 
     async def ready(account_id):
@@ -181,10 +444,7 @@ def test_nonzero_exit_preserves_matching_candidate_identity(cli_settings, monkey
         return _CommandResult(
             started=True,
             returncode=1,
-            stdout=(
-                "Article published!  ID: 7788\n"
-                "https://zhuanlan.zhihu.com/p/7788\n"
-            ),
+            stdout=("Article published!  ID: 7788\nhttps://zhuanlan.zhihu.com/p/7788\n"),
         )
 
     monkeypatch.setattr(pub, "_audited_version_ready", ready)

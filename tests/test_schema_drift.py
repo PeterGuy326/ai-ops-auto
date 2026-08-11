@@ -16,6 +16,7 @@ env 隔离：alembic Python API 走 env.py 的 `_resolve_database_url()`，
 优先读 `DATABASE_URL` env —— 用 monkeypatch.setenv 把 env 指到 tmp DB，
 不影响默认 settings.database_url 也不污染 ./data/ai_ops.db。
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -163,9 +164,7 @@ def test_alembic_config_falls_back_to_wheel_share(tmp_path, monkeypatch):
     assert Path(cfg.config_file_name) == installed_ini
 
 
-def test_check_schema_drift_in_sync_when_db_at_head(
-    tmp_db_url, tmp_db_path
-):
+def test_check_schema_drift_in_sync_when_db_at_head(tmp_db_url, tmp_db_path):
     """DB stamp 到 head + 跑 upgrade head（真建表）后，check_schema_drift 报 in_sync=True。"""
     # 走真 upgrade，建出所有表（含 alembic_version 写入 head）
     _run_alembic_command("upgrade", "head")
@@ -254,9 +253,7 @@ def test_try_auto_upgrade_respects_disabled_default(tmp_db_url, monkeypatch):
     assert db_mod.get_db_alembic_head() == "b09fbf0bf0f0"
 
 
-def test_try_auto_upgrade_promotes_old_db_to_head(
-    production_session_on_tmp, tmp_db_url
-):
+def test_try_auto_upgrade_promotes_old_db_to_head(production_session_on_tmp, tmp_db_url):
     """真实事故重现 + 闭环验证（Round 5 P9 事故）：
 
     构造场景：dev DB 是 baseline 时代 create_all 建的（业务表都在，但只跑了 baseline migration，
@@ -274,11 +271,13 @@ def test_try_auto_upgrade_promotes_old_db_to_head(
     #
     # 更简便的等价路径：直接走 baseline migration 真 upgrade（不 upgrade head）
     from alembic import command
+
     cfg = db_mod._alembic_config()
     command.upgrade(cfg, "b09fbf0bf0f0")  # 只跑 baseline，不跑后续
 
     # sanity：业务表已建，字段还没加（这正是 P9 事故现场）
     from sqlalchemy import inspect as _inspect
+
     cols = [c["name"] for c in _inspect(engine).get_columns("publish_jobs")]
     assert "superseded_by_job_id" not in cols, "构造失败：baseline 不该有这字段"
 
@@ -305,6 +304,7 @@ def test_try_auto_upgrade_promotes_old_db_to_head(
     # Round 6 新加：metrics.source 字段也应被升级路径自动加上
     metrics_cols_after = [c["name"] for c in _inspect(engine).get_columns("metrics")]
     assert "source" in metrics_cols_after, "Round 6 metrics.source 字段必须被自动升级加上"
+    assert "agent_operation_id" in metrics_cols_after
 
 
 def test_try_auto_upgrade_dry_run_does_not_change_db(tmp_db_url):
@@ -369,10 +369,7 @@ def test_safe_init_refuses_partial_unversioned_business_schema_without_mutation(
     _, engine = production_session_on_tmp
     with engine.begin() as conn:
         conn.execute(
-            text(
-                "CREATE TABLE topics ("
-                "id INTEGER PRIMARY KEY, name VARCHAR(128) NOT NULL)"
-            )
+            text("CREATE TABLE topics (id INTEGER PRIMARY KEY, name VARCHAR(128) NOT NULL)")
         )
 
     with pytest.raises(db_mod.DatabaseSchemaError, match="unsafe unversioned schema refused"):

@@ -1,7 +1,18 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, Integer, Float
+from sqlalchemy import (
+    BigInteger,
+    JSON,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .enums import (
@@ -58,18 +69,39 @@ class Article(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
     topic: Mapped["Topic"] = relationship(back_populates="articles")
-    assets: Mapped[list["Asset"]] = relationship(back_populates="article")
+    # Asset order affects carousels/covers and is part of the approval digest.
+    # Primary-key order preserves insertion order across session reloads.
+    assets: Mapped[list["Asset"]] = relationship(
+        back_populates="article",
+        order_by="Asset.id",
+    )
     jobs: Mapped[list["PublishJob"]] = relationship(back_populates="article")
+    publication_plans: Mapped[list["PublicationPlan"]] = relationship(back_populates="article")
 
 
 class Asset(Base):
     __tablename__ = "assets"
+    __table_args__ = (
+        CheckConstraint(
+            "(storage_kind IS NULL AND content_sha256 IS NULL AND size_bytes IS NULL) OR "
+            "(storage_kind IS NOT NULL AND content_sha256 IS NOT NULL "
+            "AND size_bytes IS NOT NULL AND storage_kind = 'agent_vault_v1' "
+            "AND length(content_sha256) = 64 AND size_bytes >= 0)",
+            name="ck_assets_vault_metadata_complete",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     article_id: Mapped[Optional[int]] = mapped_column(ForeignKey("articles.id"), nullable=True)
     asset_type: Mapped[AssetType] = mapped_column(String(32))
     source: Mapped[AssetSource] = mapped_column(String(32))
     local_path: Mapped[str] = mapped_column(String(512))
+    # Contract-v1 assets are copied into the controlled content-addressed vault.
+    # Legacy assets keep these fields NULL and cannot be used by the exact
+    # approval path until they are ingested into that vault.
+    content_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    storage_kind: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
@@ -96,11 +128,210 @@ class Account(Base):
     topic: Mapped[Optional["Topic"]] = relationship(back_populates="accounts")
 
 
+class PublicationPlan(Base):
+    """Immutable publication intent that an approval decision can bind to.
+
+    ``content_digest`` identifies the staged content snapshot, while
+    ``plan_digest`` also covers targets and timing.  Service code must recompute
+    and compare both before scheduling; the database keeps the durable evidence.
+    """
+
+    __tablename__ = "publication_plans"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('draft', 'approval_pending', 'approved', 'rejected', "
+            "'scheduled', 'cancelled', 'expired')",
+            name="ck_publication_plans_state",
+        ),
+        CheckConstraint(
+            "length(content_digest) = 64",
+            name="ck_publication_plans_content_digest_sha256",
+        ),
+        CheckConstraint(
+            "length(plan_digest) = 64",
+            name="ck_publication_plans_plan_digest_sha256",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    article_id: Mapped[int] = mapped_column(ForeignKey("articles.id"), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(32),
+        default="draft",
+        server_default="draft",
+        nullable=False,
+    )
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Immutable, credential-free payload reviewed by the human principal and
+    # consumed by contract jobs.  Workers never rebuild a v1 payload from the
+    # mutable Article row after approval.
+    content_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    targets: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    # Immediate execution is represented by an explicit current timestamp.  A
+    # nullable value would let approval bind every future execution time.
+    planned_for: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_by_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+
+    article: Mapped["Article"] = relationship(back_populates="publication_plans")
+    approval_requests: Mapped[list["ApprovalRequest"]] = relationship(back_populates="plan")
+    jobs: Mapped[list["PublishJob"]] = relationship(back_populates="plan")
+
+
+class ApprovalRequest(Base):
+    """An immutable decision trail for one exact publication plan digest."""
+
+    __tablename__ = "approval_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected', 'cancelled', 'expired')",
+            name="ck_approval_requests_status",
+        ),
+        CheckConstraint(
+            "length(plan_digest) = 64",
+            name="ck_approval_requests_plan_digest_sha256",
+        ),
+        CheckConstraint(
+            "((decided_by IS NULL AND decided_by_type IS NULL) OR "
+            "(decided_by IS NOT NULL AND decided_by_type IS NOT NULL))",
+            name="ck_approval_requests_decider_identity",
+        ),
+        CheckConstraint(
+            "status NOT IN ('approved', 'rejected') OR "
+            "(decided_by IS NOT NULL AND decided_by_type IS NOT NULL "
+            "AND decided_at IS NOT NULL)",
+            name="ck_approval_requests_decision_complete",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("publication_plans.id"),
+        nullable=False,
+        index=True,
+    )
+    plan_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="pending",
+        server_default="pending",
+        nullable=False,
+    )
+    requested_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    requested_by_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    decided_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    decided_by_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    decision_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+
+    plan: Mapped["PublicationPlan"] = relationship(back_populates="approval_requests")
+
+
+class AgentOperation(Base):
+    """Replay ledger for an Agent mutation's idempotency key.
+
+    A row with null response fields is a claimed operation. Database-only
+    mutations fill it in the same transaction; bounded external reads use the
+    explicit expiring lease and a uniquely linked normalized result.
+    """
+
+    __tablename__ = "agent_operations"
+    __table_args__ = (
+        UniqueConstraint(
+            "principal_id",
+            "operation",
+            "idempotency_key",
+            name="uq_agent_operations_principal_operation_key",
+        ),
+        CheckConstraint(
+            "length(request_digest) = 64",
+            name="ck_agent_operations_request_digest_sha256",
+        ),
+        CheckConstraint(
+            "response_status_code IS NULL OR "
+            "(response_status_code >= 100 AND response_status_code <= 599)",
+            name="ck_agent_operations_response_status_code",
+        ),
+        CheckConstraint(
+            "(response_status_code IS NULL AND response_json IS NULL) OR "
+            "(response_status_code IS NOT NULL AND response_json IS NOT NULL)",
+            name="ck_agent_operations_response_complete",
+        ),
+        CheckConstraint(
+            "(lease_token IS NULL AND lease_expires_at IS NULL) OR "
+            "(lease_token IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND length(lease_token) = 64)",
+            name="ck_agent_operations_lease_complete",
+        ),
+        CheckConstraint(
+            "response_json IS NULL OR (lease_token IS NULL AND lease_expires_at IS NULL)",
+            name="ck_agent_operations_completed_not_leased",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    principal_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    response_status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    response_json: Mapped[Optional[dict]] = mapped_column(
+        JSON(none_as_null=True),
+        nullable=True,
+    )
+    # External reads commit an unfinished operation before leaving the DB.
+    # Ownership and expiry let a retry reclaim crashes without allowing an old
+    # worker to overwrite the eventual replay response.
+    lease_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+
+
 class PublishJob(Base):
     __tablename__ = "publish_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "plan_id",
+            "account_id",
+            name="uq_publish_jobs_plan_account",
+        ),
+        CheckConstraint(
+            "plan_id IS NULL OR approved_planned_for IS NOT NULL",
+            name="ck_publish_jobs_contract_planned_for",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     article_id: Mapped[int] = mapped_column(ForeignKey("articles.id"))
+    # Nullable keeps every legacy/manual/backfill job valid.  Contract-v1 jobs
+    # set it and gain one-job-per-target idempotency at the database boundary.
+    plan_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("publication_plans.id"),
+        nullable=True,
+    )
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     platform: Mapped[Platform] = mapped_column(String(32))
     status: Mapped[JobStatus] = mapped_column(String(32), default=JobStatus.PENDING)
@@ -111,6 +342,14 @@ class PublishJob(Base):
     platform_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     raw_response: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Immutable not-before timestamp copied from the approved PublicationPlan.
+    # Contract verification reads this field; ``scheduled_at`` remains the
+    # mutable next-attempt timestamp shared with legacy jobs and may move after
+    # a retry or policy deferral.
+    approved_planned_for: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
     scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -126,13 +365,27 @@ class PublishJob(Base):
     )
 
     article: Mapped["Article"] = relationship(back_populates="jobs")
+    plan: Mapped[Optional["PublicationPlan"]] = relationship(back_populates="jobs")
 
 
 class Metrics(Base):
     __tablename__ = "metrics"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_operation_id",
+            name="uq_metrics_agent_operation_id",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("publish_jobs.id"))
+    # Manual Agent collections bind their normalized snapshot to the durable
+    # idempotency ledger.  A retry after response-finalization failure reuses
+    # this row rather than calling the external collector again.
+    agent_operation_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_operations.id"),
+        nullable=True,
+    )
     collected_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     likes: Mapped[int] = mapped_column(Integer, default=0)
     comments: Mapped[int] = mapped_column(Integer, default=0)

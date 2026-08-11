@@ -9,6 +9,7 @@ Exit policy is deterministic: required check failures return 1, otherwise 0.
 Callers may opt into ``strict`` mode, where warnings also return 1.  CLI usage
 errors remain the CLI framework's responsibility (normally exit code 2).
 """
+
 from __future__ import annotations
 
 import ast
@@ -30,7 +31,14 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool
 
-from .config import settings
+from .config import (
+    HUMAN_APPROVAL_SCOPES,
+    SCOPE_APPROVAL_REQUEST,
+    SCOPE_CONTENT_STAGE,
+    SCOPE_PLAN_CREATE,
+    SCOPE_SCHEDULE_CREATE,
+    settings,
+)
 
 
 class CheckOutcome(StrEnum):
@@ -149,6 +157,97 @@ class DoctorReport:
 
 ModuleProbe = Callable[[str], bool]
 ExecutableProbe = Callable[[str], str | None]
+
+_REQUIRED_CORE_TABLES = frozenset(
+    {
+        "topics",
+        "articles",
+        "assets",
+        "accounts",
+        "publication_plans",
+        "approval_requests",
+        "agent_operations",
+        "publish_jobs",
+        "metrics",
+        "resume_profiles",
+        "job_postings",
+        "job_matches",
+        "applications",
+        "job_accounts",
+    }
+)
+_AGENT_CONTRACT_REQUIRED_COLUMNS = {
+    "assets": {"content_sha256", "size_bytes", "storage_kind"},
+    "publication_plans": {
+        "article_id",
+        "state",
+        "content_digest",
+        "plan_digest",
+        "content_snapshot",
+        "targets",
+        "planned_for",
+        "created_by",
+        "created_by_type",
+        "created_at",
+        "updated_at",
+    },
+    "approval_requests": {
+        "plan_id",
+        "plan_digest",
+        "status",
+        "requested_by",
+        "requested_by_type",
+        "requested_at",
+        "decided_by",
+        "decided_by_type",
+        "decided_at",
+        "decision_reason",
+        "expires_at",
+        "updated_at",
+    },
+    "agent_operations": {
+        "principal_id",
+        "principal_type",
+        "operation",
+        "idempotency_key",
+        "request_digest",
+        "response_status_code",
+        "response_json",
+        "lease_token",
+        "lease_expires_at",
+        "created_at",
+        "updated_at",
+    },
+    "publish_jobs": {"plan_id", "approved_planned_for"},
+    "metrics": {"agent_operation_id"},
+}
+_AGENT_CONTRACT_REQUIRED_FOREIGN_KEYS = {
+    ("publication_plans", ("article_id",), "articles", ("id",)),
+    ("approval_requests", ("plan_id",), "publication_plans", ("id",)),
+    ("publish_jobs", ("plan_id",), "publication_plans", ("id",)),
+    ("metrics", ("agent_operation_id",), "agent_operations", ("id",)),
+}
+_AGENT_CONTRACT_REQUIRED_UNIQUES = {
+    ("agent_operations", ("principal_id", "operation", "idempotency_key")),
+    ("publish_jobs", ("plan_id", "account_id")),
+    ("metrics", ("agent_operation_id",)),
+}
+_AGENT_CONTRACT_REQUIRED_CHECKS = {
+    "ck_assets_vault_metadata_complete",
+    "ck_publication_plans_state",
+    "ck_publication_plans_content_digest_sha256",
+    "ck_publication_plans_plan_digest_sha256",
+    "ck_approval_requests_status",
+    "ck_approval_requests_plan_digest_sha256",
+    "ck_approval_requests_decider_identity",
+    "ck_approval_requests_decision_complete",
+    "ck_agent_operations_request_digest_sha256",
+    "ck_agent_operations_response_status_code",
+    "ck_agent_operations_response_complete",
+    "ck_agent_operations_lease_complete",
+    "ck_agent_operations_completed_not_leased",
+    "ck_publish_jobs_contract_planned_for",
+}
 
 
 def _json_safe(value: Any) -> Any:
@@ -284,9 +383,7 @@ def _resource_check(
         "article_detail.html",
         "account_detail.html",
     )
-    missing_templates = [
-        name for name in required_templates if not (templates / name).is_file()
-    ]
+    missing_templates = [name for name in required_templates if not (templates / name).is_file()]
     ui_ready = not missing_templates
 
     heads: tuple[str, ...] = ()
@@ -458,7 +555,8 @@ def _database_checks(config: Any, code_heads: tuple[str, ...]) -> list[DoctorChe
                 # cannot mutate the configured database.
                 connection.execute(text("SET TRANSACTION READ ONLY"))
             connection.execute(text("SELECT 1"))
-            table_names = set(inspect(connection).get_table_names())
+            database_inspector = inspect(connection)
+            table_names = set(database_inspector.get_table_names())
             if "alembic_version" in table_names:
                 db_heads = tuple(
                     sorted(
@@ -470,9 +568,38 @@ def _database_checks(config: Any, code_heads: tuple[str, ...]) -> list[DoctorChe
                 )
             else:
                 db_heads = ()
-        active_sidecar = (
-            _sqlite_mutable_sidecar(sqlite_path) if sqlite_path is not None else None
-        )
+            inspected_agent_tables = set(_AGENT_CONTRACT_REQUIRED_COLUMNS).intersection(table_names)
+            columns_by_table = {
+                table_name: {
+                    str(column["name"]) for column in database_inspector.get_columns(table_name)
+                }
+                for table_name in inspected_agent_tables
+            }
+            observed_foreign_keys = {
+                (
+                    table_name,
+                    tuple(str(name) for name in foreign_key.get("constrained_columns") or ()),
+                    str(foreign_key.get("referred_table") or ""),
+                    tuple(str(name) for name in foreign_key.get("referred_columns") or ()),
+                )
+                for table_name in inspected_agent_tables
+                for foreign_key in database_inspector.get_foreign_keys(table_name)
+            }
+            observed_uniques = {
+                (
+                    table_name,
+                    tuple(str(name) for name in unique.get("column_names") or ()),
+                )
+                for table_name in inspected_agent_tables
+                for unique in database_inspector.get_unique_constraints(table_name)
+            }
+            observed_checks = {
+                str(constraint.get("name"))
+                for table_name in inspected_agent_tables
+                for constraint in database_inspector.get_check_constraints(table_name)
+                if constraint.get("name")
+            }
+        active_sidecar = _sqlite_mutable_sidecar(sqlite_path) if sqlite_path is not None else None
         if active_sidecar is not None:
             failed = _result(
                 "database.connectivity",
@@ -505,32 +632,34 @@ def _database_checks(config: Any, code_heads: tuple[str, ...]) -> list[DoctorChe
         "database accepted a read-only query",
         details={"dialect": dialect},
     )
-    required_tables = {
-        "topics",
-        "articles",
-        "assets",
-        "accounts",
-        "publish_jobs",
-        "metrics",
-        "resume_profiles",
-        "job_postings",
-        "job_matches",
-        "applications",
-        "job_accounts",
+    missing_tables = sorted(_REQUIRED_CORE_TABLES - table_names)
+    missing_columns = {
+        table_name: sorted(required - columns_by_table.get(table_name, set()))
+        for table_name, required in _AGENT_CONTRACT_REQUIRED_COLUMNS.items()
+        if table_name in table_names and required - columns_by_table.get(table_name, set())
     }
-    missing_tables = sorted(required_tables - table_names)
+    missing_foreign_keys = sorted(_AGENT_CONTRACT_REQUIRED_FOREIGN_KEYS - observed_foreign_keys)
+    missing_uniques = sorted(_AGENT_CONTRACT_REQUIRED_UNIQUES - observed_uniques)
+    missing_checks = sorted(_AGENT_CONTRACT_REQUIRED_CHECKS - observed_checks)
+    has_shape_drift = bool(
+        missing_columns or missing_foreign_keys or missing_uniques or missing_checks
+    )
     if len(code_heads) != 1:
         schema = _schema_skipped("a unique code migration head is unavailable")
-    elif db_heads != code_heads or missing_tables:
+    elif db_heads != code_heads or missing_tables or has_shape_drift:
         schema = _result(
             "database.schema",
             CheckOutcome.FAIL,
-            "database schema is not at the unique code migration head",
+            "database migration marker or critical schema shape does not match code",
             remediation="back up the database and run `ai-ops init-db`",
             details={
                 "db_heads": list(db_heads),
                 "code_heads": list(code_heads),
                 "missing_core_tables": missing_tables,
+                "missing_columns": missing_columns,
+                "missing_foreign_keys": [list(item) for item in missing_foreign_keys],
+                "missing_unique_constraints": [list(item) for item in missing_uniques],
+                "missing_check_constraints": missing_checks,
             },
         )
     else:
@@ -577,9 +706,13 @@ def _runtime_check(config: Any) -> list[DoctorCheck]:
     )
 
     data_dir = Path(getattr(config, "data_dir", Path("./data"))).expanduser()
-    if data_dir.exists() and data_dir.is_dir() and os.access(
-        data_dir,
-        os.R_OK | os.W_OK | os.X_OK,
+    if (
+        data_dir.exists()
+        and data_dir.is_dir()
+        and os.access(
+            data_dir,
+            os.R_OK | os.W_OK | os.X_OK,
+        )
     ):
         data_check = _result(
             "runtime.data_dir",
@@ -688,25 +821,131 @@ def _security_checks(config: Any) -> list[DoctorCheck]:
                 remediation="replace it with output from `ai-ops gen-fernet-key`",
             )
 
+    principals = tuple(getattr(config, "agent_principals", ()) or ())
     host = str(getattr(config, "api_host", "127.0.0.1"))
     has_api_key = bool(str(getattr(config, "api_key", "")))
+    dev_bypass_requested = bool(getattr(config, "legacy_dev_auth_bypass", False))
     loopback = _is_loopback_host(host)
-    if not loopback and not has_api_key:
+    dev_bypass_effective = dev_bypass_requested and not has_api_key and not principals
+    api_details = {
+        "loopback": loopback,
+        "api_key_configured": has_api_key,
+        "configured_principals": len(principals),
+        "dev_bypass_requested": dev_bypass_requested,
+        "dev_bypass_effective": dev_bypass_effective,
+    }
+    if dev_bypass_effective and not loopback:
         api = _result(
             "security.api_auth",
             CheckOutcome.FAIL,
-            "API is non-loopback while API_KEY is empty",
-            remediation="set API_KEY or bind API_HOST to a loopback address",
-            details={"loopback": False, "api_key_configured": False},
+            "legacy anonymous mode is requested on a non-loopback API binding",
+            remediation="disable LEGACY_DEV_AUTH_BYPASS or bind API_HOST to loopback",
+            details=api_details,
+        )
+    elif dev_bypass_effective:
+        api = _result(
+            "security.api_auth",
+            CheckOutcome.WARN,
+            "legacy protected routes are anonymously accessible on loopback",
+            remediation="set API_KEY and disable LEGACY_DEV_AUTH_BYPASS outside local development",
+            details=api_details,
+        )
+    elif principals and not has_api_key:
+        api = _result(
+            "security.api_auth",
+            CheckOutcome.WARN,
+            "legacy protected routes fail closed because API_KEY is empty",
+            remediation="set API_KEY if the legacy API or UI must remain available",
+            details=api_details,
         )
     else:
         api = _result(
             "security.api_auth",
             CheckOutcome.PASS,
-            "API binding and authentication configuration is safe for its scope",
-            details={"loopback": loopback, "api_key_configured": has_api_key},
+            (
+                "legacy protected routes require API_KEY authentication"
+                if has_api_key
+                else "all protected routes fail closed while no identity is configured"
+            ),
+            details=api_details,
         )
-    return [fernet, api]
+
+    required_operational_scopes = {
+        SCOPE_CONTENT_STAGE,
+        SCOPE_PLAN_CREATE,
+        SCOPE_APPROVAL_REQUEST,
+        SCOPE_SCHEDULE_CREATE,
+    }
+    invalid_approval_principals = 0
+    human_approver_ids: set[str] = set()
+    operational_caller_ids: set[str] = set()
+    operational_scope_coverage: set[str] = set()
+    for principal in principals:
+        principal_id = str(getattr(principal, "principal_id", ""))
+        principal_type = str(getattr(principal, "type", ""))
+        scopes = set(getattr(principal, "scopes", ()) or ())
+        approval_scopes = HUMAN_APPROVAL_SCOPES.intersection(scopes)
+        if approval_scopes and principal_type != "human":
+            invalid_approval_principals += 1
+        if principal_type == "human" and HUMAN_APPROVAL_SCOPES.issubset(scopes):
+            human_approver_ids.add(principal_id)
+        caller_scopes = required_operational_scopes.intersection(scopes)
+        if principal_type != "human" and caller_scopes:
+            operational_caller_ids.add(principal_id)
+            operational_scope_coverage.update(caller_scopes)
+    missing_operational_scopes = sorted(required_operational_scopes - operational_scope_coverage)
+    has_independent_pair = (
+        any(
+            caller_id != approver_id
+            for caller_id in operational_caller_ids
+            for approver_id in human_approver_ids
+        )
+        and not missing_operational_scopes
+    )
+    principal_details = {
+        "configured_principals": len(principals),
+        "human_approvers": len(human_approver_ids),
+        "operational_callers": len(operational_caller_ids),
+        "operational_scope_coverage": sorted(operational_scope_coverage),
+        "missing_operational_scopes": missing_operational_scopes,
+        "independent_pair": has_independent_pair,
+    }
+    if invalid_approval_principals:
+        agent_contract = _result(
+            "security.agent_contract",
+            CheckOutcome.FAIL,
+            "a non-human principal has a human approval scope",
+            remediation="remove approval:read and approval:decide from every agent/service principal",
+            details=principal_details,
+        )
+    elif not principals:
+        agent_contract = _result(
+            "security.agent_contract",
+            CheckOutcome.WARN,
+            "Agent contract v1 is disabled because no principals are configured",
+            remediation="provision separate Agent and human bearer principals when enabling /v1",
+            details=principal_details,
+        )
+    elif not has_independent_pair:
+        agent_contract = _result(
+            "security.agent_contract",
+            CheckOutcome.WARN,
+            "Agent contract v1 lacks a complete independent caller/approver workflow",
+            remediation=(
+                "cover content:stage, plan:create, approval:request, and schedule:create "
+                "with non-human principals; give a separate human both approval:read "
+                "and approval:decide"
+            ),
+            details=principal_details,
+        )
+    else:
+        agent_contract = _result(
+            "security.agent_contract",
+            CheckOutcome.PASS,
+            "Agent contract v1 has separate operational and human approval identities",
+            details=principal_details,
+        )
+    return [fernet, api, agent_contract]
 
 
 def _scheduler_check(config: Any, module_probe: ModuleProbe) -> DoctorCheck:
@@ -736,9 +975,7 @@ def _scheduler_check(config: Any, module_probe: ModuleProbe) -> DoctorCheck:
         except (AttributeError, TypeError, ValueError):
             problems.append(f"{name} is invalid")
     try:
-        if float(config.job_running_timeout_seconds) <= float(
-            config.job_execution_timeout_seconds
-        ):
+        if float(config.job_running_timeout_seconds) <= float(config.job_execution_timeout_seconds):
             problems.append("running timeout must exceed execution timeout")
     except (AttributeError, TypeError, ValueError):
         pass
@@ -789,7 +1026,9 @@ def _chrome_available(executable_probe: ExecutableProbe) -> bool:
     return any(path.is_file() and os.access(path, os.X_OK) for path in candidates)
 
 
-def _browser_check(config: Any, module_probe: ModuleProbe, executable_probe: ExecutableProbe) -> DoctorCheck:
+def _browser_check(
+    config: Any, module_probe: ModuleProbe, executable_probe: ExecutableProbe
+) -> DoctorCheck:
     engine = str(getattr(config, "browser_engine", ""))
     modules = {
         "playwright_chromium": "playwright",
@@ -807,9 +1046,7 @@ def _browser_check(config: Any, module_probe: ModuleProbe, executable_probe: Exe
 
     module_ready = module_probe(modules[engine])
     artifact_verified = (
-        _chrome_available(executable_probe)
-        if engine == "playwright_chrome_channel"
-        else False
+        _chrome_available(executable_probe) if engine == "playwright_chrome_channel" else False
     )
     cdp_url = str(getattr(config, "browser_cdp_url", ""))
     endpoint_valid = _configured_endpoint_valid(cdp_url)

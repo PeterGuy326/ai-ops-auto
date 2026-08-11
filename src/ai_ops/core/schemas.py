@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .enums import (
     AccountHealth,
@@ -43,6 +43,7 @@ class TopicIn(BaseModel):
 
 class TopicUpdate(BaseModel):
     """PATCH /topics/{id}：所有字段可选。"""
+
     name: Optional[str] = None
     category: Optional[str] = None
     keywords: Optional[list[str]] = None
@@ -59,6 +60,7 @@ class TopicOut(TopicIn):
 
 class TopicStats(BaseModel):
     """GET /topics 列表项：带账号/文章统计。"""
+
     id: int
     name: str
     category: str
@@ -117,7 +119,9 @@ class AccountIn(BaseModel):
         default_factory=dict,
         description="明文凭证（cookie/token），落库时加密",
     )
-    tags: list[str] = Field(default_factory=list, description="账号标签：人设/赛道/地域，存到 profile.tags")
+    tags: list[str] = Field(
+        default_factory=list, description="账号标签：人设/赛道/地域，存到 profile.tags"
+    )
     group: str = Field(default="", description="账号分组，用于跨账号分发策略")
     weight: int = Field(default=1, ge=1, le=100, description="分发权重，默认 1")
     proxy: str = Field(
@@ -133,6 +137,7 @@ class AccountIn(BaseModel):
 
 class AccountUpdate(BaseModel):
     """PATCH /accounts/{id} 用，所有字段可选。"""
+
     nickname: Optional[str] = None
     daily_quota: Optional[int] = None
     topic_id: Optional[int] = Field(
@@ -143,7 +148,18 @@ class AccountUpdate(BaseModel):
     group: Optional[str] = None
     weight: Optional[int] = Field(default=None, ge=1, le=100)
     credential_plain: Optional[dict] = Field(default=None, description="如提供则覆盖加密凭证")
-    proxy: Optional[str] = Field(default=None, description="账号专属代理；None 表示不变，空串表示清空")
+    external_account_id: Optional[str] = Field(
+        default=None,
+        max_length=160,
+        pattern=r"^(?:|[A-Za-z0-9][A-Za-z0-9:._-]*)$",
+        description=(
+            "公开稳定的平台账号标识；None=不变，空串=清空。知乎 exact 使用 "
+            "zhihu:id:<whoami.id>。"
+        ),
+    )
+    proxy: Optional[str] = Field(
+        default=None, description="账号专属代理；None 表示不变，空串表示清空"
+    )
 
     @field_validator("proxy")
     @classmethod
@@ -185,8 +201,27 @@ class AccountOut(BaseModel):
         return self.profile.get("proxy", "")
 
 
+class ApprovedAssetExecution(BaseModel):
+    """Private immutable asset identity carried from approval into the worker.
+
+    Publisher payloads must never serialize this host-path-bearing structure.
+    The exact-contract worker uses it only to securely open the approved vault
+    inode and materialize a short-lived execution copy immediately before the
+    external adapter is entered.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    asset_type: AssetType
+    storage_path: str = Field(min_length=1, max_length=4096)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
+    storage_suffix: str = Field(pattern=r"^(?:\.[a-z0-9]{1,10})?$")
+
+
 class PublishContent(BaseModel):
     """喂给 PublisherBase.publish 的标准化内容。"""
+
     title: str
     body: str
     content_type: ContentType
@@ -194,6 +229,26 @@ class PublishContent(BaseModel):
     videos: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     extra: dict = Field(default_factory=dict)
+    # Contract-v1 jobs set this only after loading a human-approved immutable
+    # snapshot and renderer projection. The worker then selects only the bound
+    # Publisher and recomputes this projection before any external write.
+    exact_approval: bool = Field(default=False, exclude=True, repr=False)
+    approved_publisher_kind: Optional[str] = Field(default=None, exclude=True, repr=False)
+    approved_renderer_payload_digest: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    approved_external_account_id: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    approved_assets: list[ApprovedAssetExecution] = Field(
+        default_factory=list,
+        exclude=True,
+        repr=False,
+    )
     # 控制面内部关联键：只用于把外部副作用回执写入 durable spool，绝不应
     # 被序列化进平台正文、CLI metadata 或 API 响应。
     job_id: Optional[int] = Field(default=None, exclude=True, repr=False)
@@ -228,6 +283,7 @@ class PublishResult(BaseModel):
 
 class VideoBrief(BaseModel):
     """喂给 VideoEngineBase.render 的标准化任务。"""
+
     theme: str
     script: Optional[str] = None
     keywords: list[str] = Field(default_factory=list)
@@ -248,6 +304,7 @@ class VideoArtifact(BaseModel):
 
 class TranscriptCue(BaseModel):
     """一条 SRT 字幕 cue（ASR 转写产物）。"""
+
     index: int
     start_ms: int
     end_ms: int
@@ -256,6 +313,7 @@ class TranscriptCue(BaseModel):
 
 class TranscriptResult(BaseModel):
     """clipper.transcribe() 的产物：字幕 + 原始文本。"""
+
     srt_path: str
     cues: list[TranscriptCue] = Field(default_factory=list)
     full_text: str = ""
@@ -266,6 +324,7 @@ class ClipSegment(BaseModel):
     """单次剪辑请求段——按文本匹配 OR 按时间段，二选一。
     dest_text 优先；同时给则以 dest_text 为准（FunClip Stage 2 语义）。
     """
+
     dest_text: Optional[str] = None
     start_ms: Optional[int] = None
     end_ms: Optional[int] = None
@@ -276,6 +335,7 @@ class ClipSegment(BaseModel):
 
 class ClipRequest(BaseModel):
     """喂给 clipper.clip() 的统一请求。"""
+
     input_video: str
     segments: list[ClipSegment] = Field(default_factory=list)
     output_dir: str = "./data/clips"
@@ -286,6 +346,7 @@ class ClipRequest(BaseModel):
 
 class ClipArtifact(BaseModel):
     """单条切片产物。"""
+
     video_path: str
     dest_text: Optional[str] = None
     start_ms: Optional[int] = None
@@ -295,6 +356,7 @@ class ClipArtifact(BaseModel):
 
 class ClipResult(BaseModel):
     """clipper.clip() 的产物：N 个切片 + transcript（如有）。"""
+
     clips: list[ClipArtifact] = Field(default_factory=list)
     transcript: Optional[TranscriptResult] = None
     meta: dict = Field(default_factory=dict)
@@ -302,6 +364,7 @@ class ClipResult(BaseModel):
 
 class ClipPublishRequest(BaseModel):
     """clip→publish 流水线入参：切片任务 + 目标平台 + 文案。"""
+
     clip_request: ClipRequest
     platforms: list[Platform]
     title: str
@@ -311,6 +374,7 @@ class ClipPublishRequest(BaseModel):
 
 class PublishPlanItem(BaseModel):
     """一条发布计划项：目标平台 + 待发标准化内容 + 溯源切片路径。"""
+
     platform: Platform
     content: PublishContent
     source_clip_path: str
@@ -322,6 +386,7 @@ class ClipPublishPlan(BaseModel):
     只编排到「内容就绪」为止，不触发真发布：真发布走 PublishJob + worker，
     以免绕过 rate limit / 风控间隔 / metrics 闭环。
     """
+
     items: list[PublishPlanItem] = Field(default_factory=list)
     clip_count: int = 0
     meta: dict = Field(default_factory=dict)
@@ -330,16 +395,18 @@ class ClipPublishPlan(BaseModel):
 # ============ AI 播客（ListenHub 这类云播客）============
 class PodcastSpeaker(BaseModel):
     """播客说话人——speaker_id 由 provider 的音色列表给出。"""
+
     speaker_id: str
     name: str = ""
 
 
 class PodcastBrief(BaseModel):
     """喂给 PodcastProviderBase.generate 的标准化任务。"""
-    query: str                                   # 主题 / prompt
+
+    query: str  # 主题 / prompt
     speakers: list[PodcastSpeaker] = Field(default_factory=list)
     language: str = "zh"
-    mode: str = "deep"                           # quick / deep / debate
+    mode: str = "deep"  # quick / deep / debate
     # 参考素材（URL 或文本），对应 ListenHub sources
     source_urls: list[str] = Field(default_factory=list)
     extra: dict = Field(default_factory=dict)
@@ -347,11 +414,12 @@ class PodcastBrief(BaseModel):
 
 class PodcastArtifact(BaseModel):
     """播客生成产物：音频 + 文稿。"""
+
     episode_id: str
     title: str = ""
-    audio_url: Optional[str] = None              # 远端 MP3（可能有时效）
-    audio_stream_url: Optional[str] = None       # m3u8 流
-    audio_path: Optional[str] = None             # 下载到本地后的路径
+    audio_url: Optional[str] = None  # 远端 MP3（可能有时效）
+    audio_stream_url: Optional[str] = None  # m3u8 流
+    audio_path: Optional[str] = None  # 下载到本地后的路径
     scripts: list[dict] = Field(default_factory=list)  # [{speakerId,speakerName,content}]
     credits: Optional[int] = None
     duration_seconds: Optional[float] = None

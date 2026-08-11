@@ -9,13 +9,16 @@
   6. list_account_jobs：按个人账号查留痕记录
   7. 文章 / 视频 / 博客 三类素材都能入库
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session
 
 from ai_ops.content import distributor as dist
 from ai_ops.content import manager as content_manager
@@ -69,7 +72,7 @@ def test_stage_video_to_library_is_draft(session, topic):
         video_paths=["/data/outputs/happyhorse/ep1.mp4"],
         target_platforms=[Platform.DOUYIN, Platform.XIAOHONGSHU],
     )
-    assert art.status == ArticleStatus.DRAFT          # 入库即待审，不直发
+    assert art.status == ArticleStatus.DRAFT  # 入库即待审，不直发
     assets = session.query(Asset).filter_by(article_id=art.id).all()
     assert len(assets) == 1 and assets[0].asset_type == AssetType.VIDEO
     assert art.target_platforms == ["douyin", "xiaohongshu"]
@@ -77,18 +80,26 @@ def test_stage_video_to_library_is_draft(session, topic):
 
 def test_draft_cannot_distribute(session, topic):
     art = dist.stage_to_library(
-        session, topic_id=topic.id, title="x", content_type=ContentType.VIDEO,
-        video_paths=["/v.mp4"], target_platforms=[Platform.DOUYIN],
+        session,
+        topic_id=topic.id,
+        title="x",
+        content_type=ContentType.VIDEO,
+        video_paths=["/v.mp4"],
+        target_platforms=[Platform.DOUYIN],
     )
     _acc(session, Platform.DOUYIN, "抖音号A")
     with pytest.raises(ValueError, match="审核"):
-        dist.distribute(session, art.id)            # DRAFT 不能分发
+        dist.distribute(session, art.id)  # DRAFT 不能分发
 
 
 def test_approve_then_distribute_explicit_accounts(session, topic):
     art = dist.stage_to_library(
-        session, topic_id=topic.id, title="第一集", content_type=ContentType.VIDEO,
-        video_paths=["/v.mp4"], target_platforms=[Platform.DOUYIN],
+        session,
+        topic_id=topic.id,
+        title="第一集",
+        content_type=ContentType.VIDEO,
+        video_paths=["/v.mp4"],
+        target_platforms=[Platform.DOUYIN],
     )
     a1 = _acc(session, Platform.DOUYIN, "抖音号A")
     a2 = _acc(session, Platform.DOUYIN, "抖音号B")
@@ -97,23 +108,57 @@ def test_approve_then_distribute_explicit_accounts(session, topic):
     assert session.get(Article, art.id).status == ArticleStatus.READY
 
     jobs = dist.distribute(session, art.id, account_ids=[a1.id, a2.id])
-    assert len(jobs) == 2                            # 每账号一条分发记录
+    assert len(jobs) == 2  # 每账号一条分发记录
     assert {j.account_id for j in jobs} == {a1.id, a2.id}
     assert all(j.status == JobStatus.PENDING and j.platform == Platform.DOUYIN for j in jobs)
     assert session.get(Article, art.id).status == ArticleStatus.SCHEDULED  # 分发后转已排期
 
 
+def test_distribute_creates_no_jobs_when_article_claim_loses_concurrent_race(
+    session,
+    topic,
+    monkeypatch,
+):
+    art = dist.stage_to_library(
+        session,
+        topic_id=topic.id,
+        title="并发排期",
+        content_type=ContentType.VIDEO,
+        target_platforms=[Platform.DOUYIN],
+    )
+    account = _acc(session, Platform.DOUYIN, "并发账号")
+    dist.approve(session, art.id)
+    original_execute = Session.execute
+
+    def lose_article_claim(current_session, statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        if getattr(statement, "is_update", False) and getattr(table, "name", None) == "articles":
+            return SimpleNamespace(rowcount=0)
+        return original_execute(current_session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "execute", lose_article_claim)
+
+    with pytest.raises(ValueError, match="并发占用"):
+        dist.distribute(session, art.id, account_ids=[account.id])
+
+    assert session.query(PublishJob).count() == 0
+
+
 def test_distribute_auto_pick_by_platform(session, topic):
     art = dist.stage_to_library(
-        session, topic_id=topic.id, title="多平台", content_type=ContentType.VIDEO,
-        video_paths=["/v.mp4"], target_platforms=[Platform.DOUYIN, Platform.XIAOHONGSHU],
+        session,
+        topic_id=topic.id,
+        title="多平台",
+        content_type=ContentType.VIDEO,
+        video_paths=["/v.mp4"],
+        target_platforms=[Platform.DOUYIN, Platform.XIAOHONGSHU],
     )
     dy = _acc(session, Platform.DOUYIN, "抖音号")
     xhs = _acc(session, Platform.XIAOHONGSHU, "小红书号")
     _acc(session, Platform.ZHIHU, "知乎号")  # 不在 target_platforms，不应被选
 
     dist.approve(session, art.id)
-    jobs = dist.distribute(session, art.id)          # 不传账号 → 按 target_platforms 自动选
+    jobs = dist.distribute(session, art.id)  # 不传账号 → 按 target_platforms 自动选
     assert {j.account_id for j in jobs} == {dy.id, xhs.id}
     assert {j.platform for j in jobs} == {Platform.DOUYIN, Platform.XIAOHONGSHU}
 
@@ -212,8 +257,12 @@ def test_aware_article_schedule_round_trips_as_utc_naive_job(session, topic):
 
 def test_list_account_jobs_records(session, topic):
     art = dist.stage_to_library(
-        session, topic_id=topic.id, title="留痕", content_type=ContentType.VIDEO,
-        video_paths=["/v.mp4"], target_platforms=[Platform.DOUYIN],
+        session,
+        topic_id=topic.id,
+        title="留痕",
+        content_type=ContentType.VIDEO,
+        video_paths=["/v.mp4"],
+        target_platforms=[Platform.DOUYIN],
     )
     a1 = _acc(session, Platform.DOUYIN, "抖音号A")
     dist.approve(session, art.id)
@@ -227,15 +276,24 @@ def test_list_account_jobs_records(session, topic):
 def test_article_and_blog_also_stage(session, topic):
     # 图文文章
     a = dist.stage_to_library(
-        session, topic_id=topic.id, title="文章", content_type=ContentType.IMAGE_TEXT,
-        body="正文", image_paths=["/img/1.png"], target_platforms=[Platform.XIAOHONGSHU],
+        session,
+        topic_id=topic.id,
+        title="文章",
+        content_type=ContentType.IMAGE_TEXT,
+        body="正文",
+        image_paths=["/img/1.png"],
+        target_platforms=[Platform.XIAOHONGSHU],
     )
     # 博客长文
     b = dist.stage_to_library(
-        session, topic_id=topic.id, title="博客", content_type=ContentType.LONG_ARTICLE,
-        body="# 标题\n正文", target_platforms=[Platform.GITHUB_PAGES],
+        session,
+        topic_id=topic.id,
+        title="博客",
+        content_type=ContentType.LONG_ARTICLE,
+        body="# 标题\n正文",
+        target_platforms=[Platform.GITHUB_PAGES],
     )
     assert a.content_type == ContentType.IMAGE_TEXT and a.status == ArticleStatus.DRAFT
     assert b.content_type == ContentType.LONG_ARTICLE and b.status == ArticleStatus.DRAFT
-    assert session.query(Asset).filter_by(article_id=a.id).count() == 1   # 图片
-    assert session.query(Asset).filter_by(article_id=b.id).count() == 0   # 博客正文无文件
+    assert session.query(Asset).filter_by(article_id=a.id).count() == 1  # 图片
+    assert session.query(Asset).filter_by(article_id=b.id).count() == 0  # 博客正文无文件

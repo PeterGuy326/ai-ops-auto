@@ -11,12 +11,13 @@
     `list_account_jobs` 即可按个人账号查全部分发记录。真发布仍由 scheduler.worker
     消费 PublishJob（含 rate-limit / 风控间隔 / metrics 闭环），本模块不绕过。
 """
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Optional, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..core.enums import (
@@ -60,20 +61,42 @@ def stage_to_library(
         body=body,
         content_type=content_type,
         status=ArticleStatus.DRAFT,
-        target_platforms=[
-            p.value if isinstance(p, Platform) else p for p in target_platforms
-        ],
+        target_platforms=[p.value if isinstance(p, Platform) else p for p in target_platforms],
         extra=extra or {},
     )
     session.add(art)
     session.flush()
 
     for path in video_paths:
-        session.add(Asset(article_id=art.id, asset_type=AssetType.VIDEO, source=source, local_path=path, meta={}))
+        session.add(
+            Asset(
+                article_id=art.id,
+                asset_type=AssetType.VIDEO,
+                source=source,
+                local_path=path,
+                meta={},
+            )
+        )
     for path in image_paths:
-        session.add(Asset(article_id=art.id, asset_type=AssetType.IMAGE, source=source, local_path=path, meta={}))
+        session.add(
+            Asset(
+                article_id=art.id,
+                asset_type=AssetType.IMAGE,
+                source=source,
+                local_path=path,
+                meta={},
+            )
+        )
     for path in audio_paths:
-        session.add(Asset(article_id=art.id, asset_type=AssetType.AUDIO, source=source, local_path=path, meta={}))
+        session.add(
+            Asset(
+                article_id=art.id,
+                asset_type=AssetType.AUDIO,
+                source=source,
+                local_path=path,
+                meta={},
+            )
+        )
     session.flush()
     return art
 
@@ -219,7 +242,9 @@ def import_published_post(
         body=body,
         content_type=content_type,
         status=ArticleStatus.PUBLISHED,  # 历史已发 → 终态
-        target_platforms=[acc.platform.value if isinstance(acc.platform, Platform) else acc.platform],
+        target_platforms=[
+            acc.platform.value if isinstance(acc.platform, Platform) else acc.platform
+        ],
         extra={**(extra or {}), "backfill": True},
     )
     session.add(art)
@@ -281,9 +306,7 @@ def distribute(
     if art is None:
         raise ValueError(f"素材 {article_id} 不存在")
     if require_ready and art.status != ArticleStatus.READY:
-        raise ValueError(
-            f"素材未审核通过（需 READY，当前 {art.status}），不能分发。请先 approve。"
-        )
+        raise ValueError(f"素材未审核通过（需 READY，当前 {art.status}），不能分发。请先 approve。")
 
     accounts = _resolve_accounts(session, art, account_ids)
     if not accounts:
@@ -295,6 +318,28 @@ def distribute(
     effective_scheduled_at = as_utc_naive(
         scheduled_at if scheduled_at is not None else art.scheduled_at
     )
+
+    # Claim the Article before creating any jobs.  Agent-contract scheduling
+    # uses the same state transition, so this compare-and-swap closes the race
+    # where legacy distribution and an exact approved plan both observe READY
+    # and fan out competing jobs for the same content.
+    allowed_states = {ArticleStatus.READY}
+    if not require_ready:
+        allowed_states.add(ArticleStatus.DRAFT)
+    current_status = ArticleStatus(art.status)
+    if current_status not in allowed_states:
+        raise ValueError(f"素材状态不可分发（当前 {current_status.value}）；可能已被另一排期占用。")
+    claimed = session.execute(
+        update(Article)
+        .where(
+            Article.id == art.id,
+            Article.status == current_status,
+        )
+        .values(status=ArticleStatus.SCHEDULED, updated_at=datetime.utcnow())
+        .execution_options(synchronize_session="fetch")
+    )
+    if claimed.rowcount != 1:
+        raise ValueError("素材已被另一分发或排期并发占用，请刷新后重试。")
 
     jobs: list[PublishJob] = []
     for acc in accounts:
@@ -308,16 +353,10 @@ def distribute(
         session.add(job)
         jobs.append(job)
     session.flush()
-
-    if art.status == ArticleStatus.READY:
-        art.status = ArticleStatus.SCHEDULED
-        session.flush()
     return jobs
 
 
-def list_account_jobs(
-    session: Session, account_id: int, *, limit: int = 100
-) -> list[PublishJob]:
+def list_account_jobs(session: Session, account_id: int, *, limit: int = 100) -> list[PublishJob]:
     """按个人账号查全部分发记录（最新优先）——留痕查询。"""
     q = (
         select(PublishJob)
@@ -336,23 +375,29 @@ def _resolve_accounts(
         AccountHealth.UNKNOWN,
     }
     if account_ids:
-        rows = session.execute(
-            select(Account).where(Account.id.in_(list(account_ids)))
-        ).scalars().all()
+        rows = (
+            session.execute(select(Account).where(Account.id.in_(list(account_ids))))
+            .scalars()
+            .all()
+        )
         blocked = [row for row in rows if AccountHealth(row.health) not in runnable_health]
         if blocked:
-            details = ", ".join(
-                f"{row.id}:{AccountHealth(row.health).value}" for row in blocked
-            )
+            details = ", ".join(f"{row.id}:{AccountHealth(row.health).value}" for row in blocked)
             raise ValueError(f"目标账号健康状态不可分发: {details}")
         return list(rows)
     # 未指定账号：按素材 target_platforms 取这些平台下所有账号
-    platforms = [Platform(p) if not isinstance(p, Platform) else p for p in (art.target_platforms or [])]
+    platforms = [
+        Platform(p) if not isinstance(p, Platform) else p for p in (art.target_platforms or [])
+    ]
     if not platforms:
         return []
-    rows = session.execute(
-        select(Account)
-        .where(Account.platform.in_([p.value for p in platforms]))
-        .where(Account.health.in_([health.value for health in runnable_health]))
-    ).scalars().all()
+    rows = (
+        session.execute(
+            select(Account)
+            .where(Account.platform.in_([p.value for p in platforms]))
+            .where(Account.health.in_([health.value for health in runnable_health]))
+        )
+        .scalars()
+        .all()
+    )
     return list(rows)

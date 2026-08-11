@@ -94,6 +94,9 @@ smoke_installed_wheel() {
   local smoke_db="$VERIFY_BUILD_CWD/wheel-smoke.db"
   local doctor_json="$smoke_cwd/doctor.json"
   local demo_json="$smoke_cwd/demo.json"
+  local agent_help="$smoke_cwd/agent-help.txt"
+  local download_help="$smoke_cwd/download-help.txt"
+  local principal_json="$smoke_cwd/principal.json"
   local smoke_output
 
   if [[ ! -f "$wheel" ]]; then
@@ -163,6 +166,42 @@ print(os.pathsep.join(path for path in paths if path))
   }
   printf '%s\n' "$smoke_output" >"$demo_json"
 
+  smoke_output="$({
+    cd "$smoke_cwd" && env \
+      DATABASE_URL="sqlite:///$smoke_db" \
+      DATA_DIR="$smoke_cwd/data" \
+      PYTHONPATH="$runtime_pythonpath" \
+      "$smoke_venv/bin/ai-ops" agent --help
+  } 2>&1)" || {
+    echo "$smoke_output"
+    return 1
+  }
+  printf '%s\n' "$smoke_output" >"$agent_help"
+
+  smoke_output="$({
+    cd "$smoke_cwd" && env \
+      DATABASE_URL="sqlite:///$smoke_db" \
+      DATA_DIR="$smoke_cwd/data" \
+      PYTHONPATH="$runtime_pythonpath" \
+      "$smoke_venv/bin/ai-ops" agent download-approval-asset --help
+  } 2>&1)" || {
+    echo "$smoke_output"
+    return 1
+  }
+  printf '%s\n' "$smoke_output" >"$download_help"
+
+  smoke_output="$({
+    cd "$smoke_cwd" && env \
+      DATABASE_URL="sqlite:///$smoke_db" \
+      DATA_DIR="$smoke_cwd/data" \
+      PYTHONPATH="$runtime_pythonpath" \
+      "$smoke_venv/bin/ai-ops" gen-principal-token
+  } 2>&1)" || {
+    echo "$smoke_output"
+    return 1
+  }
+  printf '%s\n' "$smoke_output" >"$principal_json"
+
   (
     cd "$smoke_cwd" && env \
       DATABASE_URL="sqlite:///$smoke_db" \
@@ -170,15 +209,50 @@ print(os.pathsep.join(path for path in paths if path))
       PYTHONPATH="$runtime_pythonpath" \
       "$smoke_venv/bin/python" -c '
 import json
+import hashlib
+import os
 from pathlib import Path
 import sys
 
 import ai_ops
+from sqlalchemy import create_engine, inspect
+from ai_ops.agent_contract.cli_commands import agent_app
+from ai_ops.api.main import app
 from ai_ops.core.db import get_code_alembic_head, get_db_alembic_head
 
 package_path = Path(ai_ops.__file__).resolve()
 assert package_path.is_relative_to(Path(sys.prefix).resolve()), package_path
-assert get_code_alembic_head() == get_db_alembic_head()
+assert get_code_alembic_head() == get_db_alembic_head() == "d4e8a1c7b5f2"
+tables = set(inspect(create_engine(os.environ["DATABASE_URL"])).get_table_names())
+assert {"publication_plans", "approval_requests", "agent_operations"} <= tables
+expected_v1_routes = {
+    ("POST", "/v1/contents"),
+    ("POST", "/v1/publication-plans"),
+    ("POST", "/v1/approval-requests"),
+    ("GET", "/v1/approval-requests/{approval_id}"),
+    ("GET", "/v1/approval-requests/{approval_id}/assets/{asset_id}"),
+    ("POST", "/v1/approvals/{approval_id}/decision"),
+    ("POST", "/v1/publication-plans/{plan_id}/schedule"),
+    ("GET", "/v1/jobs/{job_id}"),
+    ("POST", "/v1/jobs/{job_id}/metrics-collections"),
+    ("POST", "/v1/performance-reviews"),
+}
+assert len(expected_v1_routes) == 10
+shipped_v1_routes = {
+    (method.upper(), path)
+    for path, operations in app.openapi()["paths"].items()
+    if path.startswith("/v1/")
+    for method in operations
+    if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}
+}
+assert shipped_v1_routes == expected_v1_routes
+download_contract = app.openapi()["paths"][
+    "/v1/approval-requests/{approval_id}/assets/{asset_id}"
+]["get"]
+assert set(download_contract["responses"]["200"]["content"]) == {
+    "application/octet-stream"
+}
+assert download_contract["security"] == [{"HTTPBearer": []}]
 templates = package_path.parent / "api" / "templates"
 required_templates = {
     "base.html",
@@ -202,6 +276,33 @@ assert demo["offline"] is True
 assert demo["credentials_used"] is False
 assert demo["external_calls"] == 0
 assert demo["review"]["passed"] is True
+
+principal = json.loads(Path("principal.json").read_text(encoding="utf-8"))
+assert principal["schema_version"] == 1
+assert principal["token"].startswith("aop_")
+assert hashlib.sha256(principal["token"].encode()).hexdigest() == principal["token_sha256"]
+
+expected_agent_commands = {
+    "stage-content",
+    "plan-publication",
+    "request-approval",
+    "get-approval",
+    "download-approval-asset",
+    "decide-approval",
+    "schedule",
+    "get-job-status",
+    "collect-metrics",
+    "review-performance",
+}
+assert len(expected_agent_commands) == 10
+shipped_agent_commands = {command.name for command in agent_app.registered_commands}
+assert shipped_agent_commands == expected_agent_commands
+help_text = Path("agent-help.txt").read_text(encoding="utf-8")
+for command in expected_agent_commands:
+    assert command in help_text
+download_help = Path("download-help.txt").read_text(encoding="utf-8")
+for required in {"approval_id", "asset_id", "--output"}:
+    assert required in download_help
 '
   )
 }
@@ -239,24 +340,30 @@ echo "▎后端质量门禁"
 if has_python_module pytest; then
   check "pytest" "$PYTHON_BIN" -m pytest -q --disable-warnings
 else
-  skip "pytest" "未安装 dev extra：pip install -e '.[dev]'"
+  echo "$NO pytest（缺少必需的 dev extra：pip install -e '.[dev]'）"
+  fail=$((fail + 1))
 fi
 
 if has_python_module ruff; then
   check "ruff check" "$PYTHON_BIN" -m ruff check .
 else
-  skip "ruff check" "未安装 dev extra：pip install -e '.[dev]'"
+  echo "$NO ruff check（缺少必需的 dev extra：pip install -e '.[dev]'）"
+  fail=$((fail + 1))
 fi
 
 echo
 echo "▎前端质量门禁"
-if ! command -v npm >/dev/null 2>&1; then
-  skip "frontend lint/build" "npm 不可用"
-elif [[ ! -d frontend/node_modules ]]; then
-  skip "frontend lint/build" "依赖未安装：cd frontend && npm ci"
-else
-  check "frontend lint" npm --prefix frontend run lint
-  check "frontend build" npm --prefix frontend run build
+if [[ -f frontend/package.json ]]; then
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "$NO frontend lint/build（npm 不可用）"
+    fail=$((fail + 1))
+  elif [[ ! -d frontend/node_modules ]]; then
+    echo "$NO frontend lint/build（依赖未安装：cd frontend && npm ci）"
+    fail=$((fail + 1))
+  else
+    check "frontend lint" npm --prefix frontend run lint
+    check "frontend build" npm --prefix frontend run build
+  fi
 fi
 
 echo
@@ -281,7 +388,8 @@ elif command -v uv >/dev/null 2>&1; then
     fail=$((fail + 1))
   fi
 else
-  skip "wheel + sdist" "build/setuptools 与 uv 均不可用"
+  echo "$NO wheel + sdist（build/setuptools 与 uv 均不可用）"
+  fail=$((fail + 1))
 fi
 if [[ "$package_built" == true ]]; then
   check "installed wheel + Alembic/doctor/demo smoke" smoke_installed_wheel

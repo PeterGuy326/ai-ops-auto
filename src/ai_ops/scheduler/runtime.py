@@ -5,12 +5,13 @@ as the durable source of truth.  Multiple processes may scan the same due rows;
 ``worker.execute_job`` performs the conditional claim that guarantees at-most-one
 publisher entry for each attempt.
 """
+
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 
 from ..config import settings
 from ..core.db import session_scope
@@ -36,9 +37,11 @@ def get_due_job_ids(
 ) -> list[int]:
     """Return runnable job ids whose durable schedule is due.
 
-    ``scheduled_at=None`` is the existing representation for "publish as soon as
-    possible", so it is intentionally treated as due.  The query does not claim
-    rows; every caller still goes through execute_job's cross-database CAS.
+    ``scheduled_at=None`` is the legacy representation for "publish as soon as
+    possible", so it is intentionally treated as due. Exact jobs additionally
+    require their immutable approved not-before timestamp to be present and due.
+    The query does not claim rows; every caller still goes through
+    execute_job's cross-database CAS.
     """
     cutoff = as_utc_naive(now) or datetime.utcnow()
     safe_limit = max(1, min(int(limit), 1000))
@@ -47,6 +50,15 @@ def get_due_job_ids(
             session.scalars(
                 select(PublishJob.id)
                 .where(PublishJob.status.in_(DUE_JOB_STATUSES))
+                .where(
+                    or_(
+                        PublishJob.plan_id.is_(None),
+                        and_(
+                            PublishJob.approved_planned_for.is_not(None),
+                            PublishJob.approved_planned_for <= cutoff,
+                        ),
+                    )
+                )
                 .where(
                     or_(
                         PublishJob.scheduled_at.is_(None),

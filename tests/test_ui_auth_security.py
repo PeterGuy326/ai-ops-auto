@@ -1,4 +1,5 @@
 """Web UI session、CSRF 与入口日志的安全回归测试。"""
+
 from __future__ import annotations
 
 import os
@@ -58,7 +59,7 @@ def ui_app(monkeypatch):
         lambda jobs: None,
     )
     app.dependency_overrides[get_session] = _override
-    client = TestClient(app, base_url="https://testserver")
+    client = TestClient(app, base_url="https://127.0.0.1")
     try:
         yield client, testing_session
     finally:
@@ -137,10 +138,13 @@ def test_session_signature_tamper_and_expiry_are_rejected(monkeypatch):
     parts[2] = ("A" if parts[2][0] != "A" else "B") + parts[2][1:]
     tampered = ".".join(parts)
     assert validate_ui_session_cookie(tampered, now=1_001) is None
-    assert validate_ui_session_cookie(
-        token,
-        now=1_000 + UI_SESSION_MAX_AGE_SECONDS + 1,
-    ) is None
+    assert (
+        validate_ui_session_cookie(
+            token,
+            now=1_000 + UI_SESSION_MAX_AGE_SECONDS + 1,
+        )
+        is None
+    )
 
 
 def test_logout_requires_bound_csrf_token_and_clears_cookie(ui_app):
@@ -150,11 +154,14 @@ def test_logout_requires_bound_csrf_token_and_clears_cookie(ui_app):
     assert session is not None
 
     assert client.post("/ui/logout", follow_redirects=False).status_code == 403
-    assert client.post(
-        "/ui/logout",
-        data={"csrf_token": "wrong"},
-        follow_redirects=False,
-    ).status_code == 403
+    assert (
+        client.post(
+            "/ui/logout",
+            data={"csrf_token": "wrong"},
+            follow_redirects=False,
+        ).status_code
+        == 403
+    )
 
     response = client.post(
         "/ui/logout",
@@ -192,46 +199,64 @@ def test_approve_and_distribute_require_current_session_csrf(ui_app):
     ).json()["id"]
 
     # 未登录的 UI 写操作在进入 handler 前就被拒绝。
-    assert client.post(
-        f"/ui/articles/{article_id}/approve",
-        follow_redirects=False,
-    ).status_code == 401
+    assert (
+        client.post(
+            f"/ui/articles/{article_id}/approve",
+            follow_redirects=False,
+        ).status_code
+        == 401
+    )
 
     _login(client)
-    assert client.post(
-        f"/ui/articles/{article_id}/approve",
-        follow_redirects=False,
-    ).status_code == 403
-    assert client.post(
-        f"/ui/articles/{article_id}/approve",
-        data={"csrf_token": "wrong"},
-        follow_redirects=False,
-    ).status_code == 403
+    assert (
+        client.post(
+            f"/ui/articles/{article_id}/approve",
+            follow_redirects=False,
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            f"/ui/articles/{article_id}/approve",
+            data={"csrf_token": "wrong"},
+            follow_redirects=False,
+        ).status_code
+        == 403
+    )
     with testing_session() as session:
         assert session.get(Article, article_id).status == ArticleStatus.DRAFT
 
     detail = client.get(f"/ui/articles/{article_id}")
     csrf = _csrf_from(detail.text)
-    assert client.post(
-        f"/ui/articles/{article_id}/approve",
-        data={"csrf_token": csrf},
-        follow_redirects=False,
-    ).status_code == 303
+    assert (
+        client.post(
+            f"/ui/articles/{article_id}/approve",
+            data={"csrf_token": csrf},
+            follow_redirects=False,
+        ).status_code
+        == 303
+    )
 
     # approve 后 token 仍属于同一会话；缺失 token 的 distribute 不得建 job。
-    assert client.post(
-        f"/ui/articles/{article_id}/distribute",
-        data={"account_ids": account_id},
-        follow_redirects=False,
-    ).status_code == 403
+    assert (
+        client.post(
+            f"/ui/articles/{article_id}/distribute",
+            data={"account_ids": account_id},
+            follow_redirects=False,
+        ).status_code
+        == 403
+    )
     with testing_session() as session:
         assert session.scalar(select(func.count(PublishJob.id))) == 0
 
-    assert client.post(
-        f"/ui/articles/{article_id}/distribute",
-        data={"account_ids": account_id, "csrf_token": csrf},
-        follow_redirects=False,
-    ).status_code == 303
+    assert (
+        client.post(
+            f"/ui/articles/{article_id}/distribute",
+            data={"account_ids": account_id, "csrf_token": csrf},
+            follow_redirects=False,
+        ).status_code
+        == 303
+    )
     with testing_session() as session:
         assert session.scalar(select(func.count(PublishJob.id))) == 1
 
@@ -242,7 +267,7 @@ def test_csrf_token_cannot_be_reused_by_another_session(ui_app):
     session_a = validate_ui_session_cookie(response_a.cookies[UI_SESSION_COOKIE])
     assert session_a is not None
 
-    client_b = TestClient(app, base_url="https://testserver")
+    client_b = TestClient(app, base_url="https://127.0.0.1")
     try:
         _login(client_b)
         response = client_b.post(
@@ -258,6 +283,7 @@ def test_csrf_token_cannot_be_reused_by_another_session(ui_app):
 def test_empty_api_key_keeps_explicit_dev_mode_compatible(ui_app, monkeypatch):
     client, testing_session = ui_app
     monkeypatch.setattr(settings, "api_key", "")
+    monkeypatch.setattr(settings, "legacy_dev_auth_bypass", True)
     topic_id = client.post(
         "/topics",
         json={"name": "dev", "category": "test"},
@@ -269,12 +295,37 @@ def test_empty_api_key_keeps_explicit_dev_mode_compatible(ui_app, monkeypatch):
 
     assert client.get("/ui").status_code == 200
     # dev 模式特意保留无 session、无 CSRF 的本地工作流。
-    assert client.post(
-        f"/ui/articles/{article_id}/approve",
-        follow_redirects=False,
-    ).status_code == 303
+    assert (
+        client.post(
+            f"/ui/articles/{article_id}/approve",
+            follow_redirects=False,
+        ).status_code
+        == 303
+    )
     with testing_session() as session:
         assert session.get(Article, article_id).status == ArticleStatus.READY
+
+
+def test_agent_principals_disable_empty_key_api_and_ui_bypasses(
+    ui_app,
+    monkeypatch,
+):
+    client, _ = ui_app
+    monkeypatch.setattr(settings, "api_key", "")
+    monkeypatch.setattr(settings, "agent_principals", [object()])
+
+    api_response = client.get("/topics")
+    ui_response = client.get("/ui", follow_redirects=False)
+    login_response = client.post(
+        "/ui/login",
+        data={"api_key": ""},
+        follow_redirects=False,
+    )
+
+    assert api_response.status_code == 401
+    assert ui_response.status_code == 303
+    assert ui_response.headers["location"] == "/ui/login"
+    assert login_response.status_code == 401
 
 
 def test_entrypoint_never_logs_database_password():

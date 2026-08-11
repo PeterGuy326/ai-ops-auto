@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 from typing import Any, Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import settings
@@ -12,12 +12,28 @@ from .models import Base
 # 否则 init_db() 的 create_all 扫不到 jobhunt 四张表（仅 import 副作用，故 noqa）。
 from ..jobhunt import models as _jobhunt_models  # noqa: E402,F401
 
+def enable_sqlite_foreign_keys(engine) -> None:
+    """Make declared SQLite foreign keys enforceable on every pooled connection."""
+
+    if engine.dialect.name != "sqlite":
+        return
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
+
+
 _engine = create_engine(
     settings.database_url,
     echo=False,
     future=True,
     connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {},
 )
+enable_sqlite_foreign_keys(_engine)
 # expire_on_commit=False 是 production-safe 的关键约定：
 # 默认 True 时 commit 后所有 ORM attribute 会被 expire，下次 access 触发 auto-refresh；
 # 若此时 session 已关闭（如 worker 跳出 session_scope 后读 job.account_id 拼日志/
@@ -121,6 +137,8 @@ def get_db_alembic_head(engine=None):
             if settings.database_url.startswith("sqlite")
             else {},
         )
+        if engine is None:
+            enable_sqlite_foreign_keys(eng)
         with eng.connect() as conn:
             insp = inspect(conn)
             if "alembic_version" not in insp.get_table_names():
@@ -246,6 +264,7 @@ def _inspect_unversioned_schema() -> tuple[str, str | None]:
         if settings.database_url.startswith("sqlite")
         else {},
     )
+    enable_sqlite_foreign_keys(eng)
     try:
         with eng.connect() as conn:
             inspector = inspect(conn)

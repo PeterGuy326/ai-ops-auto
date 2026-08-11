@@ -2,8 +2,9 @@
 
 > 一句话：**AI 生成 / 历史回填 → 统一素材库 → 先审后发 → 按个人账号分发并留痕**。
 > 开源默认不配置任何内网/云服务或通知目标；先审核再分发。
-> 当前 `approve` 是共享管理 `API_KEY` 下的状态迁移，不会验证调用者一定是人；强制人工审批需由
-> 外部权限/工作流保证。
+> 本文的 legacy `approve` 是共享管理 `API_KEY` 下的状态迁移，不会验证调用者一定是人。Agent
+> 自动化请使用 [Agent contract v1](agent-contract.md) 的独立 caller/human-approver 身份和摘要绑定；
+> human token 仍须由外部权限/工作流隔离保管。
 
 ## 1. 底层逻辑（一张图）
 
@@ -18,8 +19,8 @@ AI 生成（短剧 / 播客 / 博客 / 图文）┐
 
 - **素材** = `Article`（含文章/视频/博客/播客，content_type=IMAGE_TEXT/VIDEO/LONG_ARTICLE/AUDIO）+ `Asset`（视频/图片/音频文件）。
 - **分发记录** = `PublishJob`（挂 `account_id` + platform + status + platform_url）——天然按**个人账号**留痕。
-- **状态门槛**：所有内容先落 DRAFT，调用 `approve` 进入 READY 后才能 `distribute`；当前 API
-  只校验管理 key，不校验审批者身份。
+- **状态门槛**：legacy 内容先落 DRAFT，调用 `approve` 进入 READY 后才能 `distribute`；这条旧 API
+  只校验管理 key。v1 另用不可变 plan、独立审批和幂等 schedule，不复用该身份语义。
 
 ## 2. 核心模块
 

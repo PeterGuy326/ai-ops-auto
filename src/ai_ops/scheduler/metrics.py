@@ -2,14 +2,17 @@
 
 闭环：发布成功 → 调度 3 次采集（1h/24h/7d）→ 写 Metrics 表 → 触发热度重算。
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from sqlalchemy import select, update
+
 from ..accounts.manager import get_credential
 from ..core.db import session_scope
 from ..core.enums import Platform
-from ..core.models import Metrics, PublishJob
+from ..core.models import AgentOperation, Metrics, PublishJob
 from ..publishers.registry import default_registry
 from ..observability import get_logger
 from ..observability.sentry import capture_exception
@@ -58,6 +61,8 @@ async def collect_one(
     *,
     interval_index: int | None = None,
     source: str = "scheduled",
+    agent_operation_id: int | None = None,
+    agent_operation_lease_token: str | None = None,
 ) -> dict:
     """采集单个 job 的最新数据，写 Metrics 表，触发热度重算。
 
@@ -76,10 +81,36 @@ async def collect_one(
         - "manual"：API /jobs/{id}/collect 端点手动触发（API 调用方显式传）
         - 写入 Metrics.source 字段，让 24h 触发判定能基于 source 计数排除非飞轮行
           （Round 6 / TD-Z3-followup-2 / TD-P0-debt2）。
+    agent_operation_id : int | None, keyword-only
+        v1 手动回采的持久幂等操作 ID。存在时，Metrics 行与该操作唯一绑定；
+        崩溃恢复会复用已落库快照，不重复访问外部 collector。
+    agent_operation_lease_token : str | None, keyword-only
+        与 ``agent_operation_id`` 配对的当前 owner token。指标落库前用条件
+        UPDATE 获取行锁并校验未过期 ownership，阻止 stale owner 越权写入。
 
     keyword-only 防误传：避免后续加参数时位置漂移导致悄悄 break。
     """
+    if (agent_operation_id is None) != (agent_operation_lease_token is None):
+        return {"skipped": True, "reason": "Agent metrics operation lease is incomplete"}
     with session_scope() as s:
+        if agent_operation_id is not None:
+            existing = s.scalar(
+                select(Metrics).where(Metrics.agent_operation_id == agent_operation_id)
+            )
+            if existing is not None:
+                if existing.job_id != job_id:
+                    return {
+                        "skipped": True,
+                        "reason": "Agent metrics operation is bound to a different job",
+                    }
+                return {
+                    "likes": existing.likes,
+                    "comments": existing.comments,
+                    "shares": existing.shares,
+                    "views": existing.views,
+                    "raw": existing.raw,
+                    "replayed_from_ledger": True,
+                }
         job = s.get(PublishJob, job_id)
         if job is None or not job.platform_post_id:
             return {"skipped": True, "reason": "job 不存在或没有 platform_post_id"}
@@ -147,8 +178,27 @@ async def collect_one(
         }
 
     with session_scope() as s:
+        if agent_operation_id is not None:
+            now = datetime.utcnow()
+            fenced = s.execute(
+                update(AgentOperation)
+                .where(
+                    AgentOperation.id == agent_operation_id,
+                    AgentOperation.operation == "collect_metrics",
+                    AgentOperation.lease_token == agent_operation_lease_token,
+                    AgentOperation.lease_expires_at > now,
+                    AgentOperation.response_json.is_(None),
+                )
+                # A no-op value still obtains the database row/write lock until
+                # the Metrics insert commits in this same transaction.
+                .values(updated_at=AgentOperation.updated_at)
+                .execution_options(synchronize_session=False)
+            )
+            if fenced.rowcount != 1:
+                return {"skipped": True, "reason": "Agent metrics operation lease was lost"}
         m = Metrics(
             job_id=job_id,
+            agent_operation_id=agent_operation_id,
             likes=data.get("likes", 0),
             comments=data.get("comments", 0),
             shares=data.get("shares", 0),
@@ -184,18 +234,27 @@ async def collect_one(
             is_health_eval_node = interval_index == HEALTH_EVAL_INTERVAL_INDEX
         else:
             # 检查是否已有 source 区分（至少 1 条非 "scheduled" → 走优先级 2）
-            from sqlalchemy import func, select
-            non_scheduled_exists = s.scalar(
-                select(func.count(Metrics.id))
-                .where(Metrics.job_id == job_id, Metrics.source != "scheduled")
-            ) or 0
+            from sqlalchemy import func
+
+            non_scheduled_exists = (
+                s.scalar(
+                    select(func.count(Metrics.id)).where(
+                        Metrics.job_id == job_id, Metrics.source != "scheduled"
+                    )
+                )
+                or 0
+            )
 
             if non_scheduled_exists > 0:
                 # 优先级 2：source-based scheduled count（owner 终态）
-                scheduled_count = s.scalar(
-                    select(func.count(Metrics.id))
-                    .where(Metrics.job_id == job_id, Metrics.source == "scheduled")
-                ) or 0
+                scheduled_count = (
+                    s.scalar(
+                        select(func.count(Metrics.id)).where(
+                            Metrics.job_id == job_id, Metrics.source == "scheduled"
+                        )
+                    )
+                    or 0
+                )
                 # +1 因为本次 collect_one 写的 scheduled 行已 flush 进库，含当前
                 is_health_eval_node = scheduled_count == HEALTH_EVAL_INTERVAL_INDEX + 1
             else:
@@ -212,15 +271,14 @@ async def collect_one(
                 else:
                     # 极端兜底：job 被并发删 / 时间字段全空。退回旧行为不阻塞主流程；
                     # 这条路径理论不可达（能跑到 collect_one 的 job 都已 finished）。
-                    metric_count = (
-                        s.query(Metrics).filter(Metrics.job_id == job_id).count()
-                    )
+                    metric_count = s.query(Metrics).filter(Metrics.job_id == job_id).count()
                 is_health_eval_node = metric_count == 2
 
     # 24h 节点：触发健康度评估（曝光异常 → 降级 + 暂停）
     if is_health_eval_node:
         try:
             from ..accounts.health_monitor import evaluate_after_metrics
+
             with session_scope() as s2:
                 action = evaluate_after_metrics(s2, job_id)
                 data["health_action"] = {
@@ -239,6 +297,7 @@ async def collect_one(
     # 异步刷新主题热度（fire and forget）
     try:
         from ..content.heat_engine import recompute_topic_heat_for_article
+
         recompute_topic_heat_for_article(article_id)
     except Exception as e:
         # 热度刷新失败不影响采集主路径——但飞轮上的内容选题环节会拿到旧热度，

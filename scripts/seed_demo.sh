@@ -4,11 +4,16 @@
 
 set -euo pipefail
 API="${API:-http://127.0.0.1:8000}"
+: "${API_KEY:?请通过环境变量 API_KEY 提供与控制面一致的 legacy 管理 key}"
 
 echo "⚠️  legacy UI seed：只写占位数据；完整离线闭环请运行 ai-ops demo"
 
 post_json() {
-  curl -fsS -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"
+  # Feed the credential through stdin so it is not exposed in curl's argv.
+  printf 'X-API-Key: %s\n' "$API_KEY" | curl -fsS -X POST "$API$1" \
+    -H 'Content-Type: application/json' \
+    -H @- \
+    -d "$2"
 }
 
 response_id() {

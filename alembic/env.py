@@ -3,16 +3,17 @@
 与默认模板的关键差异：
   1. target_metadata = Base.metadata（import 自 ai_ops.core.models），
      autogenerate 才能识别 model 变更。
-  2. database_url 优先级：DATABASE_URL env > ai_ops.config.settings.database_url
-     > alembic.ini 的 fallback。
+  2. database_url 优先级：DATABASE_URL env > ai_ops.config.settings.database_url。
      - DATABASE_URL env：测试 / CI / 临时验证用（DONE step 4/5 直接走此路径）
      - settings.database_url：生产路径（运维 alembic upgrade head 时复用 app 配置）
-     - ini fallback：纯本地、未配 settings 时兜底
+     - 显式空白 env、空配置以及加载/校验异常都必须终止，绝不能回退后
+       误迁另一个数据库
   3. render_as_batch=True 永远生效。SQLite ALTER TABLE 不能 add/drop FK column，
      必须走 batch（CREATE temp table + COPY + DROP + RENAME）。Postgres 上
      render_as_batch=True 也兼容，autogenerate 出来的 batch_alter_table 在
      非-SQLite 后端会退化成普通 alter，无副作用。
 """
+
 from __future__ import annotations
 
 import os
@@ -51,20 +52,23 @@ def _resolve_database_url() -> str:
 
     1. DATABASE_URL env（CI / 临时验证 / DONE step 4-5 用此路径）
     2. ai_ops.config.settings.database_url（生产 / 复用 app 配置）
-    3. alembic.ini 的 fallback（纯本地兜底）
+    显式空白值一律视为配置错误，不能回退到 alembic.ini 的本地 URL。
     """
-    env_url = os.environ.get("DATABASE_URL", "").strip()
-    if env_url:
+    raw_env_url = os.environ.get("DATABASE_URL")
+    if raw_env_url is not None:
+        env_url = raw_env_url.strip()
+        if not env_url:
+            raise RuntimeError("DATABASE_URL is set but empty")
         return env_url
-    try:
-        from ai_ops.config import settings
-        cfg_url = (settings.database_url or "").strip()
-        if cfg_url:
-            return cfg_url
-    except Exception:
-        # settings 加载失败（如 pydantic-settings 校验报错），fallback 到 ini
-        pass
-    return config.get_main_option("sqlalchemy.url") or ""
+    # Import and validation failures deliberately propagate. Falling back after
+    # an invalid production setting can make Alembic report success while it
+    # silently migrates the repository's local SQLite URL instead.
+    from ai_ops.config import settings
+
+    cfg_url = (settings.database_url or "").strip()
+    if cfg_url:
+        return cfg_url
+    raise RuntimeError("database URL resolved to an empty value")
 
 
 def run_migrations_offline() -> None:

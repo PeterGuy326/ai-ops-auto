@@ -1,12 +1,93 @@
+import hashlib
+import ipaddress
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+PrincipalType = Literal["agent", "human", "service"]
+SCOPE_CONTENT_STAGE = "content:stage"
+SCOPE_PLAN_CREATE = "plan:create"
+SCOPE_APPROVAL_REQUEST = "approval:request"
+SCOPE_APPROVAL_READ = "approval:read"
+SCOPE_APPROVAL_DECIDE = "approval:decide"
+SCOPE_SCHEDULE_CREATE = "schedule:create"
+SCOPE_JOB_READ = "job:read"
+SCOPE_METRICS_COLLECT = "metrics:collect"
+SCOPE_PERFORMANCE_READ = "performance:read"
+
+AGENT_V1_SCOPES = frozenset(
+    {
+        SCOPE_CONTENT_STAGE,
+        SCOPE_PLAN_CREATE,
+        SCOPE_APPROVAL_REQUEST,
+        SCOPE_APPROVAL_READ,
+        SCOPE_APPROVAL_DECIDE,
+        SCOPE_SCHEDULE_CREATE,
+        SCOPE_JOB_READ,
+        SCOPE_METRICS_COLLECT,
+        SCOPE_PERFORMANCE_READ,
+    }
+)
+
+# Backward-readable name used at the policy check sites.
+APPROVAL_DECIDE_SCOPE = SCOPE_APPROVAL_DECIDE
+HUMAN_APPROVAL_SCOPES = frozenset({SCOPE_APPROVAL_READ, SCOPE_APPROVAL_DECIDE})
+
+
+class AgentPrincipalConfig(BaseModel):
+    """One pre-provisioned bearer principal.
+
+    Only a SHA-256 verifier is accepted.  Raw bearer tokens must stay in the
+    caller's secret store and are never part of application configuration.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    principal_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    )
+    type: PrincipalType
+    token_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    scopes: tuple[str, ...] = ()
+
+    @field_validator("principal_id")
+    @classmethod
+    def _validate_principal_id(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("principal_id must not contain surrounding whitespace")
+        return value
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not scope or scope != scope.strip() for scope in values):
+            raise ValueError("scopes must be non-empty and contain no surrounding whitespace")
+        if len(set(values)) != len(values):
+            raise ValueError("scopes must be unique within a principal")
+        unknown = set(values) - AGENT_V1_SCOPES
+        if unknown:
+            raise ValueError("scopes contain an unknown Agent contract v1 scope")
+        return values
+
+    @model_validator(mode="after")
+    def _restrict_approval_decision(self):
+        if self.type != "human" and HUMAN_APPROVAL_SCOPES.intersection(self.scopes):
+            raise ValueError("only human principals may receive approval read/decide scopes")
+        return self
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 
     database_url: str = "sqlite:///./data/ai_ops.db"
     fernet_key: str = ""
@@ -25,9 +106,9 @@ class Settings(BaseSettings):
     # ====== 本地 Claude Code 作为 LLM 后端（LLM_DEFAULT=claude_cli）======
     # 走本机 `claude -p` headless，复用已登录的 Claude Code 鉴权/额度，
     # 无需单独 OpenAI/Anthropic key，简历数据不流向第三方。
-    claude_cli_bin: str = "claude"          # claude 可执行文件（不在 PATH 时填绝对路径）
-    claude_cli_model: str = ""              # 空=用 Claude Code 默认模型；可填 sonnet/opus/haiku
-    claude_cli_timeout_seconds: int = 120   # 单次 subprocess 超时（兜底防卡死）
+    claude_cli_bin: str = "claude"  # claude 可执行文件（不在 PATH 时填绝对路径）
+    claude_cli_model: str = ""  # 空=用 Claude Code 默认模型；可填 sonnet/opus/haiku
+    claude_cli_timeout_seconds: int = 120  # 单次 subprocess 超时（兜底防卡死）
 
     # ====== AI 短剧视频 · HappyHorse（DashScope 异步协议）======
     # 这是可选的私有/兼容服务适配器；开源默认不配置任何组织端点。
@@ -104,17 +185,14 @@ class Settings(BaseSettings):
     def _validate_scheduler_timeouts(self):
         if self.job_running_timeout_seconds <= self.job_execution_timeout_seconds:
             raise ValueError(
-                "JOB_RUNNING_TIMEOUT_SECONDS must be greater than "
-                "JOB_EXECUTION_TIMEOUT_SECONDS"
+                "JOB_RUNNING_TIMEOUT_SECONDS must be greater than JOB_EXECUTION_TIMEOUT_SECONDS"
             )
         if (
             self.youtube_uploader_enabled
-            and self.youtube_uploader_timeout_seconds
-            >= self.job_execution_timeout_seconds
+            and self.youtube_uploader_timeout_seconds >= self.job_execution_timeout_seconds
         ):
             raise ValueError(
-                "YOUTUBE_UPLOADER_TIMEOUT_SECONDS must be lower than "
-                "JOB_EXECUTION_TIMEOUT_SECONDS"
+                "YOUTUBE_UPLOADER_TIMEOUT_SECONDS must be lower than JOB_EXECUTION_TIMEOUT_SECONDS"
             )
         return self
 
@@ -194,6 +272,26 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path("./data"))
 
+    # Agent contract v1 accepts only pre-staged files under this import root,
+    # then copies them into a separate content-addressed vault before approval.
+    agent_asset_import_root: Path = Path("./data/agent-import")
+    agent_asset_vault_root: Path = Path("./data/agent-vault")
+    agent_asset_max_bytes: int = Field(
+        default=512 * 1024 * 1024,
+        ge=1,
+        le=50 * 1024 * 1024 * 1024,
+    )
+    agent_asset_max_total_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1,
+        le=100 * 1024 * 1024 * 1024,
+    )
+    # Manual Agent metrics reads run outside the database transaction.  Bound
+    # them below a durable operation lease so cancellation/crash recovery can
+    # safely reclaim the same idempotency key.
+    agent_metrics_collection_timeout_seconds: int = Field(default=120, ge=1, le=1800)
+    agent_external_operation_lease_seconds: int = Field(default=300, ge=2, le=7200)
+
     # ====== 通知模块（Task B）======
     # 飞书 custom robot webhook（钉钉/企微留 adapters.py 空壳，out of scope, follow-up）
     feishu_webhook_url: str = ""
@@ -203,9 +301,100 @@ class Settings(BaseSettings):
     notify_dedup_threshold: int = 3
 
     # ====== Task F · API 鉴权 ======
-    # 写操作 / 敏感读路由的 X-API-Key 校验值；空字符串 = dev 模式自动放行（仅本地调试用）。
-    # 生产部署必须设非空值，且通过 env (API_KEY=...) 注入，避免落 .env 仓库。
+    # 写操作 / 敏感读路由的 X-API-Key 校验值。空字符串默认 fail closed；
+    # 生产部署必须从环境注入非空值。
     api_key: str = ""
+    # Legacy 匿名模式必须二次显式开启；默认空 API_KEY 现在是 fail closed。
+    # 该开关只用于 loopback 本地开发，`ai-ops serve` 会拒绝把它绑定到非
+    # loopback 地址。
+    legacy_dev_auth_bypass: bool = False
+
+    # ====== Agent contract v1 · independent bearer principals ======
+    # JSON array supplied through AGENT_PRINCIPALS.  Entries contain only a
+    # SHA-256 token verifier, never the raw bearer token.  This identity plane
+    # is deliberately independent from the legacy X-API-Key/dev-mode contract.
+    agent_principals: list[AgentPrincipalConfig] = Field(default_factory=list)
+
+    @field_validator("api_key")
+    @classmethod
+    def _validate_legacy_api_key(cls, value: str) -> str:
+        if not value:
+            return value
+        if (
+            len(value) < 32
+            or value != value.strip()
+            or any(ord(character) < 0x21 or ord(character) > 0x7E for character in value)
+        ):
+            raise ValueError("API_KEY must be empty or at least 32 printable ASCII characters")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_legacy_dev_bind(self):
+        if not self.legacy_dev_auth_bypass:
+            return self
+        normalized = self.api_host.strip().strip("[]").lower()
+        try:
+            loopback = normalized == "localhost" or ipaddress.ip_address(normalized).is_loopback
+        except ValueError:
+            loopback = normalized == "localhost"
+        if not loopback:
+            raise ValueError("LEGACY_DEV_AUTH_BYPASS requires API_HOST to be a loopback address")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_agent_asset_root_separation(self):
+        try:
+            import_root = self.agent_asset_import_root.expanduser().resolve(strict=False)
+            vault_root = self.agent_asset_vault_root.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            raise ValueError("Agent asset roots must be resolvable paths") from None
+
+        if (
+            import_root == vault_root
+            or import_root.is_relative_to(vault_root)
+            or vault_root.is_relative_to(import_root)
+        ):
+            raise ValueError(
+                "AGENT_ASSET_IMPORT_ROOT and AGENT_ASSET_VAULT_ROOT must be "
+                "separate, non-overlapping directories"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_agent_asset_limits(self):
+        if self.agent_asset_max_total_bytes < self.agent_asset_max_bytes:
+            raise ValueError("AGENT_ASSET_MAX_TOTAL_BYTES must be at least AGENT_ASSET_MAX_BYTES")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_agent_external_operation_timeouts(self):
+        if (
+            self.agent_external_operation_lease_seconds
+            <= self.agent_metrics_collection_timeout_seconds
+        ):
+            raise ValueError(
+                "AGENT_EXTERNAL_OPERATION_LEASE_SECONDS must be greater than "
+                "AGENT_METRICS_COLLECTION_TIMEOUT_SECONDS"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_agent_principal_uniqueness(self):
+        principal_ids: set[str] = set()
+        token_hashes: set[str] = set()
+        legacy_api_key_hash = (
+            hashlib.sha256(self.api_key.encode("utf-8")).hexdigest() if self.api_key else None
+        )
+        for principal in self.agent_principals:
+            if principal.principal_id in principal_ids:
+                raise ValueError("AGENT_PRINCIPALS principal_id values must be unique")
+            if principal.token_sha256 in token_hashes:
+                raise ValueError("AGENT_PRINCIPALS token_sha256 values must be unique")
+            if legacy_api_key_hash is not None and principal.token_sha256 == legacy_api_key_hash:
+                raise ValueError("Agent bearer tokens must not reuse the legacy API_KEY")
+            principal_ids.add(principal.principal_id)
+            token_hashes.add(principal.token_sha256)
+        return self
 
     # ====== Task G · 可观测性 ======
     # Sentry DSN；空 = 不启用 Sentry（sentry-sdk 为软依赖，未装也不报错）
@@ -230,7 +419,6 @@ class Settings(BaseSettings):
     # lark-cli subprocess 总超时（秒）—— 兜底防 cli 本身卡死拖垮主业务
     lark_cli_timeout_seconds: int = 15
 
-
     # ====== Video Clipper · FunClip（智能视频剪辑，阿里达摩院/ModelScope 开源）======
     # 外置 FunClip 仓库路径（git clone https://github.com/modelscope/FunClip）
     funclip_path: Path = Path("./external/FunClip")
@@ -241,7 +429,6 @@ class Settings(BaseSettings):
     funclip_timeout_seconds: int = 1800
     # 默认输出根目录（每次调用会在下面建 run_<ts>/ 子目录隔离产物）
     funclip_output_root: Path = Path("./data/clips")
-
 
     # ====== AI 短剧 · 可灵 Kling（云视频生成，快手；本地零算力）======
     # 鉴权走 JWT(HS256)：iss=access_key，用 secret_key 签名，token 30min 过期。
@@ -275,5 +462,6 @@ class Settings(BaseSettings):
     # dev 可设 AUTO_UPGRADE_DB=true 让本地 uvicorn 启动期自愈，避免开发者
     # git pull 拿到新 model 后启动直接炸（Round 5 事故重现）。
     auto_upgrade_db: bool = False
+
 
 settings = Settings()

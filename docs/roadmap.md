@@ -4,9 +4,10 @@
 
 让任何强 Agent 都能**安全、持久、可审计**地管理中国内容渠道，同时把不可逆操作的授权留给人。
 
-项目不以“自己再造一个 Agent”为目标，也不用平台数量作为主要成功指标。
-“授权留给人”是产品目标，不是当前 Alpha 已经强制实现的安全属性：现有管理端点共用一个
-`API_KEY`，只能记录审核状态，尚不能区分 Agent 与人工审批者。
+项目不以“自己再造一个 Agent”为目标，也不用平台数量作为主要成功指标。Agent contract v1
+已经用独立 principal、最小 scope 和不可自签的精确计划审批区分 Agent 与 human approver；
+旧 `API_KEY` 仍是兼容管理面，不能交给 Agent。`human` 身份能否代表真人，最终依赖部署者把该
+凭证托管在 Agent 无法访问的组织权限边界。
 
 ## Phase 0 — Trustworthy alpha（已完成，2026-08-11）
 
@@ -49,11 +50,12 @@ ingest -> review -> dry-run plan -> durable job -> fake publish -> fake metrics 
   强制输出 synthetic/offline 标识，不使用凭证，外部调用数为 0。
 - 人类可读与 JSON 输出、明确 dry-run 阶段、安装后 wheel 契约 smoke。
 - 旧 `scripts/seed_demo.sh` 降级为 legacy UI seed，不再代表价值闭环。
+- 独立 Bearer 调用者、最小作用域/RBAC、精确发布计划摘要和不可由请求者/Agent 自签的审批；
+  legacy 管理 key 与 Agent 身份面保持分离。
 
 待交付：
 
 - 更完整的首次启动向导与运行时能力探测。
-- 独立调用者身份、最小作用域/RBAC 和不可由 Agent 自签的发布审批；在此之前不宣传 human gate。
 - 把**首个 Stable 中国平台**作为本阶段发布主目标：优先验证知乎文章，其次验证 B 站视频；
   必须先获得结构化 post identity/readback，并连续 30 天跑专用账号 canary，未达标继续标 Experimental。
 - 将写入结果拆成 `accepted`（执行后端接受）、`deployed`（平台部署完成）、`verified`
@@ -62,22 +64,44 @@ ingest -> review -> dry-run plan -> durable job -> fake publish -> fake metrics 
 
 成功指标：新用户首次 demo 中位时间、安装成功率、首个待审内容建立率。
 
-## Phase 2 — Agent-native contract
+## Phase 2 — Agent-native contract（进行中）
 
 目标：让 Agent 调用稳定契约，不需要理解平台 selector 或数据库细节。
 
+已交付 v1 纵切：
+
 - `stage_content`
-- `request_approval`
 - `plan_publication`
+- `request_approval`
+- 独立 human `get_approval`
+- 独立 human `download_approval_asset`
+- 独立 human `decide_approval`
 - `schedule`
 - `get_job_status`
 - `collect_metrics`
 - `review_performance`
 
+交付形态包括严格 Pydantic DTO、稳定 Python service/HTTP client、`/v1` HTTP 路由和只通过 HTTP
+工作的 CLI。修改操作使用持久幂等账本；human reviewer 能以受控二进制流下载并独立校验审批绑定
+素材，审批同时绑定内容/素材、精确账号/平台与 UTC 排期；排程前重新计算摘要并用数据库唯一约束
+防止重复扇出。
+
+精确执行边界也已纳入 v1：每个 target 绑定 Publisher kind、renderer identity、contract/adapter
+version、无宿主路径的 payload projection 和摘要，worker 执行前重算并禁止 fallback。当前只有
+知乎 CLI `0.2.4` 实现 exact renderer，且需显式启用并配置由 `whoami.id` 规范化得到的稳定公开账号
+身份；该身份进入审批展示和 plan digest，写前再次校验。YouTube CLI `v1.25.5` 因缺少可审计的
+只读频道身份探针只保留 legacy canary；其他平台在 v1 计划阶段 fail closed。审批素材的存储后缀进入内容摘要，单文件/快照总量门禁、同一已验证文件
+句柄的下载流和 Range 拒绝完成了素材审阅边界。这些是契约一致性证据，不代表平台已达 Stable。
+
+待交付：MCP 适配、审批 SSO/组织身份集成、指标回采的持久任务账本，以及随使用数据建立的
+调用成功率/状态可解释性基线。
+
 控制面对 Agent 的交付形式优先级：稳定 Python/HTTP 契约 → CLI → MCP。平台执行层则优先选择
 有版本、结构化 post identity 和可回滚路径的官方 API/CLI。两层不要混为一谈，Agent 不能通过
 任何一层越过人工审批策略。要兑现这一目标，必须先增加独立的调用者身份、作用域/RBAC 和可验证的
-审批主体；在此之前由外部网关或工作流隔离 Agent 与管理 key。详见 [CLI Adapter 选型](cli-adapters.md)。
+审批主体；v1 已提供应用内身份与 scope，生产仍应由外部网关/SSO 托管 human 凭证，并将 legacy
+管理 key 与 Agent 隔离。详见 [Agent contract v1](agent-contract.md) 与
+[CLI Adapter 选型](cli-adapters.md)。
 
 成功指标：Agent 调用成功率、审批绕过事故数、任务状态可解释率。
 
