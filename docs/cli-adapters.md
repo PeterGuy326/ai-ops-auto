@@ -1,6 +1,6 @@
 # CLI Adapter 选型与迁移
 
-> 审计日期：2026-08-10。结论来自源码、包元数据和官方 API 文档，没有使用真实账号执行写操作。
+> 最近审计：2026-08-11。结论来自源码、包元数据和官方 API 文档，没有使用真实账号执行写操作。
 > “CLI 可调用”不等于“可作为发布成功依据”；最终成熟度仍以[平台能力矩阵](platform-capabilities.md)为准。
 
 ## 决策原则
@@ -34,17 +34,20 @@ CLI 是 Publisher 的一种执行后端，不是新的控制面。一个发布 C
 
 | 平台 | 候选 | 回执与边界 | 决策 |
 |---|---|---|---|
-| 知乎 | [`pyzhihu-cli 0.2.4`](https://pypi.org/project/pyzhihu-cli/) | 文章/想法/提问写命令无 JSON；无 ID 时仍可 exit 0 | 已接 feature-gated canary；严格解析 ID，unknown 禁止 fallback/retry |
+| 知乎 | [`pyzhihu-cli 0.2.4`](https://pypi.org/project/pyzhihu-cli/) | 社区 Alpha，并非知乎官方 CLI；文章/想法/提问写命令无稳定 JSON 回执 | 已接 feature-gated canary；严格解析 ID，unknown 禁止 fallback/retry |
 | 小红书 | [`xhs-cli 0.1.4`](https://pypi.org/project/xhs-cli/) | 图文有 `--json`，但 stdout 混 Rich 进度；无视频/定时 | 后续可选图文 canary，先补纯 JSON contract |
 | 小红书 | [`redbook-cli 0.2.0`](https://pypi.org/project/redbook-cli/) | 图文/视频/定时，但没有结构化发布 ID，并会下载预编译二进制 | 不进主链路 |
 | 小红书 | [`flow-xhs 0.1.2`](https://pypi.org/project/flow-xhs/) | JSON/JSONL 较完整，但没有可审计源码和许可证 | 拒绝默认集成 |
-| 抖音 | [`dy-cli 0.2.2`](https://pypi.org/project/dy-cli/) | 某些未找到按钮路径仍会打印成功；写命令无 JSON | 读取可实验，发布不接 |
-| 抖音/快手/小红书/B 站/视频号 | [`social-auto-upload@008e4ff`](https://github.com/dreammis/social-auto-upload/commit/008e4ff66abdf48eb1f4b999272ef979711af436) | 已审计 CLI 只含前四者，视频号只走 HTTP；均缺结构化 post ID/URL，仓库未声明 LICENSE | 现有兼容路径；生产锁定该审计 commit，补许可证和回执前不升级主链路 |
-| 快手 | [`ks-miniprogram-ci`](https://www.npmjs.com/package/ks-miniprogram-ci) | 官方工具上传的是小程序构建包，不是创作者内容 | 不适用 |
-| B 站 | [`biliup 1.2.2`](https://pypi.org/project/biliup/) | 底层能得到 aid/bvid，但 CLI 上传层当前丢弃回执 | 值得迁移；先补 JSON 回执 shim 或上传后查询验证 |
+| 小红书 | [`xiaohongshu-mcp`](https://github.com/xpzouying/xiaohongshu-mcp) | 活跃但仍是本机 Chrome/Rod 自动化，不是官方接口 | 只允许 localhost、版本锁定、tool allowlist 和严格 readback 的可选插件 |
+| 抖音/头条视频 | [官方开放平台](https://open.douyin.com/platform/resource/docs/openapi/video-management/douyin/create/create-video/) | OAuth/scope/审核后可返回 item id；用户必须明确知情 | 后续官方 API 插件优先；`dy-cli` 社区逆向/浏览器路径不默认接入 |
+| 抖音/快手/小红书/B 站/视频号 | [`social-auto-upload@008e4ff`](https://github.com/dreammis/social-auto-upload/commit/008e4ff66abdf48eb1f4b999272ef979711af436) | 当前 main 已标 MIT，但旧审计 pin 仍缺 post ID/URL；B 站路径还可能运行时下载/更新 biliup | 保留兼容 fallback；禁止跟随 main 和运行时自更新，先补结构化回执 |
+| 快手 | [官方 OpenAPI](https://open.kuaishou.com/platform/openApi) | OAuth + `user_video_publish` 等权限，可形成 upload/publish/photoId/readback 链路 | 官方 API 薄插件优先；`ks-miniprogram-ci` 只是小程序构建上传，不适用 |
+| B 站 | [官方 Open Platform](https://openhome.bilibili.com/doc) | 提供视频稿件/专栏发布、删除、查询、沙箱和 webhook，需主体认证及 UP 授权 | 路线改为官方 API 第一；`biliup` 只作 opt-in fallback |
+| B 站 | [`biliup 1.2.2`](https://pypi.org/project/biliup/) | 社区上传器；底层能得到 aid/bvid，但 CLI 回执仍不够稳定 | 不再作为首选；只在固定版本和 JSON/readback shim 后 canary |
 | B 站 | [`bilibili-cli 0.6.2`](https://pypi.org/project/bilibili-cli/) | 读取/互动为主，只发文字动态，不上传视频 | 可选读取 Adapter |
-| 微信公众号 | [`ghostwriter-cli 0.1.1`](https://pypi.org/project/ghostwriter-cli/) | 基于官方 API 写草稿箱，不执行最终群发 | 可选“草稿”Adapter；不能冒充正式发布 |
-| 头条/百家号/搜狐号 | 无可信独立发布 CLI | 同名云 CLI/旧包不是创作者发文工具 | 保留现有浏览器/API Adapter |
+| 微信公众号 | [官方草稿/发布 API](https://developers.weixin.qq.com/doc/offiaccount/Publish/Publish.html) | 草稿 ID、publish ID 和状态轮询边界明确，但账号类型/认证资格受限 | 自建官方 API 插件优先；先验证账号当前权限 |
+| 微信公众号 | [`ghostwriter-cli 0.1.1`](https://pypi.org/project/ghostwriter-cli/) | 基于官方 API 只写草稿箱，不执行最终群发 | 可选 `draft` Adapter；不能冒充 `published` |
+| 百家号/搜狐号 | 无已核验的可信独立发布 CLI | 百家号需先在账号后台确认当前官方合同/资格；搜狐号有条件账号可用内容同步权益 | 保留 default-off Stub；有官方同步/API 权益时优先，不猜测私有接口 |
 | TikTok | [官方 Content Posting API](https://developers.tiktok.com/products/content-posting-api) | 有 OAuth、publish ID 和状态查询，但不是现成 CLI | 未来用官方 API 做薄 CLI/Publisher |
 | TikTok | [`tiktok-uploader 1.2.0`](https://pypi.org/project/tiktok-uploader/) | Playwright CLI，无 post ID/URL/JSON，失败退出语义不可靠 | 仅浏览器 fallback 候选 |
 | YouTube | [`youtubeuploader v1.25.5`](https://github.com/porjo/youtubeuploader/releases/tag/v1.25.5) | 基于官方 Data API；`-metaJSONout` 可得到 video resource/ID | 已接 default-off canary；receipt 是成功边界，当前没有 SAU fallback |
@@ -81,18 +84,20 @@ YouTube 还有平台级前置条件：2020-07-28 后创建且未经审核的 API
    或等价 API，补 Actions/Pages deploy 与 live URL readback。
 2. **已落地**：`youtubeuploader` 每账号隔离 OAuth 文件，固定 v1.25.5，解析
    `-metaJSONout` video ID；默认关闭，等专用频道 private canary。
-3. **待上游改造**：给 `biliup` 增加不丢 aid/bvid 的 JSON shim，再替代
-   B 站 SAU 主链路。
+3. **待实现**：B 站改接官方 Open Platform；`biliup` JSON shim 只保留为可选 fallback，
+   不再作为主路线。
+4. **待实现**：优先按 Publisher Plugin SDK 接官方抖音/头条视频、快手、微信公众号和
+   TikTok API。插件进入 registry 前仍要完成凭据权限、回执轮询和专用账号 canary。
 
 ### Wave 2：有限场景 Adapter
 
-- `xhs-cli` 只接图文，先清理 stdout JSON contract。
+- `xhs-cli` 或本机 `xiaohongshu-mcp` 只作为默认关闭的图文 canary，先补严格 readback。
 - `ghostwriter-cli` 只建公众号草稿，状态命名必须是 `draft`。
 - TikTok 优先官方 Content Posting API，不追逐无 ID 的浏览器 CLI。
 
 ### 保留 fallback
 
-抖音、快手、视频号和当前小红书视频继续由 SAU/浏览器路径承接。它们只有补齐许可证、版本锁定、
+视频号和当前小红书视频继续由 SAU/浏览器路径承接；抖音/快手则逐步迁到官方 API。兼容路径只有补齐版本锁定、
 结构化 post identity 和真实 canary 后，才有资格从 fallback 升到主链路。
 
 ## 上游协作清单
@@ -104,7 +109,9 @@ YouTube 还有平台级前置条件：2020-07-28 后创建且未经审核的 API
 - `--config-dir`，不再依赖伪造 HOME；
 - 发布后本人文章 readback 和可选 idempotency key。
 
-B 站需要把底层已有的 aid/bvid 原样暴露到 CLI JSON；SAU 需要先补 LICENSE 和统一发布回执。
+B 站主路线应以官方 Open Platform 的稿件 ID/查询/webhook 为准；若继续使用 `biliup` fallback，
+仍需把 aid/bvid 原样暴露到 CLI JSON。SAU 当前 main 虽已出现 MIT 标识，生产仍必须固定审计版本、
+禁用运行时下载/更新，并补统一发布回执。
 
 ## 已接入 CLI 的运行边界
 

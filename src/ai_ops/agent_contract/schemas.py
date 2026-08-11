@@ -27,7 +27,6 @@ from ..core.enums import (
     ContentType,
     JobStatus,
     Platform,
-    PublisherKind,
 )
 from .digest import canonical_json_bytes, canonical_sha256, normalize_utc_datetime
 
@@ -218,7 +217,10 @@ class RendererContract(_ContractModel):
     contract_version: str = Field(min_length=1, max_length=128)
     adapter_version: str = Field(min_length=1, max_length=128)
     platform: Platform
-    publisher_kind: PublisherKind
+    publisher_kind: Annotated[
+        str,
+        Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]{0,63}$"),
+    ]
     accepted_extra_keys: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
         default_factory=list, max_length=64
     )
@@ -234,6 +236,24 @@ class RendererContract(_ContractModel):
         if len(set(asset_types)) != len(asset_types):
             raise ValueError("asset_rules must not repeat asset types")
         return self
+
+
+def validate_renderer_contract(
+    value: object,
+    *,
+    expected_platform: Platform,
+    expected_publisher_kind: str,
+) -> RendererContract:
+    """Validate the shared renderer identity and platform safety contract."""
+
+    renderer = RendererContract.model_validate(value)
+    if (
+        renderer.platform != expected_platform
+        or renderer.publisher_kind != expected_publisher_kind
+        or (expected_platform == Platform.ZHIHU and not renderer.requires_external_account_id)
+    ):
+        raise ValueError("renderer contract does not satisfy the platform binding")
+    return renderer
 
 
 class RendererBinding(_ContractModel):
@@ -772,6 +792,7 @@ __all__ = [
     "RendererAssetRule",
     "RendererBinding",
     "RendererContract",
+    "validate_renderer_contract",
     "ScheduleRequest",
     "ScheduleResponse",
     "ScheduleState",

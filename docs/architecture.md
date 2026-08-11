@@ -139,6 +139,16 @@ fallback。它只能提高技术容错，不能代替幂等性、服务端成功
 这套边界取决于 Adapter 如实报告结果。目前迁移过的 CLI/Git 路径已使用上述字段；旧浏览器
 Adapter 仍是 Experimental，异常后的副作用判定并不都具备同等证据，不能把该保证外推到所有平台。
 
+第三方 Publisher 使用 `ai_ops.publishers.v1` entry point。安装包只有同时命中精确的
+`distribution:entry-point` allowlist，才会被加载；manifest、factory 和每次构造出的实例都会核验
+API version、platform、namespaced kind、metrics 与 exact renderer 自描述。同平台不同 kind
+可以共存；重复 `(platform, kind)` 会拒绝全部冲突插件。已启用插件校验失败时 registry 保持可导入，
+供 API/doctor 暴露诊断，但所有 Publisher routing fail closed，不会静默换实现。
+
+这仍是同进程信任边界：插件能访问进程权限，并会在 Publisher 方法调用时接触账号数据。allowlist
+只是代码执行授权，不提供沙箱。不可信社区适配器未来必须进入独立 subprocess/RPC host 和按能力
+发放凭证的 broker。完整契约见 [Publisher Plugin SDK v1](publisher-plugins.md)。
+
 对外支持等级只看 [平台能力矩阵](platform-capabilities.md)。
 
 ## 外部工具边界
@@ -147,7 +157,7 @@ Adapter 仍是 Experimental，异常后的副作用判定并不都具备同等�
 
 1. subprocess CLI，例如版本门禁的知乎 canary、social-auto-upload/FunClip。
 2. HTTP API，例如外置视频生成服务。
-3. 少量 Python 调用。
+3. 少量受信任 Python 调用，包括显式 allowlist 的 Publisher 插件。
 
 外部工具不是本仓库的依赖锁定一部分；真实发布证据必须同时记录它们的精确版本。
 数据库中的 credential blob 由 Fernet 保护，但知乎独立 HOME、YouTube OAuth 文件、SAU cookie

@@ -43,7 +43,9 @@ Agent contract v1 已把 Agent 与审批者拆成独立 Bearer principal，并�
   自己精确绑定的快照做当次健康判断；没有真实 post identity/collector 时仍不会伪造数据。
 - v1 计划把 Publisher kind、renderer identity/contract/adapter version 和无宿主路径的最终平台
   payload projection 及其摘要一起交给 human review；worker 执行前重算，不允许切换到另一
-  Publisher。当前只有显式启用、且配置了稳定公开账号身份的知乎 CLI 具备 exact renderer；
+  Publisher。core 内建路径中只有显式启用、且配置了稳定公开账号身份的知乎 CLI 具备 exact
+  renderer；通过 SDK 校验的受信任插件也可声明 namespaced exact renderer，但不会因此获得 Stable
+  评级或绕过审批；
   YouTube CLI 因缺少可审计的只读频道身份探针，仅保留 legacy canary。其他平台在 v1 计划阶段
   fail closed；这不代表知乎已经 Stable。
 - Agent 素材只从显式 import root 入库，经大小门禁和 SHA-256 校验原子复制到持久 vault；发布计划保存
@@ -51,6 +53,9 @@ Agent contract v1 已把 Agent 与审批者拆成独立 Bearer principal，并�
   宿主路径；文件后缀和单文件/总量上限也在契约里受控。下载端在同一已验证文件句柄上流式
   返回、拒绝 Range；排程与 worker 会再次校验素材。
 - social-auto-upload、Playwright 平台适配器、MoneyPrinterTurbo、FunClip 等外部工具接口。
+- Publisher Plugin SDK v1：第三方适配器通过版本化 Python entry point 接入，默认零加载；
+  `plugins list` 只读元数据，`plugins doctor` 只验证人工 allowlist 的受信任代码。详见
+  [插件开发与部署](docs/publisher-plugins.md)。
 - 单元测试与 mock 集成证据。这些不等于当前平台 UI 上的真实发布证据。
 
 目前还不是：分布式队列、无人值守 SaaS、官方平台 API 聚合层，或已经完成的 Agent MCP 产品。
@@ -125,6 +130,8 @@ API_KEY='<与 .env 相同的管理 key>' bash scripts/seed_demo.sh
   任何网络暴露环境必须设置独立强随机值，并限制在 TLS/操作员访问边界内。
 - GitHub Pages 默认 `GITHUB_PAGES_DRY_RUN=true`。
 - 知乎/YouTube CLI canary 与百家号/搜狐号 Stub 默认不进入真实写主链路。
+- `PUBLISHER_PLUGIN_ALLOWLIST=[]`：未授权的第三方 entry point 不会被 import；非空 allowlist
+  等同于同进程代码执行授权，不是沙箱。
 - 开源配置不包含内网端点、个人路径、固定通知群或任何凭证。
 - 对外网络暴露 API/UI 前还必须配置反向代理 TLS、请求限制和网络访问策略。
 - 真实发布是外部副作用；先用测试账号、最小配额和单平台验证。
@@ -164,7 +171,8 @@ Codex / Claude / OpenClaw / custom agent
    绑定，以及可恢复的 1h/24h/7d 数据库指标任务已经落地；YouTube exact 等待只读频道身份探针，
    下一步补 MCP。平台侧继续优先复用能返回 post identity 的版本化 CLI/API，浏览器自动化作为
    受控 fallback。
-4. **Evidence moat**：版本化 Adapter、平台 canary、跨平台指标归一化和实验追踪。
+4. **Evidence moat**：Publisher Plugin SDK v1 与兼容性 manifest 已落地；下一步是官方 API
+   插件、平台 canary、跨平台指标归一化和实验追踪。
 
 详细里程碑与成功指标见 [Roadmap](docs/roadmap.md)。
 

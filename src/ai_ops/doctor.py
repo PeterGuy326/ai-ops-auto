@@ -816,6 +816,7 @@ def _publication_safety_check(config: Any) -> DoctorCheck:
         "github_pages_live": not bool(getattr(config, "github_pages_dry_run", True)),
         "zhihu_cli": bool(getattr(config, "zhihu_cli_enabled", False)),
         "youtube_uploader": bool(getattr(config, "youtube_uploader_enabled", False)),
+        "publisher_plugins": bool(getattr(config, "publisher_plugin_allowlist", ())),
         "baijiahao_stub": bool(getattr(config, "baijiahao_publisher_enabled", False)),
         "sohuhao_stub": bool(getattr(config, "sohuhao_publisher_enabled", False)),
     }
@@ -1375,6 +1376,71 @@ def _adapter_checks(config: Any, executable_probe: ExecutableProbe) -> list[Doct
     return [zhihu, youtube, sau, xhs, mpt, funclip]
 
 
+def _publisher_plugin_selection_check(
+    config: Any,
+    *,
+    entry_points: Sequence[Any] | None = None,
+) -> DoctorCheck:
+    """Inspect Publisher entry-point metadata without importing plugin code."""
+
+    from .publishers.plugin_sdk import (
+        PUBLISHER_PLUGIN_ENTRY_POINT_GROUP,
+        inspect_publisher_plugins,
+        safe_plugin_exception_type,
+    )
+
+    enabled = tuple(getattr(config, "publisher_plugin_allowlist", ()) or ())
+    try:
+        inventory = inspect_publisher_plugins(enabled, entry_points=entry_points)
+    except (Exception, SystemExit) as exc:
+        return _result(
+            "plugins.selection",
+            CheckOutcome.FAIL if enabled else CheckOutcome.WARN,
+            "Publisher plugin metadata inventory failed",
+            remediation="repair Python package metadata and rerun doctor",
+            details={
+                "code_loaded": False,
+                "enabled_count": len(enabled),
+                "entry_point_group": PUBLISHER_PLUGIN_ENTRY_POINT_GROUP,
+                "exception_type": safe_plugin_exception_type(exc),
+            },
+        )
+    details = {
+        "code_loaded": False,
+        "enabled_selectors": list(inventory.enabled_selectors),
+        "entry_point_group": PUBLISHER_PLUGIN_ENTRY_POINT_GROUP,
+        "installed_count": len(inventory.entries),
+        "missing_enabled": list(inventory.missing_enabled),
+        "duplicate_enabled": list(inventory.duplicate_enabled),
+        "invalid_enabled": list(inventory.invalid_enabled),
+    }
+    if inventory.missing_enabled or inventory.duplicate_enabled or inventory.invalid_enabled:
+        return _result(
+            "plugins.selection",
+            CheckOutcome.FAIL,
+            "one or more enabled Publisher plugin selectors are unavailable, ambiguous, or invalid",
+            remediation=(
+                "install one pinned distribution with valid metadata per selector or remove it "
+                "from the allowlist"
+            ),
+            details=details,
+        )
+    if not enabled:
+        return _result(
+            "plugins.selection",
+            CheckOutcome.SKIP,
+            "no third-party Publisher plugins are enabled; plugin code was not loaded",
+            details=details,
+        )
+    return _result(
+        "plugins.selection",
+        CheckOutcome.WARN,
+        "trusted Publisher plugins are selected but were not imported by top-level doctor",
+        remediation="run `ai-ops plugins doctor` before starting a publishing worker",
+        details=details,
+    )
+
+
 def run_doctor(
     config: Any | None = None,
     *,
@@ -1382,6 +1448,7 @@ def run_doctor(
     package_root: Path | None = None,
     module_probe: ModuleProbe = _module_available,
     executable_probe: ExecutableProbe = shutil.which,
+    plugin_entry_points: Sequence[Any] | None = None,
 ) -> DoctorReport:
     """Run the fixed-order, side-effect-free doctor checks."""
 
@@ -1399,6 +1466,7 @@ def run_doctor(
     checks.append(_scheduler_check(active, module_probe))
     checks.append(_browser_check(active, module_probe, executable_probe))
     checks.extend(_adapter_checks(active, executable_probe))
+    checks.append(_publisher_plugin_selection_check(active, entry_points=plugin_entry_points))
     return DoctorReport(tuple(checks))
 
 

@@ -57,6 +57,7 @@ Kubernetes 多副本或把本项目描述为分布式系统。当前调度后端
 | `AGENT_ASSET_MAX_TOTAL_BYTES` | 单份 v1 内容快照的素材总量上限；默认 2 GiB，不得小于单文件上限 |
 | `AGENT_METRICS_COLLECTION_TIMEOUT_SECONDS` | v1 手动指标回采超时；默认 120 秒 |
 | `AGENT_EXTERNAL_OPERATION_LEASE_SECONDS` | 外部读取幂等 lease；默认 300 秒，必须大于手动指标回采超时加 30 秒事务收尾余量 |
+| `PUBLISHER_PLUGIN_ALLOWLIST` | 默认 `[]`；JSON selector 数组。非空表示授权固定发行包的同进程 Python 代码执行 |
 | `AUTO_PUBLISH_ENABLED` | 默认 `false`；只控制后台扫描，真账号 canary 完成后才显式打开 |
 | `SCHEDULER_BACKEND` | 只能是 `apscheduler` |
 | `SCHEDULER_TIMEZONE` | 健康检查/报表 cron 的业务时区，默认 `Asia/Shanghai` |
@@ -102,8 +103,24 @@ Agent 调用应只使用 [Agent contract v1](agent-contract.md) 的 Bearer princ
 缺少这些能力的平台会 fail closed，不能降级成路径字符串检查。Windows 可运行其他控制面功能，
 但在提供等价安全实现前不能承载带素材的 v1 exact 工作流。
 
-v1 exact 计划当前只接受显式启用、且已绑定 `whoami.id` 稳定公开身份的知乎 CLI（`0.2.4`）
-渲染器。计划/审批包绑定 Publisher kind、renderer identity、contract/adapter version、目标平台
+第三方 Publisher 插件必须先在部署器中锁定版本/hash 并完成人工代码与依赖审阅；项目不会在线
+安装插件，也不会替 operator 修改 `.env`。启用前依次运行：
+
+```bash
+ai-ops plugins list --json
+ai-ops plugins doctor --json
+ai-ops doctor
+```
+
+第一条只读 metadata；第二条会 import allowlist 中的受信任代码并校验 manifest/factory，但不会调用
+login/publish/health/metrics。顶层 doctor 仍不加载第三方代码，且会用 WARN 提示已启用插件，因此
+这条部署检查不使用 `--strict`。任何 enabled selector 缺失、重名或
+契约不兼容都会让 Publisher routing fail closed；API/doctor 仍可启动以便修复。插件与控制面同进程，
+不是权限沙箱，具体供应链与开发约束见 [Publisher Plugin SDK v1](publisher-plugins.md)。
+
+core 内建的 v1 exact 计划当前只接受显式启用、且已绑定 `whoami.id` 稳定公开身份的知乎 CLI
+（`0.2.4`）渲染器。通过 SDK 完整校验的受信任插件也可声明 namespaced exact renderer；这只扩展
+适配器来源，不改变人工审批、账号身份和平台 evidence 门槛。计划/审批包绑定 Publisher kind、renderer identity、contract/adapter version、目标平台
 账号身份、无宿主路径的 payload projection 与摘要；worker 只能调用该 Publisher，执行写入前会
 再次读取并比对账号身份与 payload，不允许 fallback。知乎投影依赖精确锁定的
 `markdown==3.10.3`。YouTube CLI（`v1.25.5`）因缺少可审计的只读频道身份探针，仅保留 legacy

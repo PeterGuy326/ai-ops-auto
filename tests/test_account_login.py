@@ -15,6 +15,15 @@ from ai_ops.core import db as db_mod
 from ai_ops.core.db import enable_sqlite_foreign_keys
 from ai_ops.core.enums import AccountHealth, Platform
 from ai_ops.core.models import Account, Base
+from ai_ops.core.schemas import PublishResult
+from ai_ops.publishers.base import PublisherBase
+from ai_ops.publishers.plugin_sdk import (
+    PUBLISHER_PLUGIN_API_VERSION,
+    PublisherPlugin,
+    PublisherPluginCapability,
+    PublisherPluginManifest,
+    instantiate_validated_publisher,
+)
 from ai_ops.publishers.registry import default_registry
 from ai_ops.runtime import account_lease as lease_mod
 
@@ -230,3 +239,62 @@ def test_unsuccessful_login_does_not_reflect_adapter_error_text(
         "error": "登录未成功；请检查账号状态或在可信终端完成登录",
     }
     assert "private adapter output" not in response.text
+
+
+def test_plugin_login_system_exit_is_generic_and_does_not_stop_api(
+    authenticated_login_api,
+    monkeypatch,
+):
+    client, _SessionLocal, account_id = authenticated_login_api
+
+    class NoopLease:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class ExitingLoginPublisher(PublisherBase):
+        platform = Platform.ZHIHU
+        kind = "fixture_login"
+
+        async def login(self, account_id, credential):
+            raise SystemExit("token=must-not-leak")
+
+        async def publish(self, account_id, credential, content):
+            return PublishResult(success=True, platform_post_id="unused")
+
+        async def health_check(self, account_id, credential):
+            return AccountHealth.HEALTHY
+
+    plugin = PublisherPlugin(
+        manifest=PublisherPluginManifest(
+            plugin_id="fixture.login",
+            plugin_version="1.0.0",
+            api_version=PUBLISHER_PLUGIN_API_VERSION,
+            platform=Platform.ZHIHU,
+            publisher_kind="fixture_login",
+            adapter_version="1",
+            capabilities=(
+                PublisherPluginCapability.HEALTH_CHECK,
+                PublisherPluginCapability.LOGIN,
+                PublisherPluginCapability.PUBLISH,
+            ),
+        ),
+        factory=ExitingLoginPublisher,
+    )
+    publisher = instantiate_validated_publisher(
+        "fixture-ai-ops:fixture.login",
+        plugin,
+    )
+    monkeypatch.setattr(lease_mod, "AccountOperationLease", NoopLease)
+    monkeypatch.setattr(default_registry, "resolve", lambda _platform: [publisher])
+
+    response = _post_login(client, account_id)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "登录服务暂时不可用，请稍后重试"}
+    assert "must-not-leak" not in response.text

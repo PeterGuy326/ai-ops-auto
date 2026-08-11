@@ -12,6 +12,7 @@ import typer
 
 from .agent_contract.cli_commands import agent_app
 from .jobhunt.cli_commands import jobhunt_app
+from .plugin_commands import plugin_app
 from .reports.cli_commands import report_app
 
 app = typer.Typer(
@@ -335,6 +336,9 @@ app.add_typer(jobhunt_app, name="jobhunt")
 
 # Agent-native HTTP 契约：只访问控制面，不直连数据库。
 app.add_typer(agent_app, name="agent")
+
+# 第三方 Publisher 插件：metadata-only inventory + 显式 allowlist validation。
+app.add_typer(plugin_app, name="plugins")
 
 
 def main() -> None:

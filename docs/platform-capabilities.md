@@ -21,15 +21,15 @@ Experimental 对外呈现。
 |---|---|---|---|---|---|
 | 小红书 | **Experimental** | SAU + XhsSkills；Camoufox 可选 | Registry/fallback/unknown 契约；CLI exit 0 或浏览器 success toast 无严格公开 note ID/URL 均不算 SUCCESS；历史真发描述无完整 evidence card | 未实现平台级采集 | 2026-05-17（历史描述；本次未复测） |
 | 头条号 | **Experimental** | 自建 Playwright publisher | 全 mock 发布/selector/结果解析契约；历史真发描述待补证 | 已实现代码路径，仅有 mock 契约证据 | 2026-05-17（历史描述；本次未复测） |
-| 知乎 | **Experimental** | `pyzhihu-cli==0.2.4` gated canary + Playwright fallback | 固定 commit 源码审计；fake CLI/结果不确定/fallback/超时契约；历史真发描述待补证 | 已实现代码路径，仅有 mock 契约证据 | CLI：2026-08-10 E2 源码审计；真发未复测 |
+| 知乎 | **Experimental** | 社区 `pyzhihu-cli==0.2.4` gated canary + Playwright fallback | 固定 commit 源码审计；fake CLI/结果不确定/fallback/超时契约；历史真发描述待补证 | 已实现代码路径，仅有 mock 契约证据 | CLI：2026-08-11 E2 源码复核；真发未复测 |
 | 抖音 | **Experimental** | social-auto-upload wrapper | wrapper/unknown/mock 契约 | 未实现；SAU 无 post id/url 时不确认成功 | — |
-| B 站 | **Experimental** | social-auto-upload wrapper | wrapper/unknown/mock 契约 | 未实现 | — |
-| 快手 | **Experimental** | social-auto-upload wrapper | wrapper/unknown/mock 契约 | 未实现 | — |
+| B 站 | **Experimental** | 当前 SAU wrapper；后续优先官方 Open Platform | wrapper/unknown/mock 契约；已确认官方稿件/专栏 API、沙箱与 webhook 存在，但尚未实现 | 未实现 | 2026-08-11 E1 官方文档审计；未调用 |
+| 快手 | **Experimental** | 当前 SAU wrapper；后续优先官方 OpenAPI | wrapper/unknown/mock 契约；已确认官方 OAuth/视频发布链路存在，但尚未实现 | 未实现 | 2026-08-11 E1 官方文档审计；未调用 |
 | 视频号 | **Experimental** | social-auto-upload HTTP wrapper | wrapper/mock 契约；HTTP 能力受上游约束 | 未实现 | — |
 | TikTok | **Stub** | 当前无注册 Publisher；官方 Content Posting API 是后续候选 | 无发布契约 | 未实现 | — |
 | YouTube | **Experimental** | `youtubeuploader v1.25.5` gated canary；无 SAU fallback | 固定 tag 源码审计；fake CLI/OAuth 隔离/receipt/partial/unknown 契约 | 未实现 | CLI：2026-08-10 E2 源码审计；真发未测 |
 | GitHub Pages / 静态站点 | **Experimental** | Hexo + 固定 `pnpm|npx`/git argv；尚未集成 `gh` | dry-run 无副作用；受控图片解码/大小；仓库锁；source-branch SHA/read-after-push/unknown 契约，不含 Pages 部署/live URL 验证 | 未实现 | 2026-08-10 离线契约；未连真实 remote/Pages |
-| 微信公众号 | **Stub** | persistent-context draft-only publisher；不执行群发 | mock 草稿/unknown 契约；selector 与后台回执未跑专用账号 canary | 未实现 | — |
+| 微信公众号 | **Stub** | persistent-context draft-only publisher；后续优先官方草稿/发布 API | mock 草稿/unknown 契约；官方能力受账号类型与认证资格限制，尚未实现 API 插件 | 未实现 | 2026-08-11 E1 官方文档审计；未调用 |
 | 百家号 | **Stub** | default-off Playwright publisher（`BAIJIAHAO_PUBLISHER_ENABLED`） | mock 契约；selector 待首次真发校准 | 代码路径已有，未真平台验证 | — |
 | 搜狐号 | **Stub** | default-off Playwright publisher（`SOHUHAO_PUBLISHER_ENABLED`） | mock 契约；selector 待首次真发校准 | 代码路径已有，未真平台验证 | — |
 
@@ -49,6 +49,11 @@ YouTube CLI 当前也默认关闭。审计对象是
 返回失败并转人工对账；无 ID 而子进程已启动时禁止 fallback/自动重传。上游没有 auth-only 命令，
 首次 OAuth 需由人在可信终端预置，可能与第一次 private canary 上传绑定。
 专用频道 private canary 前不得升级 Beta 或默认开启。
+
+Publisher Plugin SDK 的 manifest/doctor 只证明 Python 兼容性和自描述一致性，不改变本表成熟度。
+插件只有提交精确上游版本、结构化回执/readback 和下面要求的真平台 evidence card，才可能推动
+Experimental/Stub 升级。默认优先级是官方 API/CLI，其次是固定版本的社区 CLI/MCP canary，浏览器
+自动化继续作为受控 fallback。完整调研见 [CLI Adapter 选型](cli-adapters.md)。
 
 worker 的三类停止条件是成功、已发生副作用、结果未知；只有明确无副作用的确定失败才会 fallback。
 迁移后的 CLI/Git 路径以及直接浏览器 Publisher 已在 mock 契约中建模最终写入边界：点击后异常、

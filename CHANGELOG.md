@@ -66,6 +66,11 @@ once release automation is established.
   repaired by bounded database scans. Expiring fenced leases, bounded retries/concurrency, unique
   snapshot binding, and 1h/6h/24h deadline grace prevent restart loss, duplicate persisted
   snapshots, and very late current observations from being mislabeled as historical window evidence.
+- Publisher Plugin SDK v1 with a versioned `ai_ops.publishers.v1` entry-point group, exact
+  distribution/name allowlist, compatibility manifests, deterministic registration, namespaced
+  kinds across metrics and Agent exact execution, and per-construction identity validation.
+- `ai-ops plugins list` for metadata-only inventory and `ai-ops plugins doctor` for explicit
+  validation of allowlisted trusted code, including stable JSON and installed-wheel fixture smoke.
 
 ### Changed
 
@@ -110,6 +115,8 @@ once release automation is established.
   reads. In the supported shared-lock topology, publishing, login, health probes, and metrics
   collection cannot concurrently mutate or consume the same profile state.
 - Phase 0 was accepted on 2026-08-11 after all six CI jobs passed on merged `main@16eccb5`.
+- Third-party Publisher imports are deny-by-default. Invalid enabled selections keep diagnostics
+  importable but block Publisher routing instead of silently choosing a different write path.
 
 ### Security
 
@@ -141,6 +148,10 @@ once release automation is established.
   current migration head instead of accepting a partially damaged installation or schema.
 - Explicit demo databases are built in a private sibling directory and promoted without following
   symlinks or overwriting databases and SQLite sidecars supplied by the caller.
+- Plugin selection binds canonical distribution and entry-point names, rejects wildcards,
+  duplicates and built-in kind collisions, and never exposes third-party exception text in CLI JSON.
+- Plugin runtime calls freeze trusted identity before awaiting third-party code, contain plugin
+  `SystemExit`, and persist only normalized metric counters rather than arbitrary plugin `raw` data.
 
 ### Known limitations
 
@@ -165,3 +176,5 @@ once release automation is established.
   content-file input and idempotency, and its Markdown/HTML behavior still needs real canary evidence.
 - The YouTube CLI adapter is disabled by default and still requires a dedicated-channel private
   canary; unverified Google API projects cannot use it as evidence of public publication.
+- Publisher plugins are trusted in-process Python code, not sandboxed extensions. Untrusted
+  community tools still require a future subprocess/RPC host and capability-scoped secret broker.

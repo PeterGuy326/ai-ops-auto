@@ -50,6 +50,11 @@ from ..core.models import (
 )
 from ..core.time import as_utc_naive
 from ..publishers.base import AgentContractRendererUnavailable
+from ..publishers.plugin_sdk import (
+    PublisherPluginResolutionError,
+    is_publisher_plugin_instance,
+    publisher_kind_value,
+)
 from .assets import (
     AssetTooLargeError,
     AssetVaultError,
@@ -84,12 +89,12 @@ from .schemas import (
     PostIdentity,
     PublicationTarget,
     RendererBinding,
-    RendererContract,
     RequestApprovalRequest,
     ScheduleRequest,
     ScheduleResponse,
     StageContentRequest,
     StageContentResponse,
+    validate_renderer_contract,
 )
 from .snapshot import (
     StoredApprovalContent,
@@ -537,15 +542,23 @@ class AgentControlPlane:
         content = publish_content_from_snapshot(snapshot)
         capable = False
         rejected = False
-        for publisher in self._publisher_registry.resolve(platform):
+        try:
+            publishers = self._publisher_registry.resolve(platform)
+        except PublisherPluginResolutionError:
+            raise AgentContractError(
+                "publisher_registry_unavailable",
+                "Publisher plugin configuration is invalid",
+                status_code=503,
+            ) from None
+        for publisher in publishers:
+            third_party = is_publisher_plugin_instance(publisher)
             descriptor = getattr(publisher, "agent_contract_renderer_descriptor", None)
             if descriptor is None:
                 continue
             capable = True
-            if (
-                getattr(descriptor, "platform", None) != platform
-                or getattr(publisher, "kind", None) != descriptor.publisher_kind
-            ):
+            if getattr(descriptor, "platform", None) != platform or publisher_kind_value(
+                getattr(publisher, "kind", "")
+            ) != publisher_kind_value(descriptor.publisher_kind):
                 raise AgentContractError(
                     "renderer_contract_invalid",
                     "A configured Publisher has an invalid Agent renderer contract",
@@ -558,13 +571,12 @@ class AgentControlPlane:
                 material = publisher.agent_contract_digest_material(content)
                 if not isinstance(material, dict) or set(material) != {"renderer", "payload"}:
                     raise ValueError
-                renderer = RendererContract.model_validate(material["renderer"])
-                if (
-                    renderer.platform != platform
-                    or renderer.publisher_kind != descriptor.publisher_kind
-                    or (platform == Platform.ZHIHU and not renderer.requires_external_account_id)
-                    or renderer.model_dump(mode="json") != descriptor.digest_material()
-                ):
+                renderer = validate_renderer_contract(
+                    material["renderer"],
+                    expected_platform=platform,
+                    expected_publisher_kind=publisher_kind_value(descriptor.publisher_kind),
+                )
+                if renderer.model_dump(mode="json") != descriptor.digest_material():
                     raise ValueError
                 payload = material["payload"]
                 if not isinstance(payload, dict):
@@ -576,7 +588,9 @@ class AgentControlPlane:
             except AgentContractRendererUnavailable:
                 rejected = True
                 continue
-            except Exception:
+            except (Exception, SystemExit) as exc:
+                if isinstance(exc, SystemExit) and not third_party:
+                    raise
                 raise AgentContractError(
                     "renderer_contract_invalid",
                     "A configured Publisher failed to project its Agent renderer contract",

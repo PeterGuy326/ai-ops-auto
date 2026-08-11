@@ -1,6 +1,7 @@
 import hashlib
 import ipaddress
 from pathlib import Path
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -165,6 +166,36 @@ class Settings(BaseSettings):
         default=20 * 1024 * 1024 * 1024,
         ge=1024,
     )
+
+    # ====== Third-party Publisher Plugin SDK ======
+    # Each selector binds both the normalized Python distribution and its
+    # versioned entry-point name. An empty tuple guarantees zero plugin imports.
+    # Environment syntax is a JSON array, for example:
+    # ["acme-ai-ops:acme.zhihu"]
+    publisher_plugin_allowlist: tuple[str, ...] = ()
+
+    @field_validator("publisher_plugin_allowlist")
+    @classmethod
+    def _validate_publisher_plugin_allowlist(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(values) > 32:
+            raise ValueError("PUBLISHER_PLUGIN_ALLOWLIST may contain at most 32 selectors")
+        normalized: list[str] = []
+        plugin_id_pattern = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
+        for value in values:
+            if value == "*" or value != value.strip() or value.count(":") != 1:
+                raise ValueError(
+                    "publisher plugin selectors must use distribution:entry-point and cannot be '*'"
+                )
+            distribution_name, plugin_id = value.split(":", 1)
+            distribution_name = re.sub(r"[-_.]+", "-", distribution_name).lower()
+            if not re.fullmatch(
+                r"[a-z0-9]+(?:-[a-z0-9]+)*", distribution_name
+            ) or not plugin_id_pattern.fullmatch(plugin_id):
+                raise ValueError("publisher plugin selector has an invalid format")
+            normalized.append(f"{distribution_name}:{plugin_id}")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("publisher plugin selectors must be unique")
+        return tuple(sorted(normalized))
 
     # 当前唯一实现的调度后端。保留字段是为了让非法值启动时立即失败，
     # 不代表 Celery/Redis 已可用。

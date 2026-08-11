@@ -4,6 +4,7 @@
 默认 02:00 跑（凌晨人少，反爬窗口）。
 到期 BANNED 账号只做只读探活，只有明确 HEALTHY 才解除封禁。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -24,12 +25,20 @@ from ..core.db import session_scope
 from ..core.enums import AccountHealth, JobStatus, Platform
 from ..core.models import Account, PublishJob
 from ..publishers.registry import default_registry
+from ..publishers.plugin_sdk import (
+    PublisherPluginResolutionError,
+    is_publisher_plugin_instance,
+)
 from ..runtime.account_lease import (
     AccountOperationLease,
     AccountOperationLeaseTimeout,
 )
 from ..observability import get_logger
-from ..observability.sentry import capture_exception
+from ..observability.sentry import (
+    capture_exception,
+    redacted_external_exception,
+    safe_exception_type,
+)
 from .queue import queue
 
 logger = get_logger(__name__)
@@ -56,23 +65,29 @@ def _credential_digest(account: Account) -> bytes:
 
 
 def _has_running_publish(session, account_id: int) -> bool:
-    return session.scalar(
-        select(PublishJob.id)
-        .where(PublishJob.account_id == account_id)
-        .where(PublishJob.status == JobStatus.RUNNING)
-        .limit(1)
-    ) is not None
+    return (
+        session.scalar(
+            select(PublishJob.id)
+            .where(PublishJob.account_id == account_id)
+            .where(PublishJob.status == JobStatus.RUNNING)
+            .limit(1)
+        )
+        is not None
+    )
 
 
 def _publish_started_since(session, account_id: int, since: datetime) -> bool:
     """Catch a publish that started and completed while the probe was in flight."""
-    return session.scalar(
-        select(PublishJob.id)
-        .where(PublishJob.account_id == account_id)
-        .where(PublishJob.started_at.is_not(None))
-        .where(PublishJob.started_at >= since)
-        .limit(1)
-    ) is not None
+    return (
+        session.scalar(
+            select(PublishJob.id)
+            .where(PublishJob.account_id == account_id)
+            .where(PublishJob.started_at.is_not(None))
+            .where(PublishJob.started_at >= since)
+            .limit(1)
+        )
+        is not None
+    )
 
 
 def _prepare_probe(account_id: int) -> _AccountProbePlan | None:
@@ -102,7 +117,7 @@ def _prepare_probe(account_id: int) -> _AccountProbePlan | None:
             # Some disk-profile adapters intentionally have no database credential.
             logger.warning(
                 "scheduler.health.credential_load: swallowed",
-                extra={"account_id": account_id, "error": str(exc)},
+                extra={"account_id": account_id, "exception_type": type(exc).__name__},
             )
             capture_exception(
                 exc,
@@ -148,7 +163,18 @@ async def check_all_accounts() -> dict:
         plan = _prepare_probe(account_id)
         if plan is None:
             continue
-        pubs = default_registry.resolve(plan.platform)
+        try:
+            pubs = default_registry.resolve(plan.platform)
+        except PublisherPluginResolutionError as exc:
+            logger.error(
+                "scheduler.health: Publisher plugin routing blocked",
+                extra={
+                    "account_id": account_id,
+                    "error_code": exc.code,
+                },
+            )
+            results[account_id] = AccountHealth.UNKNOWN.value
+            continue
         if not pubs:
             continue
         health = AccountHealth.UNKNOWN
@@ -157,28 +183,35 @@ async def check_all_accounts() -> dict:
             # the worker waits on the same lease; profile access is serialized.
             async with AccountOperationLease(account_id, timeout_seconds=0):
                 for pub in pubs:
+                    plugin_publisher = is_publisher_plugin_instance(pub)
                     try:
-                        candidate = await asyncio.wait_for(
-                            pub.health_check(account_id, plan.credential),
-                            timeout=float(
-                                getattr(settings, "health_probe_timeout_seconds", 60)
-                            ),
-                        )
-                    except Exception as e:
+                        # Keep plugin code in this Task so Python 3.11 cannot
+                        # leak SystemExit through a wait_for child Task.
+                        async with asyncio.timeout(
+                            float(getattr(settings, "health_probe_timeout_seconds", 60))
+                        ):
+                            candidate = AccountHealth(
+                                await pub.health_check(account_id, plan.credential)
+                            )
+                    except (Exception, SystemExit) as e:
+                        if isinstance(e, SystemExit) and not plugin_publisher:
+                            raise
                         # 探活炸了不阻断 fallback/后续账号，但必须 capture。
+                        exception_type = safe_exception_type(e)
                         logger.warning(
                             "scheduler.health.check: swallowed",
                             extra={
                                 "account_id": account_id,
                                 "platform": str(plan.platform),
-                                "error": str(e),
+                                "exception_type": exception_type,
                             },
                         )
                         capture_exception(
-                            e,
+                            redacted_external_exception(e),
                             scope="scheduler.health.check",
                             account_id=account_id,
                             platform=str(plan.platform),
+                            exception_type=exception_type,
                         )
                         continue
                     health = candidate
@@ -226,9 +259,7 @@ async def check_all_accounts() -> dict:
                 # have been applied while the external health probe was running.
                 if AccountHealth(acc.health) != AccountHealth.BANNED:
                     effective_health = AccountHealth(acc.health)
-                elif health == AccountHealth.HEALTHY and recover_banned_account(
-                    s, account_id
-                ):
+                elif health == AccountHealth.HEALTHY and recover_banned_account(s, account_id):
                     effective_health = AccountHealth.HEALTHY
                 else:
                     # UNKNOWN and every explicit unhealthy result are
@@ -263,6 +294,7 @@ async def check_all_accounts() -> dict:
         if notify_snapshot is not None:
             try:
                 from ..notify import account_expired
+
                 account_expired(notify_snapshot)
             except Exception as e:
                 # 通知是辅助通道，失败不能阻断探活循环——但必须 capture，
@@ -272,9 +304,9 @@ async def check_all_accounts() -> dict:
                     extra={
                         "account_id": account_id,
                         "health": notify_snapshot.get("health").value
-                            if hasattr(notify_snapshot.get("health"), "value")
-                            else str(notify_snapshot.get("health")),
-                        "error": str(e),
+                        if hasattr(notify_snapshot.get("health"), "value")
+                        else str(notify_snapshot.get("health")),
+                        "exception_type": type(e).__name__,
                     },
                 )
                 capture_exception(
