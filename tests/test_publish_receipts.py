@@ -71,3 +71,23 @@ def test_remove_publish_receipt_is_scoped_to_one_operation(tmp_path, monkeypatch
     assert receipts.read_publish_receipt(9, first) is None
     assert receipts.read_publish_receipt(9, second) is not None
     assert Path(receipts.receipt_path(9, second)).exists()
+
+
+def test_task_local_receipt_scope_routes_nested_adapter_journals(tmp_path, monkeypatch):
+    production_dir = tmp_path / "production-must-stay-absent"
+    isolated_dir = tmp_path / "isolated"
+    monkeypatch.setattr(receipts.settings, "data_dir", production_dir)
+    operation_id = "c" * 32
+
+    with receipts.receipt_data_dir_scope(isolated_dir):
+        path = receipts.write_publish_receipt(
+            job_id=12,
+            operation_id=operation_id,
+            publisher_kind="self_journaling_cli",
+            result=PublishResult(success=True, platform_post_id="post-12"),
+        )
+        recovered = receipts.read_publish_receipt(12, operation_id)
+
+    assert path is not None and path.is_relative_to(isolated_dir)
+    assert recovered is not None and recovered["platform_post_id"] == "post-12"
+    assert not production_dir.exists()

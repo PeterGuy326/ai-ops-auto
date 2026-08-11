@@ -8,7 +8,7 @@
 “授权留给人”是产品目标，不是当前 Alpha 已经强制实现的安全属性：现有管理端点共用一个
 `API_KEY`，只能记录审核状态，尚不能区分 Agent 与人工审批者。
 
-## Phase 0 — Trustworthy alpha（代码就绪，待发布验收）
+## Phase 0 — Trustworthy alpha（已完成，2026-08-11）
 
 目标：任务不丢、不重复发布、不默认误发，并且公开仓库的能力声明可以被验证。
 
@@ -30,11 +30,11 @@
 - 后端测试/lint、前端 lint/build、wheel 安装后迁移、PostgreSQL 空库迁移和 Docker
   build/runtime smoke 在 CI 通过。
 
-截至 2026-08-10，上述控制面语义已有实现和本地自动化测试；仓库 CI 已加入安装后 wheel、
-PostgreSQL 空库迁移与 Docker 运行冒烟。只有这些检查在合并提交上通过，Phase 0 才能标记完成。
-真实平台 canary 和独立人工审批身份不包含在“代码就绪”判断中。
+验收记录：2026-08-11，合并后的 `main@16eccb5` 上六个 CI jobs 全部通过，覆盖 Python
+3.11/3.12 后端、前端 lint/build、安装后 wheel 与 Alembic、PostgreSQL 空库迁移、Docker
+build/runtime smoke。真实平台 canary 和独立人工审批身份不包含在 Phase 0 完成判断中。
 
-## Phase 1 — Five-minute value
+## Phase 1 — Five-minute value（进行中）
 
 目标：新用户在无凭证、无真平台的环境中看到完整价值链。
 
@@ -42,11 +42,17 @@ PostgreSQL 空库迁移与 Docker 运行冒烟。只有这些检查在合并提�
 ingest -> review -> dry-run plan -> durable job -> fake publish -> fake metrics -> review
 ```
 
-计划交付：
+已交付的 doctor/demo tranche：
 
 - `ai-ops doctor`：检查数据库、资源、调度器、浏览器和外部适配器。
-- `ai-ops demo`：使用 Fake Publisher/Fake Metrics 生成可重复的完整状态流。
-- 首次启动向导、能力探测和明确的 dry-run 标识。
+- `ai-ops demo`：使用隔离 SQLite、Fake Publisher/Fake Metrics 生成可重复的完整状态流；
+  强制输出 synthetic/offline 标识，不使用凭证，外部调用数为 0。
+- 人类可读与 JSON 输出、明确 dry-run 阶段、安装后 wheel 契约 smoke。
+- 旧 `scripts/seed_demo.sh` 降级为 legacy UI seed，不再代表价值闭环。
+
+待交付：
+
+- 更完整的首次启动向导与运行时能力探测。
 - 独立调用者身份、最小作用域/RBAC 和不可由 Agent 自签的发布审批；在此之前不宣传 human gate。
 - 把**首个 Stable 中国平台**作为本阶段发布主目标：优先验证知乎文章，其次验证 B 站视频；
   必须先获得结构化 post identity/readback，并连续 30 天跑专用账号 canary，未达标继续标 Experimental。

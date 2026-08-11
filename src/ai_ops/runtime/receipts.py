@@ -8,6 +8,8 @@ reconciliation recover it.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
 import logging
@@ -21,6 +23,11 @@ from ..core.schemas import PublishResult
 
 
 logger = logging.getLogger(__name__)
+
+_ACTIVE_RECEIPT_DATA_DIR: ContextVar[str | Path | None] = ContextVar(
+    "ai_ops_active_receipt_data_dir",
+    default=None,
+)
 
 _OPERATION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _SAFE_RAW_KEYS = frozenset(
@@ -46,6 +53,16 @@ _SAFE_RAW_KEYS = frozenset(
 _MAX_RECEIPT_BYTES = 64 * 1024
 
 
+@contextmanager
+def receipt_data_dir_scope(data_dir: str | Path):
+    """Route nested adapter journals to one task-local receipt directory."""
+    token = _ACTIVE_RECEIPT_DATA_DIR.set(data_dir)
+    try:
+        yield
+    finally:
+        _ACTIVE_RECEIPT_DATA_DIR.reset(token)
+
+
 def new_operation_id() -> str:
     return secrets.token_hex(16)
 
@@ -54,8 +71,18 @@ def _valid_identity(job_id: int, operation_id: str) -> bool:
     return job_id > 0 and bool(_OPERATION_ID_RE.fullmatch(operation_id))
 
 
-def _receipt_dir(job_id: int, *, create: bool) -> Path:
-    receipts_root = Path(settings.data_dir).expanduser() / "receipts"
+def _receipt_dir(
+    job_id: int,
+    *,
+    create: bool,
+    data_dir: str | Path | None = None,
+) -> Path:
+    effective_data_dir = data_dir
+    if effective_data_dir is None:
+        effective_data_dir = _ACTIVE_RECEIPT_DATA_DIR.get()
+    if effective_data_dir is None:
+        effective_data_dir = settings.data_dir
+    receipts_root = Path(effective_data_dir).expanduser() / "receipts"
     root = receipts_root / "publish"
     job_dir = root / f"job_{job_id}"
     if receipts_root.is_symlink() or root.is_symlink() or job_dir.is_symlink():
@@ -75,10 +102,15 @@ def _receipt_dir(job_id: int, *, create: bool) -> Path:
     return job_dir
 
 
-def receipt_path(job_id: int, operation_id: str) -> Path:
+def receipt_path(
+    job_id: int,
+    operation_id: str,
+    *,
+    data_dir: str | Path | None = None,
+) -> Path:
     if not _valid_identity(job_id, operation_id):
         raise ValueError("invalid publish receipt identity")
-    return _receipt_dir(job_id, create=False) / f"{operation_id}.json"
+    return _receipt_dir(job_id, create=False, data_dir=data_dir) / f"{operation_id}.json"
 
 
 def _safe_scalar(value):
@@ -106,6 +138,7 @@ def write_publish_receipt(
     operation_id: str | None,
     publisher_kind: str,
     result: PublishResult,
+    data_dir: str | Path | None = None,
 ) -> Path | None:
     """Atomically persist a redacted result before the DB finalize transaction.
 
@@ -116,7 +149,7 @@ def write_publish_receipt(
     if job_id is None or operation_id is None or not _valid_identity(job_id, operation_id):
         return None
     try:
-        job_dir = _receipt_dir(job_id, create=True)
+        job_dir = _receipt_dir(job_id, create=True, data_dir=data_dir)
         path = job_dir / f"{operation_id}.json"
         payload = {
             "version": 1,
@@ -170,12 +203,17 @@ def write_publish_receipt(
         return None
 
 
-def read_publish_receipt(job_id: int, operation_id: str) -> dict | None:
+def read_publish_receipt(
+    job_id: int,
+    operation_id: str,
+    *,
+    data_dir: str | Path | None = None,
+) -> dict | None:
     """Read and validate one exact sidecar without following file symlinks."""
     if not _valid_identity(job_id, operation_id):
         return None
     try:
-        path = receipt_path(job_id, operation_id)
+        path = receipt_path(job_id, operation_id, data_dir=data_dir)
         if path.is_symlink() or not path.is_file():
             return None
         stat = path.stat()
@@ -193,13 +231,18 @@ def read_publish_receipt(job_id: int, operation_id: str) -> dict | None:
     return payload
 
 
-def remove_publish_receipt(job_id: int, operation_id: str) -> None:
+def remove_publish_receipt(
+    job_id: int,
+    operation_id: str,
+    *,
+    data_dir: str | Path | None = None,
+) -> None:
     """Best-effort cleanup after the same receipt is durably in the database."""
     if not _valid_identity(job_id, operation_id):
         return
     try:
-        receipt_path(job_id, operation_id).unlink(missing_ok=True)
-        job_dir = _receipt_dir(job_id, create=False)
+        receipt_path(job_id, operation_id, data_dir=data_dir).unlink(missing_ok=True)
+        job_dir = _receipt_dir(job_id, create=False, data_dir=data_dir)
         try:
             job_dir.rmdir()
         except OSError:

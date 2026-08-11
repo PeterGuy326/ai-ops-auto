@@ -1,14 +1,42 @@
 """命令行入口 — typer 驱动。"""
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import typer
 
-from .config import settings
-from .core.db import init_db as _init_db
 from .jobhunt.cli_commands import jobhunt_app
 from .reports.cli_commands import report_app
 
 app = typer.Typer(help="ai-ops-auto CLI")
+_DEMO_VERSION = "offline-demo-v1"
+
+
+class _LazySettings:
+    """Delay Settings validation until a command actually needs runtime config."""
+
+    def __getattr__(self, name: str):
+        from .config import settings as configured
+
+        return getattr(configured, name)
+
+
+# Kept as a module seam for command tests and embedding callers. Importing the
+# CLI remains safe when configuration is invalid, which lets doctor report a
+# structured, redacted error instead of failing before Typer starts.
+settings = _LazySettings()
+
+
+def _init_db():
+    from .core.db import init_db
+
+    return init_db()
+
+
+def _echo_json(payload: object) -> None:
+    """Write one machine-readable JSON document to stdout."""
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 @app.command("init-db")
@@ -27,6 +55,129 @@ def cmd_init_db():
     # DATABASE_URL may embed a username/password.  Logs need only the result,
     # never the connection string.
     typer.echo("OK: db initialized")
+
+
+@app.command("doctor")
+def cmd_doctor(
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="输出稳定的 JSON 检查结果，便于 Agent 和脚本消费。",
+    ),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="把可选能力的 WARN 也视为非零退出。",
+    ),
+):
+    """只读检查数据库、资源、安全配置、调度器和外部能力。"""
+    try:
+        from .doctor import run_doctor
+
+        report = run_doctor()
+    except Exception as exc:
+        # Doctor itself is a trust boundary: never echo arbitrary exception text,
+        # because database drivers may include a credential-bearing endpoint.
+        invalid_config = type(exc).__name__ == "ValidationError"
+        code = "invalid_configuration" if invalid_config else "doctor_failed"
+        message = (
+            "配置校验失败；请检查环境变量和 .env"
+            if invalid_config
+            else f"诊断器未能完成（{type(exc).__name__}）"
+        )
+        if as_json:
+            _echo_json(
+                {
+                    "error": {"code": code, "message": message},
+                    "exit_code": 1,
+                    "ok": False,
+                    "schema_version": 1,
+                    "strict": strict,
+                }
+            )
+        else:
+            typer.echo(f"ERROR: {message}", err=True)
+        raise typer.Exit(code=1) from None
+
+    if as_json:
+        _echo_json(report.to_dict(strict=strict))
+    else:
+        typer.echo(report.render_human(strict=strict))
+    exit_code = report.exit_code_for(strict=strict)
+    if exit_code:
+        raise typer.Exit(code=exit_code)
+
+
+@app.command("demo")
+def cmd_demo(
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="输出稳定的 JSON 结果，便于 Agent 和脚本消费。",
+    ),
+    database: Path | None = typer.Option(
+        None,
+        "--database",
+        dir_okay=False,
+        resolve_path=False,
+        help="新建的隔离 SQLite 文件；必须尚不存在。默认使用临时文件。",
+    ),
+    keep_data: bool | None = typer.Option(
+        None,
+        "--keep-data/--no-keep-data",
+        help="保留或清理演示库；默认保留显式路径、清理临时路径。",
+    ),
+):
+    """运行零凭证、零外部调用的完整离线价值闭环。"""
+    import asyncio
+
+    try:
+        from .demo import run_offline_demo
+
+        summary = asyncio.run(
+            run_offline_demo(
+                database_path=database,
+                keep_data=keep_data,
+            )
+        )
+    except FileExistsError:
+        message = "演示数据库已存在；请选择一个尚不存在的路径"
+        if as_json:
+            _echo_json(
+                {
+                    "demo_version": _DEMO_VERSION,
+                    "error": {"code": "database_exists", "message": message},
+                    "exit_code": 1,
+                    "ok": False,
+                }
+            )
+        else:
+            typer.echo(f"ERROR: {message}", err=True)
+        raise typer.Exit(code=1) from None
+    except Exception as exc:
+        # The exception text may contain a local path or adapter detail. Keep the
+        # public error deterministic and redacted; operators can rerun tests for
+        # a traceback when developing the project.
+        message = f"离线演示失败（{type(exc).__name__}）"
+        if as_json:
+            _echo_json(
+                {
+                    "demo_version": _DEMO_VERSION,
+                    "error": {"code": "demo_failed", "message": message},
+                    "exit_code": 1,
+                    "ok": False,
+                }
+            )
+        else:
+            typer.echo(f"ERROR: {message}", err=True)
+        raise typer.Exit(code=1) from None
+
+    if as_json:
+        _echo_json(summary.model_dump(mode="json"))
+    else:
+        typer.echo(summary.to_human_text())
+    if summary.exit_code:
+        raise typer.Exit(code=summary.exit_code)
 
 
 @app.command("serve")

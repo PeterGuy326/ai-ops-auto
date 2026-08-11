@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from contextvars import ContextVar
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable
 
 from sqlalchemy import select, update
 
@@ -29,10 +32,11 @@ from ..core.time import as_utc_naive
 from ..config import settings
 from ..observability import get_logger
 from ..observability.sentry import capture_exception
-from ..publishers.registry import default_registry
+from ..publishers.registry import PublisherRegistry, default_registry
 from ..runtime.receipts import (
     new_operation_id,
     read_publish_receipt,
+    receipt_data_dir_scope,
     remove_publish_receipt,
     write_publish_receipt,
 )
@@ -94,6 +98,56 @@ _FINALIZING_RESULT: ContextVar[PublishResult | None] = ContextVar(
     "ai_ops_finalizing_publish_result",
     default=None,
 )
+
+
+@dataclass(frozen=True)
+class WorkerExecutionContext:
+    """Explicit dependencies for an isolated/manual worker execution.
+
+    Production callers omit this object and retain the existing module-level
+    dependencies.  Offline demos and tests can instead run the
+    real claim/finalize state machine without temporarily replacing the global
+    database session, publisher registry, notifications, or metric scheduler.
+    """
+
+    session_scope_factory: Callable[[], Any]
+    registry: PublisherRegistry
+    schedule_after_publish: Callable[[int], object]
+    notify_success: Callable[[dict], object]
+    notify_failed: Callable[[dict], object]
+    similarity_checker: Callable[..., bool]
+    rate_limit_checker: Callable[..., Any]
+    account_lease_factory: Callable[..., Any]
+    receipt_writer: Callable[..., object]
+    receipt_reader: Callable[[int, str], dict | None]
+    receipt_remover: Callable[[int, str], object]
+    receipt_data_dir: str | Path
+    report_exception: Callable[..., object]
+    job_execution_timeout_seconds: float = 30.0
+    account_operation_lock_timeout_seconds: float = 5.0
+
+
+def _execution_session_scope(context: WorkerExecutionContext | None):
+    return context.session_scope_factory() if context is not None else session_scope()
+
+
+def _report_worker_exception(
+    execution_context: WorkerExecutionContext | None,
+    exc: BaseException,
+    **details,
+) -> None:
+    reporter = (
+        capture_exception
+        if execution_context is None
+        else execution_context.report_exception
+    )
+    try:
+        reporter(exc, **details)
+    except Exception:
+        logger.exception(
+            "worker exception reporter failed",
+            extra={"scope": details.get("scope")},
+        )
 
 
 def _retry_delay_seconds(attempts: int) -> int:
@@ -253,6 +307,7 @@ def mark_running_job_uncertain(
     now: datetime | None = None,
     started_before: datetime | None = None,
     known_result: PublishResult | None = None,
+    execution_context: WorkerExecutionContext | None = None,
 ) -> bool:
     """Fail-close one interrupted RUNNING job without blindly publishing again.
 
@@ -262,7 +317,7 @@ def mark_running_job_uncertain(
     late recovery pass harmless when another execution already completed.
     """
     finished_at = now or datetime.utcnow()
-    with session_scope() as session:
+    with _execution_session_scope(execution_context) as session:
         row = session.execute(
             select(
                 PublishJob.article_id,
@@ -277,11 +332,21 @@ def mark_running_job_uncertain(
         article_id, prior_raw, prior_kind, prior_post_id, prior_url = row
         raw_response = dict(prior_raw or {})
         operation_id = raw_response.get("operation_id")
-        receipt = (
-            read_publish_receipt(job_id, operation_id)
-            if isinstance(operation_id, str)
-            else None
-        )
+        if isinstance(operation_id, str):
+            try:
+                receipt = (
+                    read_publish_receipt(job_id, operation_id)
+                    if execution_context is None
+                    else execution_context.receipt_reader(job_id, operation_id)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "worker receipt recovery failed closed",
+                    extra={"job_id": job_id, "error_type": type(exc).__name__},
+                )
+                receipt = None
+        else:
+            receipt = None
 
         platform_post_id: str | None = prior_post_id
         platform_url: str | None = prior_url
@@ -352,26 +417,27 @@ def _best_effort_mark_uncertain(
     *,
     scope: str,
     known_result: PublishResult | None = None,
+    execution_context: WorkerExecutionContext | None = None,
 ) -> bool:
     """Preserve the caller's control flow even if reconciliation storage fails."""
     try:
-        return mark_running_job_uncertain(job_id, error, known_result=known_result)
+        return mark_running_job_uncertain(
+            job_id,
+            error,
+            known_result=known_result,
+            execution_context=execution_context,
+        )
     except Exception as reconciliation_error:
         logger.exception(
             "worker could not persist unknown platform outcome",
             extra={"job_id": job_id, "scope": scope},
         )
-        try:
-            capture_exception(
-                reconciliation_error,
-                scope=scope,
-                job_id=job_id,
-            )
-        except Exception:
-            logger.exception(
-                "worker could not report reconciliation failure",
-                extra={"job_id": job_id, "scope": scope},
-            )
+        _report_worker_exception(
+            execution_context,
+            reconciliation_error,
+            scope=scope,
+            job_id=job_id,
+        )
         return False
 
 
@@ -423,11 +489,15 @@ def schedule_job_runs(jobs, *, default_when: datetime | None = None) -> list[tup
     return out
 
 
-async def execute_job(job_id: int) -> PublishResult:
+async def execute_job(
+    job_id: int,
+    *,
+    execution_context: WorkerExecutionContext | None = None,
+) -> PublishResult:
     """Run one job and fail-close unexpected post-claim persistence errors."""
     result_token = _FINALIZING_RESULT.set(None)
     try:
-        return await _execute_job_once(job_id)
+        return await _execute_job_once(job_id, execution_context=execution_context)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -442,22 +512,18 @@ async def execute_job(job_id: int) -> PublishResult:
             persistence_error,
             scope="worker.finalize_unknown_outcome",
             known_result=known_result,
+            execution_context=execution_context,
         )
         logger.exception(
             "worker execution crashed outside publisher boundary",
             extra={"job_id": job_id, "marked_failed": marked},
         )
-        try:
-            capture_exception(
-                exc,
-                scope="worker.execute_job",
-                job_id=job_id,
-            )
-        except Exception:
-            logger.exception(
-                "worker could not report execution failure",
-                extra={"job_id": job_id},
-            )
+        _report_worker_exception(
+            execution_context,
+            exc,
+            scope="worker.execute_job",
+            job_id=job_id,
+        )
         if known_result is not None:
             raw_response = dict(known_result.raw_response or {})
             raw_response["reconciliation_required"] = True
@@ -482,14 +548,18 @@ async def execute_job(job_id: int) -> PublishResult:
         _FINALIZING_RESULT.reset(result_token)
 
 
-async def _execute_job_once(job_id: int) -> PublishResult:
+async def _execute_job_once(
+    job_id: int,
+    *,
+    execution_context: WorkerExecutionContext | None = None,
+) -> PublishResult:
     """Execute one job after a database-level conditional claim.
 
     Explicit calls are intentionally allowed even when automatic publishing is
     disabled.  The API/CLI authorization layer owns that human-triggered action;
     only automatic scheduling/scanning is guarded by ``auto_publish_enabled``.
     """
-    with session_scope() as s:
+    with _execution_session_scope(execution_context) as s:
         existing: PublishJob | None = s.get(PublishJob, job_id)
         if existing is None:
             return PublishResult(success=False, error=f"job {job_id} 不存在")
@@ -515,7 +585,12 @@ async def _execute_job_once(job_id: int) -> PublishResult:
         _sync_article_status(s, article.id)
 
         # 风控限流校验（养号期 + 间隔 + 单日上限）
-        gate = check_rate_limit(s, job.account_id, exclude_job_id=job.id)
+        rate_limit_checker = (
+            check_rate_limit
+            if execution_context is None
+            else execution_context.rate_limit_checker
+        )
+        gate = rate_limit_checker(s, job.account_id, exclude_job_id=job.id)
         if not gate.allowed:
             error = f"rate-limit: {gate.reason}"
             if gate.retry_at is not None:
@@ -558,7 +633,16 @@ async def _execute_job_once(job_id: int) -> PublishResult:
 
         # 内容层前置兜底：TAINT 词 + simhash 查重。
         # 任何一个命中即 fail-fast，不再消耗下游的解密 / 浏览器开销。
-        ok, pre_err = _pre_publish_check(s, job, article)
+        if execution_context is None:
+            ok, pre_err = _pre_publish_check(s, job, article)
+        else:
+            ok, pre_err = _pre_publish_check(
+                s,
+                job,
+                article,
+                similarity_checker=execution_context.similarity_checker,
+                exception_reporter=execution_context.report_exception,
+            )
         if not ok:
             _finish_failed_attempt(
                 s,
@@ -612,7 +696,8 @@ async def _execute_job_once(job_id: int) -> PublishResult:
                     "worker.image_anti_fingerprint: swallowed",
                     extra={"job_id": job.id, "account_id": job.account_id, "error": str(e)},
                 )
-                capture_exception(
+                _report_worker_exception(
+                    execution_context,
                     e,
                     scope="worker.image_anti_fingerprint",
                     job_id=job.id,
@@ -629,20 +714,47 @@ async def _execute_job_once(job_id: int) -> PublishResult:
     try:
         timeout_seconds = float(
             getattr(settings, "job_execution_timeout_seconds", 1800)
+            if execution_context is None
+            else execution_context.job_execution_timeout_seconds
         )
         lock_timeout = float(
             getattr(settings, "account_operation_lock_timeout_seconds", 120)
+            if execution_context is None
+            else execution_context.account_operation_lock_timeout_seconds
         )
-        async with AccountOperationLease(
-            account_id,
-            timeout_seconds=lock_timeout,
-        ):
+        lease = (
+            AccountOperationLease(account_id, timeout_seconds=lock_timeout)
+            if execution_context is None
+            else execution_context.account_lease_factory(
+                account_id,
+                timeout_seconds=lock_timeout,
+            )
+        )
+        async with lease:
             write_lease_acquired = True
-            publish_call = _try_publishers(platform, account_id, credential, content)
-            if timeout_seconds > 0:
-                result = await asyncio.wait_for(publish_call, timeout=timeout_seconds)
+            if execution_context is None:
+                publish_call = _try_publishers(platform, account_id, credential, content)
+                if timeout_seconds > 0:
+                    result = await asyncio.wait_for(publish_call, timeout=timeout_seconds)
+                else:
+                    result = await publish_call
             else:
-                result = await publish_call
+                with receipt_data_dir_scope(execution_context.receipt_data_dir):
+                    publish_call = _try_publishers(
+                        platform,
+                        account_id,
+                        credential,
+                        content,
+                        registry=execution_context.registry,
+                        receipt_writer=execution_context.receipt_writer,
+                    )
+                    if timeout_seconds > 0:
+                        result = await asyncio.wait_for(
+                            publish_call,
+                            timeout=timeout_seconds,
+                        )
+                    else:
+                        result = await publish_call
     except asyncio.CancelledError:
         if not write_lease_acquired:
             _best_effort_mark_uncertain(
@@ -657,12 +769,14 @@ async def _execute_job_once(job_id: int) -> PublishResult:
                     error=PREWRITE_CANCELLED_ERROR,
                     raw_response={"write_started": False},
                 ),
+                execution_context=execution_context,
             )
             raise
         marked = _best_effort_mark_uncertain(
             job_id,
             INTERRUPTED_EXECUTION_ERROR,
             scope="worker.cancel_unknown_outcome",
+            execution_context=execution_context,
         )
         logger.warning(
             "worker execution cancelled; platform outcome is unknown",
@@ -720,7 +834,7 @@ async def _execute_job_once(job_id: int) -> PublishResult:
     # to a durable sidecar for process-crash/stale-job recovery.
     _FINALIZING_RESULT.set(result)
 
-    with session_scope() as s:
+    with _execution_session_scope(execution_context) as s:
         job = s.get(PublishJob, job_id)
         if job is None:
             return result
@@ -761,13 +875,19 @@ async def _execute_job_once(job_id: int) -> PublishResult:
                     s,
                     job.id,
                     (result.raw_response or {}).get("initial_metadata") or {},
+                    exception_reporter=(
+                        capture_exception
+                        if execution_context is None
+                        else execution_context.report_exception
+                    ),
                 )
             except Exception as e:
                 logger.warning(
                     "worker.persist_initial_metrics_outer: swallowed",
                     extra={"job_id": job.id, "error": str(e)},
                 )
-                capture_exception(
+                _report_worker_exception(
+                    execution_context,
                     e,
                     scope="worker.persist_initial_metrics_outer",
                     job_id=job.id,
@@ -778,15 +898,24 @@ async def _execute_job_once(job_id: int) -> PublishResult:
 
             # 飞轮闭环：发布成功 → 调度 1h/24h/7d 数据采集
             try:
-                from .metrics import schedule_after_publish
-                schedule_after_publish(job.id)
+                if execution_context is None:
+                    from .metrics import schedule_after_publish
+
+                    schedule_after_publish(job.id)
+                else:
+                    execution_context.schedule_after_publish(job.id)
             except Exception as e:
                 # 采集失败不影响主流程——但必须留观测痕迹，否则飞轮长期断掉无人知
                 logger.warning(
                     "worker.schedule_metrics: swallowed",
                     extra={"job_id": job.id, "error": str(e)},
                 )
-                capture_exception(e, scope="worker.schedule_metrics", job_id=job.id)
+                _report_worker_exception(
+                    execution_context,
+                    e,
+                    scope="worker.schedule_metrics",
+                    job_id=job.id,
+                )
             # 通知模块快照（Task B）：在 session 内拼好数据，出块后再发——
             # 避免 notify 调用失败/慢回写影响 job 状态落库
             notify_snapshot = {
@@ -838,7 +967,12 @@ async def _execute_job_once(job_id: int) -> PublishResult:
                             "worker.auto_republish: swallowed",
                             extra={"job_id": job.id, "error": str(e)},
                         )
-                        capture_exception(e, scope="worker.auto_republish", job_id=job.id)
+                        _report_worker_exception(
+                            execution_context,
+                            e,
+                            scope="worker.auto_republish",
+                            job_id=job.id,
+                        )
             # 通知模块快照（Task B）：失败也快照，session 外调 notify.publish_failed
             notify_snapshot = {
                 "kind": "failed",
@@ -849,9 +983,25 @@ async def _execute_job_once(job_id: int) -> PublishResult:
             }
 
     # 出 session 后异步通知——session_scope 已 commit，notify 异常不会回滚 job 状态
-    remove_publish_receipt(job_id, operation_id)
     try:
-        from ..notify import publish_success, publish_failed
+        if execution_context is None:
+            remove_publish_receipt(job_id, operation_id)
+        else:
+            execution_context.receipt_remover(job_id, operation_id)
+    except Exception as exc:
+        # Receipt cleanup is best-effort after the database result committed.
+        # It must never turn a durable SUCCESS/FAILED result into a false error.
+        logger.warning(
+            "worker receipt cleanup failed after commit",
+            extra={"job_id": job_id, "error_type": type(exc).__name__},
+        )
+    try:
+        if execution_context is None:
+            from ..notify import publish_failed, publish_success
+
+        else:
+            publish_success = execution_context.notify_success
+            publish_failed = execution_context.notify_failed
         if notify_snapshot["kind"] == "success":
             publish_success(notify_snapshot)
         else:
@@ -867,7 +1017,8 @@ async def _execute_job_once(job_id: int) -> PublishResult:
                 "error": str(e),
             },
         )
-        capture_exception(
+        _report_worker_exception(
+            execution_context,
             e,
             scope="worker.notify",
             job_id=job_id,
@@ -882,9 +1033,13 @@ async def _try_publishers(
     account_id: int,
     credential: dict,
     content: PublishContent,
+    *,
+    registry: PublisherRegistry | None = None,
+    receipt_writer: Callable[..., object] | None = None,
 ) -> PublishResult:
     """按优先级尝试该平台所有 Publisher，第一个成功即返回。"""
-    publishers = default_registry.resolve(platform)
+    active_registry = registry if registry is not None else default_registry
+    publishers = active_registry.resolve(platform)
     if not publishers:
         return PublishResult(success=False, error=f"未注册 {platform} 的 Publisher")
 
@@ -913,12 +1068,26 @@ async def _try_publishers(
         publisher_kind = getattr(pub.kind, "value", str(pub.kind))
         raw_response["publisher_kind"] = publisher_kind
         result = result.model_copy(update={"raw_response": raw_response})
-        write_publish_receipt(
-            job_id=content.job_id,
-            operation_id=content.operation_id,
-            publisher_kind=publisher_kind,
-            result=result,
+        active_receipt_writer = (
+            write_publish_receipt if receipt_writer is None else receipt_writer
         )
+        try:
+            active_receipt_writer(
+                job_id=content.job_id,
+                operation_id=content.operation_id,
+                publisher_kind=publisher_kind,
+                result=result,
+            )
+        except Exception as exc:
+            # The built-in writer already swallows storage failures. Custom
+            # execution contexts receive the same best-effort contract here.
+            logger.warning(
+                "worker receipt journal failed",
+                extra={
+                    "job_id": content.job_id,
+                    "error_type": type(exc).__name__,
+                },
+            )
         if result.success or result.effect_applied or result.outcome_uncertain:
             return result
         last = result
@@ -970,6 +1139,7 @@ def _pre_publish_check(
     article: Article,
     *,
     similarity_checker=None,
+    exception_reporter=None,
 ) -> tuple[bool, str | None]:
     """发布前置内容兜底：TAINT 词 grep + simhash 查重。
 
@@ -981,6 +1151,8 @@ def _pre_publish_check(
         article: Article，提供 body 作为待检测文本。
         similarity_checker: 可注入的相似度检测函数（签名同 is_too_similar），
             主要给单测注入 mock 用；生产路径默认 = is_too_similar。
+        exception_reporter: 可注入的异常上报函数；未传时在调用时解析生产
+            ``capture_exception``，避免把导入时对象冻结进默认参数。
 
     Returns:
         (ok, error_message)：ok=False 时 error_message 给 worker 写入 job.error。
@@ -1014,12 +1186,21 @@ def _pre_publish_check(
             "worker.simhash_check: swallowed",
             extra={"job_id": job.id, "account_id": job.account_id, "error": str(e)},
         )
-        capture_exception(
-            e,
-            scope="worker.simhash_check",
-            job_id=job.id,
-            account_id=job.account_id,
+        active_reporter = (
+            capture_exception if exception_reporter is None else exception_reporter
         )
+        try:
+            active_reporter(
+                e,
+                scope="worker.simhash_check",
+                job_id=job.id,
+                account_id=job.account_id,
+            )
+        except Exception:
+            logger.exception(
+                "worker simhash exception reporter failed",
+                extra={"job_id": job.id},
+            )
         return True, None
     if too_similar:
         return False, (
@@ -1058,6 +1239,8 @@ def _persist_initial_metrics(
     session,
     job_id: int,
     initial_metadata: dict,
+    *,
+    exception_reporter=capture_exception,
 ) -> "Metrics | None":
     """publish 成功后落第一份 Metrics 快照。
 
@@ -1119,11 +1302,17 @@ def _persist_initial_metrics(
             "worker.persist_initial_metrics: swallowed",
             extra={"job_id": job_id, "error": str(e)},
         )
-        capture_exception(
-            e,
-            scope="worker.persist_initial_metrics",
-            job_id=job_id,
-        )
+        try:
+            exception_reporter(
+                e,
+                scope="worker.persist_initial_metrics",
+                job_id=job_id,
+            )
+        except Exception:
+            logger.exception(
+                "worker metrics exception reporter failed",
+                extra={"job_id": job_id},
+            )
         return None
 
 
