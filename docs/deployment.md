@@ -48,7 +48,14 @@ Kubernetes 多副本或把本项目描述为分布式系统。当前调度后端
 |---|---|
 | `DATABASE_URL` | API 与 worker 必须指向同一数据库 |
 | `FERNET_KEY` | 必须持久保存；只加密数据库 credential blob，丢失后无法解密；不覆盖磁盘 profile/OAuth/cookie |
-| `API_KEY` | 非空强随机值；所有对外部署必须设置；当前是审批/分发/执行共用的全权限管理 key |
+| `API_KEY` | 非空强随机值；legacy 管理端点的全权限 key，不能提供给 Agent |
+| `AGENT_PRINCIPALS` | `/v1` 独立 Bearer principal 的 JSON 数组；只保存 token SHA-256；Agent 与 human approver 必须分离 |
+| `AGENT_ASSET_IMPORT_ROOT` | v1 素材受控收件目录；只允许普通文件，不能与 vault 重叠 |
+| `AGENT_ASSET_VAULT_ROOT` | API 写、worker 读的持久 SHA-256 内容仓库；两进程必须挂载同一目录 |
+| `AGENT_ASSET_MAX_BYTES` | 单个素材流式入库上限；默认 512 MiB，按平台与容量策略下调 |
+| `AGENT_ASSET_MAX_TOTAL_BYTES` | 单份 v1 内容快照的素材总量上限；默认 2 GiB，不得小于单文件上限 |
+| `AGENT_METRICS_COLLECTION_TIMEOUT_SECONDS` | v1 手动指标回采超时；默认 120 秒 |
+| `AGENT_EXTERNAL_OPERATION_LEASE_SECONDS` | 外部读取幂等 lease；默认 300 秒，必须大于指标回采超时 |
 | `AUTO_PUBLISH_ENABLED` | 默认 `false`；只控制后台扫描，真账号 canary 完成后才显式打开 |
 | `SCHEDULER_BACKEND` | 只能是 `apscheduler` |
 | `SCHEDULER_TIMEZONE` | 健康检查/报表 cron 的业务时区，默认 `Asia/Shanghai` |
@@ -64,14 +71,46 @@ Kubernetes 多副本或把本项目描述为分布式系统。当前调度后端
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 python -c "import secrets; print(secrets.token_urlsafe(32))"
+ai-ops gen-principal-token  # 每个 v1 principal 单独生成；raw token 只交给该调用方
 ```
 
 第一个输出用于 `FERNET_KEY`，第二个用于 `API_KEY`。手工放入部署密钥管理系统，不要把值写进
 Dockerfile、Compose YAML、Shell 历史或 Git。
 
-当前项目没有调用者身份/RBAC，不能用同一个 `API_KEY` 区分 Agent 与人工审批者。需要强制 human
-gate 时，把管理 key 留在人工工作流或网关侧，并给 Agent 暴露更窄的外层接口。知乎/YouTube/SAU
-和浏览器的磁盘 profile 还需用专用系统用户、`0700/0600` 权限和受控备份单独保护。
+Agent 调用应只使用 [Agent contract v1](agent-contract.md) 的 Bearer principal，不得持有 legacy
+`API_KEY`。后者可以调用显式副作用管理端点；生产中必须非空、独立生成，并只经 TLS 和操作员访问
+边界使用。`approval:read` / `approval:decide` 只能授予独立的 human principal，且应用会拒绝请求者/
+计划创建者自签；审批客户端必须先读取脱敏快照，再把实际审阅的 `plan_digest` 作为
+`expected_plan_digest` 回传。部署者仍必须把 human token 放在 Agent 无法读取的 SSO、审批系统或
+硬件密钥边界。注意 `approval:read` 不只是元数据权限：它也能下载该审批绑定的原始素材字节，必须
+按敏感内容读取权限分发、轮换和审计。
+
+`AGENT_ASSET_IMPORT_ROOT` 是受控收件箱，不是任意宿主路径上传能力；让上游用独立系统账号写入，
+不要授予其 vault 写权限。两个根目录必须分离且不能互相包含。API 会拒绝越界、symlink、设备和
+超限文件，把字节原子复制到内容寻址 vault；计划保存不可变快照，并校验单文件与快照总量上限。
+安全规范化的存储后缀作为独立元数据进入 `content_digest`；排程和 worker 会重算路径、大小与 SHA-256。
+`AGENT_ASSET_VAULT_ROOT` 必须与数据库一样持久化，并由 API/worker 共享；备份和恢复时
+保持两者一致。知乎/YouTube/SAU 和浏览器的磁盘 profile 还需用专用系统用户、`0700/0600` 权限和
+受控备份单独保护。当前 v1 素材导入要求 POSIX `dir_fd`、`O_NOFOLLOW` 和安全 link/unlink 原语；
+缺少这些能力的平台会 fail closed，不能降级成路径字符串检查。Windows 可运行其他控制面功能，
+但在提供等价安全实现前不能承载带素材的 v1 exact 工作流。
+
+v1 exact 计划当前只接受显式启用、且已绑定 `whoami.id` 稳定公开身份的知乎 CLI（`0.2.4`）
+渲染器。计划/审批包绑定 Publisher kind、renderer identity、contract/adapter version、目标平台
+账号身份、无宿主路径的 payload projection 与摘要；worker 只能调用该 Publisher，执行写入前会
+再次读取并比对账号身份与 payload，不允许 fallback。知乎投影依赖精确锁定的
+`markdown==3.10.3`。YouTube CLI（`v1.25.5`）因缺少可审计的只读频道身份探针，仅保留 legacy
+canary，不进入 v1 exact。其他平台、未启用的 CLI、不支持的内容形状或版本/身份/payload 漂移均
+fail closed；部署时不要把浏览器/SAU fallback 当成 v1 保底路径。这是执行一致性契约，不是 Stable
+平台证据。
+
+人工审批工作站先运行 `get-approval`，再按审阅包里的 `asset_id` 使用
+`download-approval-asset --output <new-file>` 取回精确字节。客户端拒绝覆盖已有文件，并校验响应的
+长度和 SHA-256 后原子落盘。POSIX 上输出目录必须已存在、归当前用户所有，且不得对 group/world
+可写；输出文件必须是新路径。服务端在已验证 SHA-256 的同一文件句柄上直接流式返回，不重新打开
+vault 路径，并且拒绝 `Range` 请求（HTTP 416）。反向代理必须允许该只读响应流式传输、不自行开启分段/
+缓存转码，遵守应用返回的 `no-store`，且
+不得记录 Bearer token、下载内容或宿主 vault 路径；下载上限和超时应与部署容量策略一致。
 
 ## 源码部署
 
@@ -183,7 +222,7 @@ curl -fsS -H "X-API-Key: <redacted>" http://127.0.0.1:8000/topics
 
 ## 升级
 
-1. 记录当前 commit/镜像 digest，备份数据库和 `FERNET_KEY`。
+1. 记录当前 commit/镜像 digest，备份数据库、Agent asset vault 和 `FERNET_KEY`。
 2. 停止 worker，避免升级期间开始新的外部副作用。
 3. 审查待应用 Alembic migration，在备份/预发数据上验证。
 4. 安装新代码或拉取已验证镜像，执行一次 `ai-ops init-db`。

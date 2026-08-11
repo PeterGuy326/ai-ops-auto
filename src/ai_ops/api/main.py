@@ -2,6 +2,7 @@
 
 设计原则：路由只做转译 + 调 service 层，不写业务逻辑。
 """
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -47,6 +48,7 @@ from ..core.schemas import (
     TopicUpdate,
 )
 from ..scheduler.worker import execute_job
+from .agent_v1 import router as agent_v1_router
 
 
 @asynccontextmanager
@@ -57,7 +59,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         # observability 自身炸了不能阻塞主启动；裸 print 兜底（此时日志可能未就绪）
         import sys
-        print(f'[startup] observability init failed (swallowed): {e}', file=sys.stderr)
+
+        print(f"[startup] observability init failed (swallowed): {e}", file=sys.stderr)
 
     # === DEPLOY-CHECK · 启动期非阻塞自检 ===
     # 底层逻辑：生产环境最常见的"启动起来但配错了"——FERNET_KEY/API_KEY 没设——
@@ -66,6 +69,7 @@ async def lifespan(app: FastAPI):
     try:
         from ..config import settings as _deploy_settings
         from ..observability import get_logger as _deploy_get_logger
+
         _deploy_logger = _deploy_get_logger("ai_ops.deploy_check")
         if not (_deploy_settings.fernet_key or "").strip():
             _deploy_logger.error(
@@ -74,10 +78,16 @@ async def lifespan(app: FastAPI):
                 "python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'"
             )
         if not (_deploy_settings.api_key or "").strip():
-            _deploy_logger.warning(
-                "[DEPLOY-CHECK] API_KEY 未设置 —— 当前为 dev 自动放行模式，"
-                "生产环境必须设非空值（X-API-Key 鉴权），否则任何人可写数据。"
-            )
+            if _deploy_settings.legacy_dev_auth_bypass:
+                _deploy_logger.warning(
+                    "[DEPLOY-CHECK] API_KEY 未设置且显式启用了 loopback dev bypass；"
+                    "legacy 受保护路由当前允许本机匿名访问。"
+                )
+            else:
+                _deploy_logger.warning(
+                    "[DEPLOY-CHECK] API_KEY 未设置；legacy 受保护路由默认 fail closed。"
+                    "如需管理 API/UI，请配置强随机 API_KEY。"
+                )
         if not (_deploy_settings.feishu_webhook_url or "").strip():
             _deploy_logger.warning(
                 "[DEPLOY-CHECK] FEISHU_WEBHOOK_URL 未设置 —— 失败/风控告警不会通知，"
@@ -86,6 +96,7 @@ async def lifespan(app: FastAPI):
     except Exception as _deploy_err:
         # 自检自己炸了绝不能阻塞启动 —— 裸 print 兜底
         import sys as _sys
+
         print(f"[DEPLOY-CHECK] self-check failed (swallowed): {_deploy_err}", file=_sys.stderr)
 
     # === SCHEMA-CHECK · 启动硬闸门 ===
@@ -122,6 +133,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ai-ops-auto", version="0.1.0", lifespan=lifespan)
+app.include_router(agent_v1_router)
 
 
 class StripApiPrefixMiddleware(BaseHTTPMiddleware):
@@ -130,6 +142,7 @@ class StripApiPrefixMiddleware(BaseHTTPMiddleware):
     意义：前端不论 dev（vite proxy）还是 prod（StaticFiles serve），
     fetch /api/topics 都能命中现有的 @app.get("/topics") 路由。
     """
+
     async def dispatch(self, request, call_next):
         path = request.scope.get("path", "")
         if path.startswith("/api/"):
@@ -163,6 +176,7 @@ def get_session() -> Session:
 
 # ---------------- Topics ----------------
 
+
 @app.post("/topics", response_model=TopicOut, dependencies=[Depends(require_api_key)])
 def api_create_topic(data: TopicIn, s: Session = Depends(get_session)):
     return content_mgr.create_topic(s, data)
@@ -188,6 +202,7 @@ def api_update_topic(topic_id: int, data: TopicUpdate, s: Session = Depends(get_
 
 # ---------------- Articles ----------------
 
+
 @app.get("/articles", response_model=list[ArticleOut], dependencies=[Depends(require_api_key)])
 def api_list_articles(
     limit: int = 100,
@@ -202,7 +217,11 @@ def api_create_article(data: ArticleIn, s: Session = Depends(get_session)):
     return content_mgr.create_article(s, data)
 
 
-@app.post("/articles/{article_id}/transition", response_model=ArticleOut, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/articles/{article_id}/transition",
+    response_model=ArticleOut,
+    dependencies=[Depends(require_api_key)],
+)
 def api_transition_article(
     article_id: int,
     target: ArticleStatus,
@@ -216,18 +235,30 @@ def api_transition_article(
 
 # ---------------- 素材分发中台（审核 → 按账号分发 → 留痕）----------------
 
+
 def _job_out(j: PublishJob) -> JobOut:
     return JobOut(
-        id=j.id, article_id=j.article_id,
+        id=j.id,
+        article_id=j.article_id,
         topic_id=j.article.topic_id if j.article is not None else None,
-        account_id=j.account_id, platform=j.platform,
-        status=j.status, attempts=j.attempts, platform_post_id=j.platform_post_id,
-        platform_url=j.platform_url, error=j.error, scheduled_at=j.scheduled_at,
-        started_at=j.started_at, finished_at=j.finished_at,
+        account_id=j.account_id,
+        platform=j.platform,
+        status=j.status,
+        attempts=j.attempts,
+        platform_post_id=j.platform_post_id,
+        platform_url=j.platform_url,
+        error=j.error,
+        scheduled_at=j.scheduled_at,
+        started_at=j.started_at,
+        finished_at=j.finished_at,
     )
 
 
-@app.post("/articles/{article_id}/approve", response_model=ArticleOut, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/articles/{article_id}/approve",
+    response_model=ArticleOut,
+    dependencies=[Depends(require_api_key)],
+)
 def api_approve_article(article_id: int, s: Session = Depends(get_session)):
     """人工审核通过：DRAFT(待审) → READY(可分发)。"""
     from ..content import distributor
@@ -239,7 +270,11 @@ def api_approve_article(article_id: int, s: Session = Depends(get_session)):
     return content_mgr._to_article_out(art)
 
 
-@app.post("/articles/{article_id}/distribute", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
+@app.post(
+    "/articles/{article_id}/distribute",
+    response_model=list[JobOut],
+    dependencies=[Depends(require_api_key)],
+)
 def api_distribute_article(
     article_id: int,
     account_ids: Optional[list[int]] = None,
@@ -259,11 +294,16 @@ def api_distribute_article(
         raise HTTPException(400, str(e))
     # 分发→真发布接线：排期自动执行（jitter/风控/夜间保护复用）
     from ..scheduler.worker import schedule_job_runs
+
     schedule_job_runs(jobs)
     return [_job_out(j) for j in jobs]
 
 
-@app.get("/accounts/{account_id}/jobs", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
+@app.get(
+    "/accounts/{account_id}/jobs",
+    response_model=list[JobOut],
+    dependencies=[Depends(require_api_key)],
+)
 def api_account_jobs(account_id: int, limit: int = 100, s: Session = Depends(get_session)):
     """按个人账号查全部分发记录（含历史回填，留痕）。"""
     from ..content import distributor
@@ -271,7 +311,11 @@ def api_account_jobs(account_id: int, limit: int = 100, s: Session = Depends(get
     return [_job_out(j) for j in distributor.list_account_jobs(s, account_id, limit=limit)]
 
 
-@app.post("/accounts/{account_id}/import-published", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
+@app.post(
+    "/accounts/{account_id}/import-published",
+    response_model=list[JobOut],
+    dependencies=[Depends(require_api_key)],
+)
 def api_import_published(
     account_id: int,
     posts: list[dict],
@@ -293,6 +337,7 @@ def api_import_published(
 
 # ---------------- Accounts ----------------
 
+
 @app.post("/accounts", response_model=AccountOut, dependencies=[Depends(require_api_key)])
 def api_create_account(data: AccountIn, s: Session = Depends(get_session)):
     return account_mgr.create_account(s, data)
@@ -307,17 +352,25 @@ def api_list_accounts(
     return account_mgr.list_accounts(s, platform=platform, by_topic=topic_id)
 
 
-@app.patch("/accounts/{account_id}", response_model=AccountOut, dependencies=[Depends(require_api_key)])
+@app.patch(
+    "/accounts/{account_id}", response_model=AccountOut, dependencies=[Depends(require_api_key)]
+)
 def api_update_account(account_id: int, data: AccountUpdate, s: Session = Depends(get_session)):
+    if s.get(Account, account_id) is None:
+        raise HTTPException(404, f"account {account_id} not found")
     try:
         return account_mgr.update_account(s, account_id, data)
     except ValueError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(400, str(e)) from None
 
 
 @app.delete("/accounts/{account_id}", dependencies=[Depends(require_api_key)])
 def api_delete_account(account_id: int, s: Session = Depends(get_session)):
-    if not account_mgr.delete_account(s, account_id):
+    try:
+        deleted = account_mgr.delete_account(s, account_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    if not deleted:
         raise HTTPException(404, f"account {account_id} 不存在")
     return {"ok": True, "deleted": account_id}
 
@@ -373,6 +426,7 @@ async def api_login_account(account_id: int):
     if ok and cred:
         with session_scope() as s:
             from ..accounts.store import get_store
+
             a = s.get(Account, account_id)
             if a is not None:
                 a.encrypted_credential = get_store().encrypt(cred)
@@ -389,23 +443,33 @@ def api_dispatch_preview(account_id: int, count: int = 1, s: Session = Depends(g
     更稳的是 /platforms/{platform}/dispatch?count=...，留 follow-up。
     """
     from ..accounts.dispatcher import pick_accounts
+
     a = s.get(Account, account_id)
     if a is None:
         raise HTTPException(404)
     cands = pick_accounts(s, Platform(a.platform), count=count)
-    return [{"account_id": c.account_id, "nickname": c.nickname, "weight": c.weight,
-             "health": c.health, "last_publish_at": c.last_publish_at} for c in cands]
+    return [
+        {
+            "account_id": c.account_id,
+            "nickname": c.nickname,
+            "weight": c.weight,
+            "health": c.health,
+            "last_publish_at": c.last_publish_at,
+        }
+        for c in cands
+    ]
 
 
 # ---------------- Jobs ----------------
+
 
 @app.get("/jobs", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
 def api_list_jobs(limit: int = 100, s: Session = Depends(get_session)):
     return [
         _job_out(j)
-        for j in s.execute(
-            select(PublishJob).order_by(PublishJob.id.desc()).limit(limit)
-        ).scalars().all()
+        for j in s.execute(select(PublishJob).order_by(PublishJob.id.desc()).limit(limit))
+        .scalars()
+        .all()
     ]
 
 
@@ -457,6 +521,7 @@ async def api_collect_metrics(job_id: int):
     避免运营手动复采污染健康度评估节点。
     """
     from ..scheduler.metrics import collect_one
+
     return await collect_one(job_id, source="manual")
 
 
@@ -464,6 +529,7 @@ async def api_collect_metrics(job_id: int):
 def api_heat_rank(limit: int = 10, s: Session = Depends(get_session)):
     """按 heat_score 倒排取热门主题（数据回流飞轮的反馈输入）。"""
     from ..content.heat_engine import top_topics
+
     return [
         {"id": t.id, "name": t.name, "heat_score": t.heat_score, "keywords": t.keywords}
         for t in top_topics(s, limit=limit)
@@ -477,23 +543,28 @@ def health():
 
 # ============== Web UI ==============
 
+
 @app.get("/ui/login", response_class=HTMLResponse)
 def ui_login_page(request: Request):
     """UI 登录页。已有有效会话或 dev 模式直接进入控制台。"""
-    if api_key_dev_mode() or validate_ui_session_cookie(
+    if api_key_dev_mode(request) or validate_ui_session_cookie(
         request.cookies.get(UI_SESSION_COOKIE)
     ):
         return RedirectResponse("/ui", status_code=303)
-    return _templates.TemplateResponse(request, "login.html", {
-        "request": request,
-        "error": "",
-    })
+    return _templates.TemplateResponse(
+        request,
+        "login.html",
+        {
+            "request": request,
+            "error": "",
+        },
+    )
 
 
 @app.post("/ui/login", response_class=HTMLResponse)
 def ui_login(request: Request, api_key: str = Form(default="")):
     """验证 API key 后签发短期 UI session；响应和 cookie 均不回显 key。"""
-    if api_key_dev_mode():
+    if api_key_dev_mode(request):
         return RedirectResponse("/ui", status_code=303)
     if not api_keys_match(api_key):
         return _templates.TemplateResponse(
@@ -515,6 +586,7 @@ def ui_logout(request: Request, csrf_token: str = Form(default="")):
     clear_ui_session_cookie(response)
     return response
 
+
 @app.get("/ui", response_class=HTMLResponse)
 def ui_dashboard(request: Request, s: Session = Depends(get_session)):
     from ..content.heat_engine import top_topics
@@ -527,50 +599,85 @@ def ui_dashboard(request: Request, s: Session = Depends(get_session)):
         "articles": s.scalar(select(func.count(Article.id))) or 0,
         "accounts": s.scalar(select(func.count(Account.id))) or 0,
         "jobs": s.scalar(select(func.count(PublishJob.id))) or 0,
-        "published": s.scalar(select(func.count(Article.id)).where(Article.status == ArticleStatus.PUBLISHED)) or 0,
-        "failed": s.scalar(select(func.count(PublishJob.id)).where(PublishJob.status == JobStatus.DEAD)) or 0,
+        "published": s.scalar(
+            select(func.count(Article.id)).where(Article.status == ArticleStatus.PUBLISHED)
+        )
+        or 0,
+        "failed": s.scalar(
+            select(func.count(PublishJob.id)).where(PublishJob.status == JobStatus.DEAD)
+        )
+        or 0,
         # 运营看板关键指标
-        "pending_review": s.scalar(select(func.count(Article.id)).where(Article.status == ArticleStatus.DRAFT)) or 0,
-        "ready": s.scalar(select(func.count(Article.id)).where(Article.status == ArticleStatus.READY)) or 0,
-        "today_jobs": s.scalar(select(func.count(PublishJob.id)).where(PublishJob.created_at >= today_start)) or 0,
+        "pending_review": s.scalar(
+            select(func.count(Article.id)).where(Article.status == ArticleStatus.DRAFT)
+        )
+        or 0,
+        "ready": s.scalar(
+            select(func.count(Article.id)).where(Article.status == ArticleStatus.READY)
+        )
+        or 0,
+        "today_jobs": s.scalar(
+            select(func.count(PublishJob.id)).where(PublishJob.created_at >= today_start)
+        )
+        or 0,
         "today_success": s.scalar(
             select(func.count(PublishJob.id)).where(
                 PublishJob.created_at >= today_start, PublishJob.status == JobStatus.SUCCESS
             )
-        ) or 0,
+        )
+        or 0,
     }
     # 各平台账号健康（platform → {health: n}）
     health_rows = s.execute(
-        select(Account.platform, Account.health, func.count(Account.id)).group_by(Account.platform, Account.health)
+        select(Account.platform, Account.health, func.count(Account.id)).group_by(
+            Account.platform, Account.health
+        )
     ).all()
     platform_health: dict = {}
     for plat, health, n in health_rows:
         platform_health.setdefault(plat, {})[health] = n
 
-    recent_jobs = s.execute(
-        select(PublishJob).order_by(PublishJob.created_at.desc()).limit(10)
-    ).scalars().all()
-    return _templates.TemplateResponse(request, "dashboard.html", {
-        "request": request,
-        "counts": counts,
-        "platform_health": platform_health,
-        "hot_topics": top_topics(s, limit=5),
-        "recent_jobs": recent_jobs,
-    })
+    recent_jobs = (
+        s.execute(select(PublishJob).order_by(PublishJob.created_at.desc()).limit(10))
+        .scalars()
+        .all()
+    )
+    return _templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {
+            "request": request,
+            "counts": counts,
+            "platform_health": platform_health,
+            "hot_topics": top_topics(s, limit=5),
+            "recent_jobs": recent_jobs,
+        },
+    )
 
 
 @app.get("/ui/topics", response_class=HTMLResponse)
 def ui_topics(request: Request, s: Session = Depends(get_session)):
     rows = [
-        {"id": t.id, "name": t.name, "keywords": ", ".join(t.keywords or []),
-         "heat_score": round(t.heat_score, 3), "created_at": t.created_at}
+        {
+            "id": t.id,
+            "name": t.name,
+            "keywords": ", ".join(t.keywords or []),
+            "heat_score": round(t.heat_score, 3),
+            "created_at": t.created_at,
+        }
         for t in s.execute(select(Topic).order_by(Topic.id.desc())).scalars().all()
     ]
-    return _templates.TemplateResponse(request, "list.html", {
-        "request": request, "title": "主题",
-        "columns": ["id", "name", "keywords", "heat_score", "created_at"],
-        "rows": rows, "empty_hint": "POST /topics 创建第一个主题",
-    })
+    return _templates.TemplateResponse(
+        request,
+        "list.html",
+        {
+            "request": request,
+            "title": "主题",
+            "columns": ["id", "name", "keywords", "heat_score", "created_at"],
+            "rows": rows,
+            "empty_hint": "POST /topics 创建第一个主题",
+        },
+    )
 
 
 @app.get("/ui/articles", response_class=HTMLResponse)
@@ -587,9 +694,15 @@ def ui_articles(
     if content_type:
         q = q.where(Article.content_type == content_type)
     rows = [
-        {"id": a.id, "topic_id": a.topic_id, "title": a.title,
-         "content_type": a.content_type, "status": a.status,
-         "scheduled_at": a.scheduled_at, "created_at": a.created_at}
+        {
+            "id": a.id,
+            "topic_id": a.topic_id,
+            "title": a.title,
+            "content_type": a.content_type,
+            "status": a.status,
+            "scheduled_at": a.scheduled_at,
+            "created_at": a.created_at,
+        }
         for a in s.execute(q).scalars().all()
     ]
 
@@ -616,17 +729,35 @@ def ui_articles(
         _chip("🖼 图文", "content_type", ContentType.IMAGE_TEXT.value),
         _chip("🎙 音频/播客", "content_type", ContentType.AUDIO.value),
     ]
-    return _templates.TemplateResponse(request, "list.html", {
-        "request": request, "title": "素材库",
-        "columns": ["id", "topic_id", "title", "content_type", "status", "scheduled_at", "created_at"],
-        "rows": rows, "empty_hint": "POST /articles 创建，或生成/回填后自动入库",
-        "link_col": "title", "link_id_col": "id", "link_prefix": "/ui/articles/",
-        "filters": filters,
-    })
+    return _templates.TemplateResponse(
+        request,
+        "list.html",
+        {
+            "request": request,
+            "title": "素材库",
+            "columns": [
+                "id",
+                "topic_id",
+                "title",
+                "content_type",
+                "status",
+                "scheduled_at",
+                "created_at",
+            ],
+            "rows": rows,
+            "empty_hint": "POST /articles 创建，或生成/回填后自动入库",
+            "link_col": "title",
+            "link_id_col": "id",
+            "link_prefix": "/ui/articles/",
+            "filters": filters,
+        },
+    )
 
 
 @app.get("/ui/articles/{article_id}", response_class=HTMLResponse)
-def ui_article_detail(article_id: int, request: Request, message: str = "", s: Session = Depends(get_session)):
+def ui_article_detail(
+    article_id: int, request: Request, message: str = "", s: Session = Depends(get_session)
+):
     """素材详情 + 审核/分发操作页（先审后发）。"""
     art = s.get(Article, article_id)
     if art is None:
@@ -636,19 +767,45 @@ def ui_article_detail(article_id: int, request: Request, message: str = "", s: S
     plats = [Platform(p) for p in (art.target_platforms or [])]
     candidate_accounts = []
     if plats:
-        candidate_accounts = s.execute(
-            select(Account).where(Account.platform.in_([p.value for p in plats]))
-        ).scalars().all()
+        candidate_accounts = (
+            s.execute(select(Account).where(Account.platform.in_([p.value for p in plats])))
+            .scalars()
+            .all()
+        )
     jobs = [
-        {"id": j.id, "account": (s.get(Account, j.account_id).nickname if s.get(Account, j.account_id) else j.account_id),
-         "platform": j.platform, "status": j.status, "platform_url": j.platform_url,
-         "finished_at": j.finished_at, "created_at": j.created_at}
-        for j in s.execute(select(PublishJob).where(PublishJob.article_id == article_id).order_by(PublishJob.id.desc())).scalars().all()
+        {
+            "id": j.id,
+            "account": (
+                s.get(Account, j.account_id).nickname
+                if s.get(Account, j.account_id)
+                else j.account_id
+            ),
+            "platform": j.platform,
+            "status": j.status,
+            "platform_url": j.platform_url,
+            "finished_at": j.finished_at,
+            "created_at": j.created_at,
+        }
+        for j in s.execute(
+            select(PublishJob)
+            .where(PublishJob.article_id == article_id)
+            .order_by(PublishJob.id.desc())
+        )
+        .scalars()
+        .all()
     ]
-    return _templates.TemplateResponse(request, "article_detail.html", {
-        "request": request, "article": art, "assets": assets,
-        "candidate_accounts": candidate_accounts, "jobs": jobs, "message": message,
-    })
+    return _templates.TemplateResponse(
+        request,
+        "article_detail.html",
+        {
+            "request": request,
+            "article": art,
+            "assets": assets,
+            "candidate_accounts": candidate_accounts,
+            "jobs": jobs,
+            "message": message,
+        },
+    )
 
 
 @app.post("/ui/articles/{article_id}/approve")
@@ -685,6 +842,7 @@ def ui_article_distribute(
     try:
         jobs = distributor.distribute(s, article_id, account_ids=account_ids or None)
         from ..scheduler.worker import schedule_job_runs
+
         scheduled = schedule_job_runs(jobs)
         if scheduled:
             msg = f"已分发到 {len(jobs)} 个账号（已写入持久排期）"
@@ -698,17 +856,39 @@ def ui_article_distribute(
 @app.get("/ui/accounts", response_class=HTMLResponse)
 def ui_accounts(request: Request, s: Session = Depends(get_session)):
     rows = [
-        {"id": a.id, "platform": a.platform, "nickname": a.nickname,
-         "health": a.health, "daily_quota": a.daily_quota,
-         "last_publish_at": a.last_publish_at, "created_at": a.created_at}
+        {
+            "id": a.id,
+            "platform": a.platform,
+            "nickname": a.nickname,
+            "health": a.health,
+            "daily_quota": a.daily_quota,
+            "last_publish_at": a.last_publish_at,
+            "created_at": a.created_at,
+        }
         for a in s.execute(select(Account).order_by(Account.id.desc())).scalars().all()
     ]
-    return _templates.TemplateResponse(request, "list.html", {
-        "request": request, "title": "账号",
-        "columns": ["id", "platform", "nickname", "health", "daily_quota", "last_publish_at", "created_at"],
-        "rows": rows, "empty_hint": "POST /accounts 添加账号",
-        "link_col": "nickname", "link_id_col": "id", "link_prefix": "/ui/accounts/",
-    })
+    return _templates.TemplateResponse(
+        request,
+        "list.html",
+        {
+            "request": request,
+            "title": "账号",
+            "columns": [
+                "id",
+                "platform",
+                "nickname",
+                "health",
+                "daily_quota",
+                "last_publish_at",
+                "created_at",
+            ],
+            "rows": rows,
+            "empty_hint": "POST /accounts 添加账号",
+            "link_col": "nickname",
+            "link_id_col": "id",
+            "link_prefix": "/ui/accounts/",
+        },
+    )
 
 
 @app.get("/ui/accounts/{account_id}", response_class=HTMLResponse)
@@ -727,30 +907,65 @@ def ui_account_detail(account_id: int, request: Request, s: Session = Depends(ge
         is_backfill = bool((art.extra or {}).get("backfill")) if art else False
         if is_backfill:
             backfill_count += 1
-        rows.append({
-            "id": j.id, "article_id": j.article_id,
-            "title": art.title if art else "-",
-            "content_type": art.content_type if art else "-",
-            "status": j.status, "backfill": is_backfill,
-            "platform_url": j.platform_url,
-            "finished_at": j.finished_at, "created_at": j.created_at,
-        })
-    return _templates.TemplateResponse(request, "account_detail.html", {
-        "request": request, "account": acc, "rows": rows, "backfill_count": backfill_count,
-    })
+        rows.append(
+            {
+                "id": j.id,
+                "article_id": j.article_id,
+                "title": art.title if art else "-",
+                "content_type": art.content_type if art else "-",
+                "status": j.status,
+                "backfill": is_backfill,
+                "platform_url": j.platform_url,
+                "finished_at": j.finished_at,
+                "created_at": j.created_at,
+            }
+        )
+    return _templates.TemplateResponse(
+        request,
+        "account_detail.html",
+        {
+            "request": request,
+            "account": acc,
+            "rows": rows,
+            "backfill_count": backfill_count,
+        },
+    )
 
 
 @app.get("/ui/jobs", response_class=HTMLResponse)
 def ui_jobs(request: Request, s: Session = Depends(get_session)):
     rows = [
-        {"id": j.id, "article_id": j.article_id, "account_id": j.account_id,
-         "platform": j.platform, "status": j.status,
-         "attempts": f"{j.attempts}/{j.max_attempts}",
-         "started_at": j.started_at, "platform_url": j.platform_url or "-"}
-        for j in s.execute(select(PublishJob).order_by(PublishJob.id.desc()).limit(50)).scalars().all()
+        {
+            "id": j.id,
+            "article_id": j.article_id,
+            "account_id": j.account_id,
+            "platform": j.platform,
+            "status": j.status,
+            "attempts": f"{j.attempts}/{j.max_attempts}",
+            "started_at": j.started_at,
+            "platform_url": j.platform_url or "-",
+        }
+        for j in s.execute(select(PublishJob).order_by(PublishJob.id.desc()).limit(50))
+        .scalars()
+        .all()
     ]
-    return _templates.TemplateResponse(request, "list.html", {
-        "request": request, "title": "任务",
-        "columns": ["id", "article_id", "account_id", "platform", "status", "attempts", "started_at", "platform_url"],
-        "rows": rows, "empty_hint": "POST /jobs/{id}/run 触发任务",
-    })
+    return _templates.TemplateResponse(
+        request,
+        "list.html",
+        {
+            "request": request,
+            "title": "任务",
+            "columns": [
+                "id",
+                "article_id",
+                "account_id",
+                "platform",
+                "status",
+                "attempts",
+                "started_at",
+                "platform_url",
+            ],
+            "rows": rows,
+            "empty_hint": "POST /jobs/{id}/run 触发任务",
+        },
+    )

@@ -52,10 +52,12 @@
     若有可验证 post identity，再排程后续数据采集
 ```
 
-> **当前安全语义**：审核是控制面状态流，不是强制 human gate；审批、分发和执行端点共用一个
-> 管理 `API_KEY`，项目自身不能证明审批者是人。`AUTO_PUBLISH_ENABLED=false` 只关掉后台扫描，
-> 持有管理 key 的调用方仍可显式执行 `/jobs/{id}/run`。grep 只是辅助检查；要强制人工授权，
-> 需在外部网关/工作流隔离 Agent 与管理 key。“失败立刻重发覆盖”可能造成重复公开内容。
+> **当前安全语义**：本节描述的 legacy Article 流程仍共用管理 `API_KEY`，其审核状态不能证明
+> 独立人工参与；持有该 key 的调用方也能显式执行 `/jobs/{id}/run`。Agent 编排应改用
+> [Agent contract v1](agent-contract.md)：它要求独立 human principal、绑定精确内容/目标/排期摘要，
+> 并禁止请求者自签。部署者仍须在外部托管 human token，才能让该身份真正代表人。
+> `AUTO_PUBLISH_ENABLED=false` 只关闭后台扫描；grep 只是辅助检查。“失败立刻重发覆盖”可能造成
+> 重复公开内容，v1 exact job 因此禁止走 legacy republish，必须重新计划和审批。
 
 ## 三、外部依赖装机 + Publisher 调用契约
 
@@ -193,7 +195,10 @@ src/ai_ops/
 
 - 注册：`ZHIHU_CLI_ENABLED=true` 时 CLI priority=5；Playwright priority=10
 - CLI 登录：`ai-ops zhihu-login <account_id>`，每个账号使用独立 HOME；这是 CLI 路径唯一会
-  显示二维码的入口，禁止 cookie argv。登录态留在该 HOME 的磁盘文件中，不进入 Fernet 数据库密文。
+  显示二维码的入口，禁止 cookie argv。登录流程与 worker 使用同一个账号操作锁。登录态留在该
+  HOME 的磁盘文件中，不进入 Fernet 数据库密文。在线验证后命令输出
+  `zhihu:id:<whoami.id>`；operator 必须向 `PATCH /accounts/<account_id>` 提交
+  `{"external_account_id":"zhihu:id:<whoami.id>"}`，服务会将其写入 Account.profile；登录命令不会自动修改数据库。
 - API 登录：启用 CLI canary 时，`POST /accounts/{id}/login` 只验证上述 HOME 是否已经登录；
   未登录会提示执行终端命令，不弹二维码，也不会自动改走 Playwright 登录。
 - 浏览器 fallback 凭证：`{"cookies": [{"name": "z_c0", ...}, ...]}`，作为 DB credential blob
@@ -202,6 +207,8 @@ src/ai_ops/
 
 ### CLI 0.2.4 canary 边界
 
+- Agent exact 计划会把上述公开稳定账号身份纳入 target、审批展示和 `plan_digest`；worker 只在
+  当前 `whoami.id` 与批准身份一致时启动 article 写进程。身份缺失、非法或漂移都属于写前失败。
 - 仅接 `article`；视频/音频拒绝，topic 只读 `extra.zhihu_topic_ids` 的数字 ID。
 - 只允许受控 `ZHIHU_CLI_ASSET_ROOT` 内、非 symlink、经验证的 JPEG；正文设 60 KB 上限。
 - 上游没有 write `--json`、stdin/`--content-file`、`--config-dir` 或 idempotency key。
@@ -243,6 +250,8 @@ src/ai_ops/
 
 > **当前决策**：已接入 `youtubeuploader v1.25.5`，但默认关闭且未真发。
 > 只有专用频道 private canary 和平台端可见验证都通过后才可以扩大。
+> 当前 OAuth profile 没有经审计的只读 channel identity 探针，因此仅保留 legacy canary，
+> Agent v1 exact renderer 暂停。
 
 - 注册：`YOUTUBE_UPLOADER_ENABLED=true` 时 CLI priority=5；SAU priority=10。
 - 凭证：`YOUTUBE_UPLOADER_PROFILE_ROOT/account_<id>/` 目录权限 `0700`，

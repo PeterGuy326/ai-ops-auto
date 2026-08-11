@@ -165,8 +165,8 @@ bash scripts/verify.sh
 
 1. 阅读 [平台能力矩阵](platform-capabilities.md)，不要把 Experimental/Stub 当作可用承诺。
 2. 使用专用测试账号，完成平台条款、隐私与内容合规检查。
-3. 配置非空 `API_KEY`，不向公网直接暴露 Uvicorn。当前它是全权限管理 key，不能区分 Agent 与人；
-   强制人工审批需由外部网关/工作流隔离权限。
+3. 为 legacy 管理端点配置非空 `API_KEY`，不向公网直接暴露 Uvicorn；它是全权限 key，不能交给
+   Agent。Agent 使用 v1 独立 Bearer scopes，human approver token 由外部网关/审批工作流隔离保管。
 4. 一次只启用一个账号和一个平台，先由人核对；需要后台扫描时再显式设置
    `AUTO_PUBLISH_ENABLED=true`。显式 `/jobs/{id}/run` 不受该开关保护。
 5. 记录适配器版本、上游 commit、操作系统、内容类型、时间和平台返回值。

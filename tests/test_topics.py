@@ -180,6 +180,34 @@ def test_update_account_topic_rebind(session):
     assert cleared.topic_id is None
 
 
+def test_update_zhihu_external_account_identity_is_explicit_and_canonical(session):
+    account = account_mgr.create_account(
+        session,
+        AccountIn(platform=Platform.ZHIHU, nickname="exact-zhihu"),
+    )
+
+    updated = account_mgr.update_account(
+        session,
+        account.id,
+        AccountUpdate(external_account_id="zhihu:id:stable-person-id"),
+    )
+    assert updated.profile["external_account_id"] == "zhihu:id:stable-person-id"
+
+    with pytest.raises(ValueError, match="zhihu:id"):
+        account_mgr.update_account(
+            session,
+            account.id,
+            AccountUpdate(external_account_id="mutable-url-token"),
+        )
+
+    cleared = account_mgr.update_account(
+        session,
+        account.id,
+        AccountUpdate(external_account_id=""),
+    )
+    assert "external_account_id" not in cleared.profile
+
+
 def test_topic_stats(session):
     t1 = content_mgr.create_topic(session, TopicIn(name="dws", category="tech"))
     content_mgr.create_topic(session, TopicIn(name="软考", category="exam"))

@@ -9,7 +9,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..core.enums import AccountHealth, JobStatus
+from ..core.enums import AccountHealth, JobStatus, Platform
+from ..core.external_identity import normalize_zhihu_external_account_id
 from ..core.models import Account, PublishJob, Topic
 from ..core.schemas import AccountIn, AccountOut
 from .store import get_store
@@ -104,6 +105,20 @@ def update_account(session: Session, account_id: int, data) -> AccountOut:
             profile.pop("proxy", None)
         else:
             profile["proxy"] = data.proxy
+    if data.external_account_id is not None:
+        if data.external_account_id == "":
+            profile.pop("external_account_id", None)
+        elif Platform(a.platform) == Platform.ZHIHU:
+            try:
+                profile["external_account_id"] = normalize_zhihu_external_account_id(
+                    data.external_account_id
+                )
+            except ValueError:
+                raise ValueError(
+                    "知乎 external_account_id 必须使用 zhihu:id:<whoami.id>"
+                ) from None
+        else:
+            raise ValueError("当前平台尚未定义 external_account_id 更新契约")
     a.profile = profile
 
     session.flush()
@@ -114,6 +129,8 @@ def delete_account(session: Session, account_id: int) -> bool:
     a = session.get(Account, account_id)
     if a is None:
         return False
+    if session.query(PublishJob.id).filter(PublishJob.account_id == account_id).first():
+        raise ValueError("账号已有发布记录，不能删除；请停用或归档账号")
     session.delete(a)
     return True
 

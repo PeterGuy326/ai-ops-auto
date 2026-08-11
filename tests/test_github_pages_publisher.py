@@ -50,6 +50,7 @@ def blog_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "github_pages_posts_dir", "source/_posts")
     monkeypatch.setattr(settings, "github_pages_images_dir", "source/img")
     monkeypatch.setattr(settings, "github_pages_asset_root", assets)
+    monkeypatch.setattr(settings, "agent_asset_vault_root", assets)
     monkeypatch.setattr(settings, "github_pages_max_image_bytes", 1024 * 1024)
     monkeypatch.setattr(settings, "github_pages_max_total_image_bytes", 2 * 1024 * 1024)
     monkeypatch.setattr(settings, "github_pages_build_tool", "pnpm")
@@ -153,6 +154,7 @@ def real_blog_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "github_pages_posts_dir", "source/_posts")
     monkeypatch.setattr(settings, "github_pages_images_dir", "source/img")
     monkeypatch.setattr(settings, "github_pages_asset_root", assets)
+    monkeypatch.setattr(settings, "agent_asset_vault_root", assets)
     monkeypatch.setattr(settings, "github_pages_max_image_bytes", 1024 * 1024)
     monkeypatch.setattr(settings, "github_pages_max_total_image_bytes", 2 * 1024 * 1024)
     monkeypatch.setattr(settings, "github_pages_build_tool", "pnpm")
@@ -314,6 +316,25 @@ async def test_rejects_image_outside_controlled_asset_root(blog_repo: Path) -> N
     assert result.success is False
     assert result.effect_applied is False
     assert "受控目录" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_exact_approval_reads_images_from_agent_vault(
+    blog_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = blog_repo.parent / "agent-vault"
+    vault.mkdir()
+    image = vault / f"{'a' * 64}.jpg"
+    _write_image(image)
+    monkeypatch.setattr(settings, "agent_asset_vault_root", vault)
+
+    content = _content(images=[str(image)]).model_copy(update={"exact_approval": True})
+    result = await GitHubPagesPublisher().publish(0, {}, content)
+
+    assert result.success is True
+    assert result.effect_applied is False
+    assert result.raw_response["images_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -533,8 +554,9 @@ async def test_precommit_failures_restore_exact_preflight_state(
     assert not copied_image.exists()
     assert _git(real_blog_repo, "status", "--porcelain=v1", "--untracked-files=all") == ""
     assert _git(real_blog_repo, "rev-parse", "HEAD").strip() == baseline_head
-    assert not any(command[:2] in (["git", "reset"], ["git", "checkout"])
-                   for command in publisher.commands)
+    assert not any(
+        command[:2] in (["git", "reset"], ["git", "checkout"]) for command in publisher.commands
+    )
     if fail_at in {"add", "commit"}:
         restore = next(
             command
@@ -542,7 +564,7 @@ async def test_precommit_failures_restore_exact_preflight_state(
             if command[:3] == ["git", "restore", "--staged"]
         )
         delimiter = restore.index("--")
-        assert set(restore[delimiter + 1:]) == {
+        assert set(restore[delimiter + 1 :]) == {
             "source/_posts/安全发布.md",
             "source/img/安全发布/cover.jpg",
         }
@@ -609,8 +631,9 @@ async def test_rollback_preserves_other_user_change_and_reports_manual_action(
     assert readme.read_text(encoding="utf-8") == "user work must survive\n"
     assert not (real_blog_repo / "source/_posts/安全发布.md").exists()
     assert _git(real_blog_repo, "status", "--porcelain=v1") == " M README.md\n"
-    assert not any(command[:2] in (["git", "reset"], ["git", "checkout"])
-                   for command in publisher.commands)
+    assert not any(
+        command[:2] in (["git", "reset"], ["git", "checkout"]) for command in publisher.commands
+    )
 
 
 @pytest.mark.asyncio
@@ -652,10 +675,10 @@ async def test_rollback_refuses_when_commit_happened_but_sha_read_failed(
     assert _git(real_blog_repo, "rev-parse", "HEAD").strip() != baseline_head
     assert _git(real_blog_repo, "show", f"HEAD:{post_relative}")
     assert (real_blog_repo / post_relative).exists()
-    assert not any(command[:2] in (["git", "reset"], ["git", "checkout"])
-                   for command in publisher.commands)
-    assert not any(command[:3] == ["git", "restore", "--staged"]
-                   for command in publisher.commands)
+    assert not any(
+        command[:2] in (["git", "reset"], ["git", "checkout"]) for command in publisher.commands
+    )
+    assert not any(command[:3] == ["git", "restore", "--staged"] for command in publisher.commands)
 
 
 @pytest.mark.asyncio
@@ -832,9 +855,9 @@ async def test_runner_kills_grandchild_that_outlives_parent_term(
     script = tmp_path / "spawn-grandchild.py"
     script.write_text(
         "import subprocess, sys, time\n"
-        "code = (\"import os, pathlib, signal, sys, time; \"\n"
-        "        \"pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); \"\n"
-        "        \"signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\")\n"
+        'code = ("import os, pathlib, signal, sys, time; "\n'
+        '        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "\n'
+        '        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)")\n'
         "subprocess.Popen([sys.executable, '-c', code, sys.argv[1]])\n"
         "time.sleep(30)\n",
         encoding="utf-8",

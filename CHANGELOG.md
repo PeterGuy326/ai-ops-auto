@@ -56,9 +56,20 @@ once release automation is established.
 - Installed-wheel contract smoke for `doctor --json` and `demo --json`, including JSON parsing and
   assertions that the synthetic final review passed without external calls.
 - Stable top-level `ok` and `exit_code` fields for successful and failed-review offline demo JSON.
+- An Agent contract v1 vertical slice across Python, HTTP, and CLI: independent bearer principals,
+  least-privilege scopes, immutable content/target/timing digests, independent human review with
+  verified asset download, durable jobs, status projection, manual metrics, and performance review.
+- Expiring, fenced idempotency leases for manual Agent metrics collection. Normalized snapshots are
+  uniquely bound to their operation, so cancellation, process loss, response-finalization failure,
+  and overlapping stale owners recover with the same key without duplicate external collection.
 
 ### Changed
 
+- Zhihu exact Agent targets now bind a canonical public `whoami.id` identity through planning,
+  human review, the plan digest, and the final pre-write check. `zhihu-login` reports the value
+  for an explicit operator PATCH and never changes account data automatically.
+- YouTube CLI remains available as a legacy canary, but its Agent exact renderer is paused until
+  an audited read-only probe can bind each OAuth profile to the intended channel.
 - Open-source defaults no longer contain organization-internal endpoints, personal absolute paths,
   personal site URLs, or a fixed notification chat ID.
 - The only advertised scheduler backend is the implemented APScheduler worker; the unimplemented
@@ -93,6 +104,12 @@ once release automation is established.
 
 ### Security
 
+- Agent v1 now bounds raw request bodies before authentication/JSON parsing, bounds every nested DTO
+  and response, keeps the legacy management key separate, and atomically arbitrates exact versus
+  legacy scheduling of the same content.
+- Interactive Zhihu QR login now shares the same per-account operation lease as publication, and
+  exact writes fail before the article subprocess if the current login identity differs from the
+  approved destination.
 - Automatic background publication is disabled by default and requires explicit operator opt-in.
 - Deployment and example configuration now document credential handling and public exposure risks.
 - Server-rendered `/ui` routes are protected by a login session when `API_KEY` is set; state-changing

@@ -40,9 +40,10 @@ Agent / operator
 | Publisher | 单平台登录、发布、结果校验和可选 metrics 翻译 | 跨账号策略和任务排程 |
 | 人 | 不可逆发布的授权、登录与风控处置 | 每次重新编排全部技术细节 |
 
-当前 Alpha 还没有角色身份模型：审批、分发和显式执行端点使用同一个全权限管理 `API_KEY`。
-因此控制面记录的是审核状态迁移，不能证明调用者一定是人。上表的 human gate 是目标边界；现阶段
-必须由反向代理、密钥托管或外部工作流把 Agent 与人工审批权限隔离。
+当前有两套明确分离的身份面：legacy 审批、分发和显式执行端点仍使用全权限管理 `API_KEY`；
+Agent contract v1 使用带最小 scope 的独立 Bearer principal，只有 `type=human` 能读取/决定审批，
+且请求者与计划创建者不能自签。后者能证明不同凭证身份参与，不能单靠软件证明凭证背后一定是真人；
+部署时仍须用 SSO、审批系统、硬件密钥或等价托管边界隔离 human token。
 
 ## 核心数据
 
@@ -54,6 +55,9 @@ Agent / operator
 | `Account` | 平台账号、数据库内加密的 credential blob、健康和配额；外部 profile 文件不在该加密边界内 |
 | `PublishJob` | 一个 Article 向一个 Account 发布的持久化执行记录 |
 | `Metrics` | 关联 PublishJob 的带来源时序快照 |
+
+v1 还持久化 `PublicationPlan`、`ApprovalRequest` 与 `AgentOperation`，分别保存不可变计划/摘要、
+独立审批证据和幂等请求账本；legacy Article 状态流继续兼容已有运营界面。
 
 Article 与 Job 是两层状态：一篇 Article 可以扇出多个 PublishJob，不应用某一个平台的结果
 覆盖其他账号的真相。

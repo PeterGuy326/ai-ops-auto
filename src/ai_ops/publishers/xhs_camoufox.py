@@ -471,7 +471,7 @@ class XhsCamoufoxPublisher(PublisherBase):
         受保护片段（链接/标签/@用户/代码）在 humanize 内部已处理。
         """
         body = content.body or ""
-        if settings.xhs_humanize_enabled and body:
+        if settings.xhs_humanize_enabled and body and not content.exact_approval:
             try:
                 from ..content.humanize import HumanizeOptions, humanize_for_xhs
                 body = humanize_for_xhs(body, HumanizeOptions())

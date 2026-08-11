@@ -22,8 +22,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -41,8 +41,8 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -55,8 +55,8 @@ jobs:
     name: Python package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -85,6 +85,8 @@ jobs:
               "share/ai-ops-auto/alembic.ini",
               "share/ai-ops-auto/alembic/env.py",
               "share/ai-ops-auto/alembic/versions/b09fbf0bf0f0_initial_schema_baseline.py",
+              "share/ai-ops-auto/alembic/versions/a2f7c9e4d1b6_add_agent_contract_tables.py",
+              "share/ai-ops-auto/alembic/versions/d4e8a1c7b5f2_bind_contract_job_planned_time.py",
           }
           missing = sorted(
               suffix for suffix in required_suffixes
@@ -106,18 +108,59 @@ jobs:
           "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" init-db
           "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" doctor --json > doctor.json
           "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" demo --json > demo.json
+          "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" agent --help > agent-help.txt
+          "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" agent download-approval-asset --help > download-help.txt
+          "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" gen-principal-token > principal.json
           "$GITHUB_WORKSPACE/.package-venv/bin/python" - <<'PY'
           import json
+          import hashlib
+          import os
           from pathlib import Path
 
           import ai_ops
+          from sqlalchemy import create_engine, inspect
+          from ai_ops.agent_contract.cli_commands import agent_app
+          from ai_ops.api.main import app
           from ai_ops.content.generator import _load_topic_prompt
           from ai_ops.core.db import get_code_alembic_head, get_db_alembic_head
+          from typer.main import get_command
 
           assert _load_topic_prompt("dws").strip(), "wheel topic prompt is not readable"
           code_head = get_code_alembic_head()
           assert code_head, "wheel Alembic migrations are not discoverable"
           assert get_db_alembic_head() == code_head, "installed wheel did not migrate to head"
+          assert code_head == "d4e8a1c7b5f2", "wheel does not contain the latest Agent contract migration"
+          tables = set(inspect(create_engine(os.environ["DATABASE_URL"])).get_table_names())
+          assert {"publication_plans", "approval_requests", "agent_operations"} <= tables
+
+          expected_v1_routes = {
+              ("POST", "/v1/contents"),
+              ("POST", "/v1/publication-plans"),
+              ("POST", "/v1/approval-requests"),
+              ("GET", "/v1/approval-requests/{approval_id}"),
+              ("GET", "/v1/approval-requests/{approval_id}/assets/{asset_id}"),
+              ("POST", "/v1/approvals/{approval_id}/decision"),
+              ("POST", "/v1/publication-plans/{plan_id}/schedule"),
+              ("GET", "/v1/jobs/{job_id}"),
+              ("POST", "/v1/jobs/{job_id}/metrics-collections"),
+              ("POST", "/v1/performance-reviews"),
+          }
+          assert len(expected_v1_routes) == 10
+          shipped_v1_routes = {
+              (method.upper(), path)
+              for path, operations in app.openapi()["paths"].items()
+              if path.startswith("/v1/")
+              for method in operations
+              if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}
+          }
+          assert shipped_v1_routes == expected_v1_routes
+          download_contract = app.openapi()["paths"][
+              "/v1/approval-requests/{approval_id}/assets/{asset_id}"
+          ]["get"]
+          assert set(download_contract["responses"]["200"]["content"]) == {
+              "application/octet-stream"
+          }
+          assert download_contract["security"] == [{"HTTPBearer": []}]
           templates = Path(ai_ops.__file__).resolve().parent / "api" / "templates"
           required_templates = {
               "base.html",
@@ -143,6 +186,46 @@ jobs:
           assert demo["credentials_used"] is False
           assert demo["external_calls"] == 0
           assert demo["review"]["passed"] is True
+
+          with open("principal.json", encoding="utf-8") as stream:
+              principal = json.load(stream)
+          assert principal["schema_version"] == 1
+          assert principal["token"].startswith("aop_")
+          assert len(principal["token_sha256"]) == 64
+          assert hashlib.sha256(principal["token"].encode()).hexdigest() == principal["token_sha256"]
+
+          expected_agent_commands = {
+              "stage-content",
+              "plan-publication",
+              "request-approval",
+              "get-approval",
+              "download-approval-asset",
+              "decide-approval",
+              "schedule",
+              "get-job-status",
+              "collect-metrics",
+              "review-performance",
+          }
+          assert len(expected_agent_commands) == 10
+          shipped_agent_commands = {
+              command.name for command in agent_app.registered_commands
+          }
+          assert shipped_agent_commands == expected_agent_commands
+          help_text = Path("agent-help.txt").read_text(encoding="utf-8")
+          for command in expected_agent_commands:
+              assert command in help_text
+          assert Path("download-help.txt").stat().st_size > 0
+          download_command = get_command(agent_app).commands[
+              "download-approval-asset"
+          ]
+          download_params = {
+              parameter.name: parameter for parameter in download_command.params
+          }
+          assert {"approval_id", "asset_id", "output"} <= set(download_params)
+          assert download_params["approval_id"].required is True
+          assert download_params["asset_id"].required is True
+          assert download_params["output"].required is True
+          assert "--output" in download_params["output"].opts
           PY
 
   postgres:
@@ -166,8 +249,8 @@ jobs:
       DATABASE_URL: postgresql+psycopg2://ai_ops_ci:ai_ops_ci@127.0.0.1:5432/ai_ops_ci
       DATA_DIR: /tmp/ai-ops-ci-data
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -198,10 +281,10 @@ jobs:
     name: Docker image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
       - name: Build image (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false

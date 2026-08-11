@@ -28,6 +28,7 @@ dependencies = [
     { name = "sqlalchemy" },
     { name = "tenacity" },
     { name = "typer" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -72,7 +73,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jinja2", specifier = ">=3" },
-    { name = "markdown", specifier = ">=3.6" },
+    { name = "markdown", specifier = "==3.10.3" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.9" },
     { name = "openai", marker = "extra == 'llm-openai'", specifier = ">=1.30" },
     { name = "patchright", marker = "extra == 'stealth'", specifier = ">=1.40" },
@@ -93,6 +94,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "tenacity", specifier = ">=8.2" },
     { name = "typer", specifier = ">=0.12" },
+    { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2024.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.27" },
 ]
 provides-extras = ["postgres", "llm-openai", "llm-anthropic", "stealth", "stealth-pro", "jobhunt", "dev"]

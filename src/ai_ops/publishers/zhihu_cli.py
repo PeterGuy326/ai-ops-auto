@@ -11,6 +11,7 @@ ai-ops account gets an isolated synthetic HOME under
 ``ZHIHU_CLI_PROFILE_ROOT/account_<id>``.  Cookies are never passed in argv and
 are never copied into logs/raw_response.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -20,14 +21,25 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import secrets
 import shutil
 import warnings
 
 from ..config import settings
-from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
+from ..core.enums import AccountHealth, AssetType, ContentType, Platform, PublisherKind
+from ..core.external_identity import (
+    normalize_zhihu_external_account_id,
+    zhihu_external_account_id_from_whoami as _external_account_id_from_whoami,
+)
 from ..core.schemas import PublishContent, PublishResult
+from ..runtime.account_lease import AccountOperationLease, AccountOperationLeaseTimeout
 from ..runtime.receipts import write_publish_receipt
-from .base import PublisherBase
+from .base import (
+    AgentContractAssetRule,
+    AgentContractRendererDescriptor,
+    AgentContractRendererUnavailable,
+    PublisherBase,
+)
 from .subprocess_utils import communicate_bounded, stop_process_group
 
 
@@ -41,6 +53,10 @@ _ARTICLE_SUCCESS_RE = re.compile(
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg"}
 _ALLOWED_IMAGE_MIMES = {"image/jpeg"}
+_MARKDOWN_RENDERER_VERSION = "3.10.3"
+_ZHIHU_AGENT_EXTRA_KEYS = ("zhihu_topic_ids",)
+_ZHIHU_MAX_TOPIC_IDS = 20
+_ZHIHU_TOPIC_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 _ENV_ALLOWLIST = {
     "PATH",
     "LANG",
@@ -89,16 +105,129 @@ def _parse_article_confirmation(stdout: str) -> tuple[str, str] | None:
     return article_id, f"https://zhuanlan.zhihu.com/p/{article_id}"
 
 
+def _parse_whoami_external_account_id(stdout: str) -> str | None:
+    try:
+        profile = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return _external_account_id_from_whoami(profile)
+
+
+def project_zhihu_agent_payload(content: PublishContent) -> dict[str, object]:
+    """Return the audited Zhihu CLI argv payload without filesystem paths."""
+
+    if content.content_type not in {ContentType.IMAGE_TEXT, ContentType.LONG_ARTICLE}:
+        raise AgentContractRendererUnavailable(
+            "Zhihu Agent contract supports only image-text and long articles"
+        )
+    if content.videos:
+        raise AgentContractRendererUnavailable("Zhihu Agent contract does not support video assets")
+    if len(content.images) > 9:
+        raise AgentContractRendererUnavailable(
+            "Zhihu Agent contract supports at most 9 image assets"
+        )
+    if content.tags:
+        raise AgentContractRendererUnavailable("Zhihu Agent contract does not support tags")
+    if not content.title.strip() or not content.body.strip():
+        raise AgentContractRendererUnavailable("Zhihu title and body must be non-empty")
+    if "\x00" in content.title or "\x00" in content.body:
+        raise AgentContractRendererUnavailable("Zhihu title and body must not contain NUL")
+
+    extra = content.extra or {}
+    if set(extra).difference(_ZHIHU_AGENT_EXTRA_KEYS):
+        raise AgentContractRendererUnavailable(
+            "Zhihu Agent contract contains unsupported extra fields"
+        )
+    raw_topic_ids = extra.get("zhihu_topic_ids", [])
+    if not isinstance(raw_topic_ids, list):
+        raise AgentContractRendererUnavailable("zhihu_topic_ids must be a list")
+    if len(raw_topic_ids) > _ZHIHU_MAX_TOPIC_IDS:
+        raise AgentContractRendererUnavailable(
+            f"Zhihu Agent contract supports at most {_ZHIHU_MAX_TOPIC_IDS} topic IDs"
+        )
+    topic_ids: list[str] = []
+    for value in raw_topic_ids:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise AgentContractRendererUnavailable("zhihu_topic_ids must contain numeric IDs")
+        normalized = str(value)
+        if _ZHIHU_TOPIC_ID_RE.fullmatch(normalized) is None:
+            raise AgentContractRendererUnavailable(
+                "zhihu_topic_ids must contain 1-32 digit positive IDs"
+            )
+        topic_ids.append(normalized)
+    if len(set(topic_ids)) != len(topic_ids):
+        raise AgentContractRendererUnavailable("zhihu_topic_ids must not contain duplicates")
+
+    import markdown
+
+    if markdown.__version__ != _MARKDOWN_RENDERER_VERSION:
+        raise AgentContractRendererUnavailable(
+            "Zhihu Agent contract Markdown renderer version is not audited"
+        )
+    body_html = markdown.markdown(
+        content.body,
+        extensions=["fenced_code", "tables", "nl2br"],
+    )
+    if len(body_html.encode("utf-8")) > settings.zhihu_cli_max_content_bytes:
+        raise AgentContractRendererUnavailable(
+            "Zhihu rendered body exceeds the configured CLI content-byte limit"
+        )
+    return {
+        "action": "article",
+        "topic_ids": topic_ids,
+        "image_slots": [
+            {"asset_type": AssetType.IMAGE.value, "index": index}
+            for index in range(len(content.images))
+        ],
+        "title": content.title,
+        "body_html": body_html,
+    }
+
+
 class ZhihuCliPublisher(PublisherBase):
     """CLI-first Zhihu article publisher, gated behind a feature flag."""
 
     platform = Platform.ZHIHU
     kind = PublisherKind.ZHIHU_CLI
+    agent_contract_renderer_descriptor = AgentContractRendererDescriptor(
+        renderer_id="zhihu-cli.article-argv",
+        contract_version=(
+            f"4+python-markdown-{_MARKDOWN_RENDERER_VERSION}"
+            "+account-id+bounds-v1+media-preflight-v1"
+        ),
+        adapter_version=_AUDITED_VERSION,
+        platform=platform,
+        publisher_kind=kind,
+        accepted_extra_keys=_ZHIHU_AGENT_EXTRA_KEYS,
+        accepts_tags=False,
+        requires_external_account_id=True,
+        asset_rules=(
+            AgentContractAssetRule(
+                asset_type=AssetType.IMAGE,
+                min_count=0,
+                max_count=9,
+            ),
+        ),
+    )
+
+    def render_agent_contract_payload(self, content: PublishContent) -> dict[str, object]:
+        return project_zhihu_agent_payload(content)
+
+    def agent_contract_digest_material(self, content: PublishContent) -> dict[str, object]:
+        """Bind only image assets that the audited CLI can actually upload."""
+
+        images, _ = self._validate_images(content.images, exact_approval=True)
+        if images is None:
+            raise AgentContractRendererUnavailable(
+                "Zhihu Agent contract image assets failed the audited media preflight"
+            )
+        return super().agent_contract_digest_material(content)
 
     def __init__(self) -> None:
         self.binary = settings.zhihu_cli_bin
         self.timeout_seconds = settings.zhihu_cli_timeout_seconds
         self.last_login_error: str | None = None
+        self.last_external_account_id: str | None = None
 
     def _journal_result(
         self,
@@ -233,41 +362,62 @@ class ZhihuCliPublisher(PublisherBase):
         match = _VERSION_RE.search(result.stdout)
         version = match.group(1) if match else ""
         if version != _AUDITED_VERSION:
-            return False, f"知乎 CLI 版本 {version or 'unknown'} 未经审计，仅允许 {_AUDITED_VERSION}"
+            return (
+                False,
+                f"知乎 CLI 版本 {version or 'unknown'} 未经审计，仅允许 {_AUDITED_VERSION}",
+            )
         return True, version
 
-    async def _session_health(self, account_id: int) -> tuple[AccountHealth, str]:
-        cookie_file = self._cookie_file(account_id)
+    async def _session_identity(
+        self,
+        account_id: int,
+    ) -> tuple[AccountHealth, str, str | None]:
+        try:
+            cookie_file = self._cookie_file(account_id)
+        except (OSError, ValueError):
+            return AccountHealth.UNKNOWN, "知乎 CLI profile 不可用", None
         if cookie_file.parent.is_symlink() or cookie_file.is_symlink():
-            return AccountHealth.UNKNOWN, "知乎 CLI profile/cookie 不能是符号链接"
+            return AccountHealth.UNKNOWN, "知乎 CLI profile/cookie 不能是符号链接", None
         if not cookie_file.is_file():
-            return AccountHealth.EXPIRED, "隔离 profile 尚未扫码登录"
+            return AccountHealth.EXPIRED, "隔离 profile 尚未扫码登录", None
         try:
             cookie_file.chmod(0o600)
         except OSError:
-            return AccountHealth.UNKNOWN, "无法收紧 cookies.json 权限"
+            return AccountHealth.UNKNOWN, "无法收紧 cookies.json 权限", None
 
         result = await self._run(account_id, "whoami", "--json", timeout=30)
         if not result.started:
-            return AccountHealth.UNKNOWN, result.error or "知乎 CLI 不可用"
+            return AccountHealth.UNKNOWN, result.error or "知乎 CLI 不可用", None
         if result.returncode != 0:
             combined = f"{result.stdout}\n{result.stderr}".lower()
             expired_markers = ("not authenticated", "session expired", "login")
             if any(marker in combined for marker in expired_markers):
-                return AccountHealth.EXPIRED, "知乎 CLI 登录态已失效"
-            return AccountHealth.UNKNOWN, "知乎 CLI 无法在线验证登录态"
+                return AccountHealth.EXPIRED, "知乎 CLI 登录态已失效", None
+            return AccountHealth.UNKNOWN, "知乎 CLI 无法在线验证登录态", None
         try:
             profile = json.loads(result.stdout)
         except json.JSONDecodeError:
-            return AccountHealth.UNKNOWN, "知乎 CLI whoami 没有返回合法 JSON"
+            return AccountHealth.UNKNOWN, "知乎 CLI whoami 没有返回合法 JSON", None
         if isinstance(profile, dict) and (profile.get("id") or profile.get("url_token")):
-            return AccountHealth.HEALTHY, ""
-        return AccountHealth.UNKNOWN, "知乎 CLI whoami 返回缺少账号标识"
+            return AccountHealth.HEALTHY, "", _external_account_id_from_whoami(profile)
+        return AccountHealth.UNKNOWN, "知乎 CLI whoami 返回缺少账号标识", None
 
-    def _validate_images(self, images: list[str]) -> tuple[list[str] | None, str | None]:
+    async def _session_health(self, account_id: int) -> tuple[AccountHealth, str]:
+        health, reason, _ = await self._session_identity(account_id)
+        return health, reason
+
+    def _validate_images(
+        self,
+        images: list[str],
+        *,
+        exact_approval: bool = False,
+    ) -> tuple[list[str] | None, str | None]:
         if len(images) > 9:
             return None, "知乎 CLI 单次最多允许 9 张图片"
-        root = settings.zhihu_cli_asset_root.expanduser().resolve()
+        configured_root = (
+            settings.agent_asset_vault_root if exact_approval else settings.zhihu_cli_asset_root
+        )
+        root = configured_root.expanduser().resolve()
         resolved: list[str] = []
         total_bytes = 0
         for raw in images:
@@ -281,7 +431,10 @@ class ZhihuCliPublisher(PublisherBase):
             if not path.is_file() or not path.is_relative_to(root):
                 return None, f"知乎 CLI 图片必须位于受控目录 {root}"
             mime, _ = mimetypes.guess_type(path.name)
-            if path.suffix.lower() not in _ALLOWED_IMAGE_SUFFIXES or mime not in _ALLOWED_IMAGE_MIMES:
+            if (
+                path.suffix.lower() not in _ALLOWED_IMAGE_SUFFIXES
+                or mime not in _ALLOWED_IMAGE_MIMES
+            ):
                 return None, "知乎 CLI canary 仅接受 JPEG 图片"
             try:
                 from PIL import Image
@@ -313,7 +466,23 @@ class ZhihuCliPublisher(PublisherBase):
         return False
 
     async def login_interactive(self, account_id: int) -> bool:
-        """Run QR login with inherited TTY; never accepts a cookie argument."""
+        """Run one lease-protected QR login; never accepts a cookie argument."""
+        self.last_login_error = None
+        self.last_external_account_id = None
+        try:
+            async with AccountOperationLease(
+                account_id,
+                timeout_seconds=settings.account_operation_lock_timeout_seconds,
+            ):
+                return await self._login_interactive_locked(account_id)
+        except AccountOperationLeaseTimeout:
+            self.last_login_error = "知乎账号正在执行其他操作，请稍后重试扫码登录"
+            return False
+        except OSError:
+            self.last_login_error = "知乎账号操作锁不可用"
+            return False
+
+    async def _login_interactive_locked(self, account_id: int) -> bool:
         ready, reason = await self._audited_version_ready(account_id)
         if not ready:
             self.last_login_error = reason
@@ -322,7 +491,11 @@ class ZhihuCliPublisher(PublisherBase):
         if binary is None:
             self.last_login_error = "知乎 CLI 未安装或不可执行"
             return False
-        env = self._subprocess_env(account_id, create_profile=True)
+        try:
+            env = self._subprocess_env(account_id, create_profile=True)
+        except (OSError, ValueError):
+            self.last_login_error = "知乎 CLI profile 不可用"
+            return False
         try:
             proc = await asyncio.create_subprocess_exec(
                 binary,
@@ -361,7 +534,8 @@ class ZhihuCliPublisher(PublisherBase):
         if proc.returncode != 0:
             self.last_login_error = f"知乎 CLI 扫码登录失败（退出码 {proc.returncode}）"
             return False
-        health, reason = await self._session_health(account_id)
+        health, reason, external_account_id = await self._session_identity(account_id)
+        self.last_external_account_id = external_account_id
         self.last_login_error = None if health == AccountHealth.HEALTHY else reason
         return health == AccountHealth.HEALTHY
 
@@ -371,50 +545,98 @@ class ZhihuCliPublisher(PublisherBase):
         credential: dict,
         content: PublishContent,
     ) -> PublishResult:
-        if content.content_type in (ContentType.VIDEO, ContentType.AUDIO):
-            return PublishResult(success=False, error="知乎 CLI 当前只接入专栏图文/长文")
-        if not content.title.strip() or not content.body.strip():
-            return PublishResult(success=False, error="知乎 CLI 文章标题和正文不能为空")
-        if "\x00" in content.title or "\x00" in content.body:
-            return PublishResult(success=False, error="知乎 CLI 标题或正文含 NUL 字符")
+        contract_payload: dict[str, object] | None = None
+        if content.exact_approval:
+            try:
+                contract_payload = self.render_agent_contract_payload(content)
+            except AgentContractRendererUnavailable as exc:
+                return PublishResult(success=False, error=str(exc))
+        else:
+            if content.content_type in (ContentType.VIDEO, ContentType.AUDIO):
+                return PublishResult(success=False, error="知乎 CLI 当前只接入专栏图文/长文")
+            if not content.title.strip() or not content.body.strip():
+                return PublishResult(success=False, error="知乎 CLI 文章标题和正文不能为空")
+            if "\x00" in content.title or "\x00" in content.body:
+                return PublishResult(success=False, error="知乎 CLI 标题或正文含 NUL 字符")
 
         ready, reason = await self._audited_version_ready(account_id)
         if not ready:
             return PublishResult(success=False, error=reason)
-        health, reason = await self._session_health(account_id)
-        if health != AccountHealth.HEALTHY:
-            return PublishResult(success=False, error=reason)
+        if not content.exact_approval:
+            health, reason = await self._session_health(account_id)
+            if health != AccountHealth.HEALTHY:
+                return PublishResult(success=False, error=reason)
 
-        images, image_error = self._validate_images(content.images)
+        images, image_error = self._validate_images(
+            content.images,
+            exact_approval=content.exact_approval,
+        )
         if images is None:
             return PublishResult(success=False, error=image_error)
 
-        # Match the old browser adapter's Markdown rendering as closely as the
-        # 0.2.4 contract allows.  Upstream wraps this fragment in an extra <p>,
-        # hence the integration remains canary-only until --content-file/html is
-        # available upstream.
-        import markdown
+        if contract_payload is not None:
+            body = contract_payload["body_html"]
+            topic_ids = contract_payload["topic_ids"]
+            title = contract_payload["title"]
+            assert isinstance(body, str)
+            assert isinstance(topic_ids, list)
+            assert isinstance(title, str)
+        else:
+            # Match the old browser adapter's Markdown rendering as closely as
+            # the 0.2.4 contract allows. Upstream wraps this fragment in an extra
+            # <p>, hence the integration remains canary-only until
+            # --content-file/html is available upstream.
+            import markdown
 
-        body = markdown.markdown(
-            content.body,
-            extensions=["fenced_code", "tables", "nl2br"],
-        )
+            body = markdown.markdown(
+                content.body,
+                extensions=["fenced_code", "tables", "nl2br"],
+            )
+            topic_ids = content.extra.get("zhihu_topic_ids", [])
+            if not isinstance(topic_ids, list) or any(
+                not str(value).isdigit() for value in topic_ids
+            ):
+                return PublishResult(success=False, error="zhihu_topic_ids 必须是数字 ID 列表")
+            topic_ids = [str(value) for value in topic_ids]
+            title = content.title.strip()
         if len(body.encode("utf-8")) > settings.zhihu_cli_max_content_bytes:
             return PublishResult(
                 success=False,
                 error="知乎 CLI 正文超过安全 argv 上限，改走浏览器 Publisher",
             )
 
-        topic_ids = content.extra.get("zhihu_topic_ids", [])
-        if not isinstance(topic_ids, list) or any(not str(value).isdigit() for value in topic_ids):
-            return PublishResult(success=False, error="zhihu_topic_ids 必须是数字 ID 列表")
-
         argv: list[str] = ["article"]
         for topic_id in topic_ids:
-            argv.extend(["--topic", str(topic_id)])
+            argv.extend(["--topic", topic_id])
         for image in images:
             argv.extend(["--image", image])
-        argv.extend(["--", content.title.strip(), body])
+        argv.extend(["--", title, body])
+
+        if content.exact_approval:
+            try:
+                approved_external_account_id = normalize_zhihu_external_account_id(
+                    content.approved_external_account_id
+                )
+            except ValueError:
+                return PublishResult(
+                    success=False,
+                    retryable=False,
+                    error="Agent contract 缺少已批准的知乎目标账号标识",
+                )
+            health, reason, observed_external_account_id = await self._session_identity(account_id)
+            if health != AccountHealth.HEALTHY:
+                return PublishResult(success=False, retryable=False, error=reason)
+            if observed_external_account_id is None or not secrets.compare_digest(
+                observed_external_account_id,
+                approved_external_account_id,
+            ):
+                return PublishResult(
+                    success=False,
+                    retryable=False,
+                    effect_applied=False,
+                    outcome_uncertain=False,
+                    error="知乎当前登录账号与批准目标不一致；写入未开始",
+                )
 
         result = await self._run(account_id, *argv)
         raw = {

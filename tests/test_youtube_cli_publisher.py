@@ -1,4 +1,5 @@
 """Offline contract tests for the youtubeuploader v1.25.5 adapter."""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,8 +11,13 @@ import pytest
 from ai_ops.config import settings
 from ai_ops.core.enums import ContentType, Platform, PublisherKind
 from ai_ops.core.schemas import PublishContent
+from ai_ops.publishers.base import AgentContractRendererUnavailable
 from ai_ops.publishers.registry import build_default_registry
-from ai_ops.publishers.youtube_cli import YoutubeUploaderPublisher, _CommandResult
+from ai_ops.publishers.youtube_cli import (
+    YoutubeUploaderPublisher,
+    _CommandResult,
+    project_youtube_agent_payload,
+)
 from ai_ops.runtime.receipts import read_publish_receipt
 
 
@@ -22,6 +28,7 @@ def youtube_settings(tmp_path, monkeypatch):
     assets.mkdir()
     monkeypatch.setattr(settings, "youtube_uploader_profile_root", profiles)
     monkeypatch.setattr(settings, "youtube_uploader_asset_root", assets)
+    monkeypatch.setattr(settings, "agent_asset_vault_root", assets)
     monkeypatch.setattr(settings, "youtube_uploader_bin", "youtubeuploader")
     monkeypatch.setattr(settings, "youtube_uploader_timeout_seconds", 1)
     monkeypatch.setattr(settings, "youtube_uploader_max_video_bytes", 1024 * 1024)
@@ -63,6 +70,67 @@ def _prepare(pub: YoutubeUploaderPublisher, account_id: int, assets):
     return home, secrets, token, video
 
 
+def test_agent_projection_is_path_free_but_exact_renderer_opt_in_is_paused():
+    content = _content("/private/agent-vault/approved-video.mp4").model_copy(
+        update={"exact_approval": True}
+    )
+    publisher = YoutubeUploaderPublisher()
+
+    projection = project_youtube_agent_payload(content)
+    descriptor = publisher.agent_contract_renderer_descriptor
+
+    assert publisher.supports_agent_contract_renderer is False
+    assert descriptor is None
+    with pytest.raises(AgentContractRendererUnavailable):
+        publisher.agent_contract_digest_material(content)
+    assert projection["media"] == {"asset_type": "video", "index": 0}
+    assert projection["metadata"] == {
+        "title": "AI 视频标题",
+        "description": "未公开的正文；$(不会进 argv)",
+        "tags": ["agent", "自动化"],
+        "privacyStatus": "private",
+        "language": "zh-Hans",
+        "madeForKids": False,
+        "containsSyntheticMedia": True,
+        "categoryId": "28",
+    }
+    assert "/private/agent-vault" not in json.dumps(projection, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"images": ["/vault/cover.jpg"]},
+        {"videos": []},
+        {"videos": ["/vault/one.mp4", "/vault/two.mp4"]},
+        {"extra": {"youtube_privacy": "private", "unknown": True}},
+    ],
+)
+def test_agent_contract_renderer_rejects_unaccounted_youtube_fields(updates):
+    content = _content("/vault/video.mp4").model_copy(update={"exact_approval": True, **updates})
+
+    with pytest.raises(AgentContractRendererUnavailable):
+        project_youtube_agent_payload(content)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"tags": [f"tag-{value}" for value in range(51)]},
+        {"tags": ["界" * 100, "界" * 100]},
+        {"tags": [""]},
+        {"extra": {"youtube_category_id": "0001"}},
+        {"extra": {"youtube_category_id": "1234"}},
+    ],
+)
+def test_legacy_projection_fields_are_bounded_without_reenabling_exact(updates):
+    content = _content("/vault/video.mp4").model_copy(update=updates)
+
+    with pytest.raises(AgentContractRendererUnavailable):
+        project_youtube_agent_payload(content)
+    assert YoutubeUploaderPublisher.agent_contract_renderer_descriptor is None
+
+
 def test_receipt_drives_success_and_sensitive_metadata_stays_out_of_argv(
     youtube_settings, monkeypatch
 ):
@@ -99,9 +167,7 @@ def test_receipt_drives_success_and_sensitive_metadata_stays_out_of_argv(
     content = _content(str(video))
     content.job_id = 42
     content.operation_id = "c" * 32
-    result = asyncio.run(
-        pub.publish(4, {"access_token": "must-not-be-used"}, content)
-    )
+    result = asyncio.run(pub.publish(4, {"access_token": "must-not-be-used"}, content))
 
     assert result.success is True
     assert result.effect_applied is True
@@ -131,6 +197,38 @@ def test_receipt_drives_success_and_sensitive_metadata_stays_out_of_argv(
     durable = read_publish_receipt(42, content.operation_id)
     assert durable is not None
     assert durable["platform_post_id"] == "abc123DEF45"
+
+
+def test_exact_approval_is_paused_before_upload_without_channel_identity(
+    youtube_settings,
+    monkeypatch,
+):
+    _, assets = youtube_settings
+    pub = YoutubeUploaderPublisher()
+    _, _, _, video = _prepare(pub, 8, assets)
+
+    async def version_ready(account_id):
+        return True, "v1.25.5"
+
+    async def must_not_upload(*args, **kwargs):
+        raise AssertionError("upload subprocess must not start")
+
+    monkeypatch.setattr(pub, "_audited_version_ready", version_ready)
+    monkeypatch.setattr(pub, "_run", must_not_upload)
+    content = _content(str(video)).model_copy(
+        update={
+            "title": "  Human-approved title  ",
+            "exact_approval": True,
+            "operation_id": "e" * 32,
+        }
+    )
+
+    result = asyncio.run(pub.publish(8, {}, content))
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is False
+    assert "agent contract rendering" in (result.error or "").lower()
 
 
 def test_valid_receipt_after_nonzero_exit_is_confirmed_partial(youtube_settings, monkeypatch):
@@ -189,9 +287,7 @@ def test_receipt_privacy_mismatch_is_known_effect_without_retry(youtube_settings
 
 
 @pytest.mark.parametrize("returncode", [0, 1])
-def test_started_upload_without_receipt_is_uncertain(
-    youtube_settings, monkeypatch, returncode
-):
+def test_started_upload_without_receipt_is_uncertain(youtube_settings, monkeypatch, returncode):
     _, assets = youtube_settings
     pub = YoutubeUploaderPublisher()
     _, _, _, video = _prepare(pub, 1, assets)
@@ -224,11 +320,7 @@ def test_deleted_receipt_stays_unknown_and_writes_redacted_recovery_evidence(
 
     async def delete_receipt(account_id, *args, timeout=None):
         receipt = Path(
-            next(
-                value.split("=", 1)[1]
-                for value in args
-                if value.startswith("-metaJSONout=")
-            )
+            next(value.split("=", 1)[1] for value in args if value.startswith("-metaJSONout="))
         )
         receipt.unlink()
         return _CommandResult(started=True, returncode=0)

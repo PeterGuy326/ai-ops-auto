@@ -110,6 +110,10 @@ B 站需要把底层已有的 aid/bvid 原样暴露到 CLI JSON；SAU 需要先�
 
 - **知乎**：只有精确成功 marker 与数字文章 URL 一致才确认；账号独立
   HOME，二维码登录只能通过显式终端命令 `ai-ops zhihu-login <account_id>` 发生。
+  登录与 worker 发布共用账号操作锁，避免同时读写同一 profile。在线验证成功后命令会输出
+  `zhihu:id:<whoami.id>`；operator 必须向 `PATCH /accounts/<account_id>` 提交
+  `{"external_account_id":"zhihu:id:<whoami.id>"}`，服务将其写入 Account.profile，命令本身不会写数据库。Agent exact 计划会公开并绑定
+  这个稳定身份，写入前再次执行 `whoami` 比对；缺失或不一致时在 article 子进程启动前失败。
   若 matching marker/URL 已出现但进程随后非零，任务保持 unknown/non-retryable，同时把候选
   post ID/URL 留给人工 reconciliation，不把它升级为 SUCCESS。
   `POST /accounts/{id}/login` 在 CLI 为首选时只验证该 HOME 的既有登录态，不会显示二维码，
@@ -122,7 +126,8 @@ B 站需要把底层已有的 aid/bvid 原样暴露到 CLI JSON；SAU 需要先�
   `0700/0600` 的隔离目录；正文元数据写入临时 `0600` JSON，不进 argv。token 内容不进 argv，
   但 `request.token` 的文件路径会作为 `-cache=...` 参数传给子进程。合法回执中的 video ID 与
   请求 privacy 一致时确认成功，即使进程随后非零或超时也不重传；privacy 不一致时记录
-  `effect_applied` 并转人工对账；无回执且进程已启动时进入 unknown。
+  `effect_applied` 并转人工对账；无回执且进程已启动时进入 unknown。该路径当前只用于 legacy
+  canary；由于缺少可审计的只读 channel identity，Agent exact renderer 已暂停。
 - **GitHub Pages**：dry-run 明确 `effect_applied=false`；图片只能来自
   `GITHUB_PAGES_ASSET_ROOT`，拒绝隐藏文件、符号链接、越界和伪造扩展名，并受单张/总大小
   上限约束。live 的 clean/write/build/commit/push 全程持有跨进程仓库锁，commit 路径集合

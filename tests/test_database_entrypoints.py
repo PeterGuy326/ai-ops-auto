@@ -1,4 +1,5 @@
 """Real smoke tests for user-facing database initialization entrypoints."""
+
 from __future__ import annotations
 
 import logging
@@ -7,11 +8,14 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 from typer.testing import CliRunner
 
 from ai_ops import cli
 from ai_ops.core import db as db_mod
+from ai_ops.core.models import ApprovalRequest, Asset, Base
 
 
 def _sqlite_url(path: Path) -> str:
@@ -25,6 +29,63 @@ def _assert_database_at_head(url: str) -> None:
             revision = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         assert revision == db_mod.get_code_alembic_head()
         assert "publish_jobs" in inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
+
+
+def test_runtime_sqlite_connections_enforce_declared_foreign_keys():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    db_mod.enable_sqlite_foreign_keys(engine)
+    Base.metadata.create_all(engine)
+
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                ApprovalRequest.__table__.insert().values(
+                    plan_id=999,
+                    plan_digest="a" * 64,
+                    status="pending",
+                    requested_by="agent",
+                    requested_by_type="agent",
+                )
+            )
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("content_sha256", "size_bytes", "storage_kind"),
+    [
+        ("a" * 64, 7, None),
+        (None, 7, "agent_vault_v1"),
+        ("a" * 64, None, "agent_vault_v1"),
+        ("a" * 64, 7, "unsupported_vault"),
+    ],
+)
+def test_runtime_metadata_rejects_partial_or_unsupported_asset_vault_rows(
+    content_sha256,
+    size_bytes,
+    storage_kind,
+):
+    """Base.create_all must enforce the same fail-closed rule as Alembic."""
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    try:
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    Asset.__table__.insert().values(
+                        asset_type="image",
+                        source="user_upload",
+                        local_path="legacy/cover.png",
+                        content_sha256=content_sha256,
+                        size_bytes=size_bytes,
+                        storage_kind=storage_kind,
+                        meta={},
+                    )
+                )
     finally:
         engine.dispose()
 

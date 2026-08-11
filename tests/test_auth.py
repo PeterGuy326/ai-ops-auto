@@ -7,6 +7,7 @@
   - prod 模式：正确 key → 200
   - 常量时间比较：长度不同也不能短路返回 200（间接验证）
 """
+
 from __future__ import annotations
 
 import pytest
@@ -40,6 +41,8 @@ def _reset_dev_warn_and_key(monkeypatch):
     单个 test 需要 dev 模式时再 monkeypatch 回去。"""
     auth_mod._reset_dev_warn_for_test()
     monkeypatch.setattr(settings, "api_key", "test-secret-123")
+    monkeypatch.setattr(settings, "agent_principals", [])
+    monkeypatch.setattr(settings, "legacy_dev_auth_bypass", False)
     yield
     auth_mod._reset_dev_warn_for_test()
 
@@ -50,11 +53,13 @@ class TestDevMode:
     def test_dev_mode_no_header_passes(self, monkeypatch, app, caplog):
         """dev 模式：不带 header 也放行，且触发 warning。"""
         import logging
+
         monkeypatch.setattr(settings, "api_key", "")
+        monkeypatch.setattr(settings, "legacy_dev_auth_bypass", True)
         auth_mod._reset_dev_warn_for_test()
 
         with caplog.at_level(logging.WARNING, logger="ai_ops.api.auth"):
-            client = TestClient(app)
+            client = TestClient(app, base_url="http://127.0.0.1")
             r = client.get("/protected")
         assert r.status_code == 200
         assert r.json() == {"ok": True, "scope": "protected"}
@@ -64,11 +69,13 @@ class TestDevMode:
     def test_dev_mode_warning_only_once(self, monkeypatch, app, caplog):
         """dev 模式 warning 不刷屏——多次请求只 warn 一次。"""
         import logging
+
         monkeypatch.setattr(settings, "api_key", "")
+        monkeypatch.setattr(settings, "legacy_dev_auth_bypass", True)
         auth_mod._reset_dev_warn_for_test()
 
         with caplog.at_level(logging.WARNING, logger="ai_ops.api.auth"):
-            client = TestClient(app)
+            client = TestClient(app, base_url="http://127.0.0.1")
             for _ in range(5):
                 client.get("/protected")
         warn_count = sum(1 for rec in caplog.records if "dev 模式" in rec.message)
@@ -77,9 +84,21 @@ class TestDevMode:
     def test_api_key_dev_mode_helper(self, monkeypatch):
         """api_key_dev_mode() helper 反映 settings 状态。"""
         monkeypatch.setattr(settings, "api_key", "")
+        monkeypatch.setattr(settings, "legacy_dev_auth_bypass", True)
         assert api_key_dev_mode() is True
+        monkeypatch.setattr(settings, "agent_principals", [object()])
+        assert api_key_dev_mode() is False
+        monkeypatch.setattr(settings, "agent_principals", [])
         monkeypatch.setattr(settings, "api_key", "x")
         assert api_key_dev_mode() is False
+
+    def test_dev_bypass_rejects_request_received_on_non_loopback(self, monkeypatch, app):
+        monkeypatch.setattr(settings, "api_key", "")
+        monkeypatch.setattr(settings, "legacy_dev_auth_bypass", True)
+
+        response = TestClient(app, base_url="http://198.51.100.10").get("/protected")
+
+        assert response.status_code == 401
 
 
 class TestProdMode:
@@ -132,6 +151,7 @@ class TestMainAppIntegration:
         """主 app 上 /health 不需要 key。"""
         monkeypatch.setattr(settings, "api_key", "any-key")
         from ai_ops.api.main import app as main_app
+
         client = TestClient(main_app)
         r = client.get("/health")
         assert r.status_code == 200
@@ -140,6 +160,7 @@ class TestMainAppIntegration:
         """主 app 上 /accounts 没带 key → 401。"""
         monkeypatch.setattr(settings, "api_key", "any-key")
         from ai_ops.api.main import app as main_app
+
         client = TestClient(main_app)
         r = client.get("/accounts")
         assert r.status_code == 401
@@ -148,6 +169,7 @@ class TestMainAppIntegration:
         """/docs 必须公开（dev 体验）。"""
         monkeypatch.setattr(settings, "api_key", "any-key")
         from ai_ops.api.main import app as main_app
+
         client = TestClient(main_app)
         r = client.get("/docs")
         assert r.status_code == 200

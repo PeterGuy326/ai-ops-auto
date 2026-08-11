@@ -8,6 +8,7 @@ OAuth client secrets and token caches remain external disk state.  They are
 never passed as values (only paths), copied to raw_response, or inherited from
 the control-plane environment.  Each ai-ops account has an isolated token file.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -22,10 +23,10 @@ import tempfile
 import uuid
 
 from ..config import settings
-from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
+from ..core.enums import AccountHealth, AssetType, ContentType, Platform, PublisherKind
 from ..core.schemas import PublishContent, PublishResult
 from ..runtime.receipts import write_publish_receipt
-from .base import PublisherBase
+from .base import AgentContractRendererUnavailable, PublisherBase
 from .subprocess_utils import communicate_bounded, stop_process_group
 
 
@@ -33,6 +34,16 @@ _AUDITED_VERSION = "v1.25.5"
 _VERSION_RE = re.compile(r"Youtubeuploader\s+version:\s*(v?[0-9]+(?:\.[0-9]+){2})", re.I)
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 _ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+_YOUTUBE_MAX_TAGS = 50
+_YOUTUBE_MAX_TAG_BYTES = 500
+_YOUTUBE_AGENT_EXTRA_KEYS = (
+    "tags",
+    "youtube_category_id",
+    "youtube_contains_synthetic_media",
+    "youtube_language",
+    "youtube_made_for_kids",
+    "youtube_privacy",
+)
 _ENV_ALLOWLIST = {
     "PATH",
     "LANG",
@@ -62,9 +73,97 @@ class _CommandResult:
     error: str | None = None
 
 
+def project_youtube_agent_payload(content: PublishContent) -> dict[str, object]:
+    """Return the exact youtubeuploader metadata contract without host paths."""
+
+    if content.content_type != ContentType.VIDEO or len(content.videos) != 1:
+        raise AgentContractRendererUnavailable(
+            "YouTube Agent contract requires exactly one video asset"
+        )
+    if content.images:
+        raise AgentContractRendererUnavailable(
+            "YouTube Agent contract does not support image assets"
+        )
+
+    extra = content.extra or {}
+    if set(extra).difference(_YOUTUBE_AGENT_EXTRA_KEYS):
+        raise AgentContractRendererUnavailable(
+            "YouTube Agent contract contains unsupported extra fields"
+        )
+    if "tags" in extra and extra["tags"] != content.tags:
+        raise AgentContractRendererUnavailable(
+            "YouTube Agent contract tag projections do not match"
+        )
+    if not content.title.strip() or len(content.title) > 100:
+        raise AgentContractRendererUnavailable(
+            "YouTube title must be non-empty and at most 100 characters"
+        )
+    if len(content.body) > 5000:
+        raise AgentContractRendererUnavailable(
+            "YouTube description must be at most 5000 characters"
+        )
+    if len(content.tags) > _YOUTUBE_MAX_TAGS:
+        raise AgentContractRendererUnavailable(
+            f"YouTube supports at most {_YOUTUBE_MAX_TAGS} projected tags"
+        )
+    if any(not isinstance(tag, str) or not tag or len(tag) > 100 for tag in content.tags):
+        raise AgentContractRendererUnavailable(
+            "YouTube tags must be non-empty strings of at most 100 characters"
+        )
+    if len(",".join(content.tags).encode("utf-8")) > _YOUTUBE_MAX_TAG_BYTES:
+        raise AgentContractRendererUnavailable(
+            f"YouTube projected tags exceed the {_YOUTUBE_MAX_TAG_BYTES}-byte limit"
+        )
+
+    privacy = extra.get("youtube_privacy", "private")
+    if not isinstance(privacy, str) or privacy not in {"private", "unlisted", "public"}:
+        raise AgentContractRendererUnavailable(
+            "youtube_privacy must be private, unlisted, or public"
+        )
+    language = extra.get("youtube_language", "zh-Hans")
+    if not isinstance(language, str) or not re.fullmatch(r"[A-Za-z0-9-]{2,16}", language):
+        raise AgentContractRendererUnavailable("youtube_language has an invalid format")
+
+    category_value = extra.get("youtube_category_id", "")
+    if isinstance(category_value, bool) or not isinstance(category_value, (str, int)):
+        raise AgentContractRendererUnavailable("youtube_category_id must be numeric")
+    category_id = str(category_value)
+    if category_id and re.fullmatch(r"[1-9][0-9]{0,2}", category_id) is None:
+        raise AgentContractRendererUnavailable(
+            "youtube_category_id must be a 1-3 digit positive ID"
+        )
+
+    made_for_kids = extra.get("youtube_made_for_kids", False)
+    contains_synthetic = extra.get("youtube_contains_synthetic_media", False)
+    if not isinstance(made_for_kids, bool) or not isinstance(contains_synthetic, bool):
+        raise AgentContractRendererUnavailable("YouTube boolean metadata must use JSON booleans")
+
+    metadata: dict[str, object] = {
+        "title": content.title,
+        "description": content.body,
+        "tags": list(content.tags),
+        "privacyStatus": privacy,
+        "language": language,
+        "madeForKids": made_for_kids,
+        "containsSyntheticMedia": contains_synthetic,
+    }
+    if category_id:
+        metadata["categoryId"] = category_id
+    return {
+        "action": "upload-video",
+        "media": {"asset_type": AssetType.VIDEO.value, "index": 0},
+        "metadata": metadata,
+    }
+
+
 class YoutubeUploaderPublisher(PublisherBase):
     platform = Platform.YOUTUBE
     kind = PublisherKind.YOUTUBE_UPLOADER
+    # Paused for Agent exact execution: youtubeuploader's local OAuth token has
+    # no audited read-only channel identity probe. Legacy canary publication is
+    # unchanged, but an approval cannot safely bind this disk profile to the
+    # intended YouTube channel yet.
+    agent_contract_renderer_descriptor = None
 
     def __init__(self) -> None:
         self.binary = settings.youtube_uploader_bin
@@ -224,8 +323,7 @@ class YoutubeUploaderPublisher(PublisherBase):
         normalized = version if version.startswith("v") else f"v{version}" if version else ""
         if normalized != _AUDITED_VERSION:
             return False, (
-                f"youtubeuploader 版本 {version or 'unknown'} 未经审计，"
-                f"仅允许 {_AUDITED_VERSION}"
+                f"youtubeuploader 版本 {version or 'unknown'} 未经审计，仅允许 {_AUDITED_VERSION}"
             )
         return True, normalized
 
@@ -264,7 +362,12 @@ class YoutubeUploaderPublisher(PublisherBase):
             return None, "YouTube 视频不能是符号链接"
         try:
             video = candidate.resolve(strict=True)
-            root = settings.youtube_uploader_asset_root.expanduser().resolve()
+            configured_root = (
+                settings.agent_asset_vault_root
+                if content.exact_approval
+                else settings.youtube_uploader_asset_root
+            )
+            root = configured_root.expanduser().resolve()
         except OSError:
             return None, "YouTube 视频不存在或不可读"
         mime, _ = mimetypes.guess_type(video.name)
@@ -281,6 +384,15 @@ class YoutubeUploaderPublisher(PublisherBase):
         return video, None
 
     def _metadata(self, content: PublishContent) -> tuple[dict | None, str | None]:
+        if content.exact_approval:
+            try:
+                projection = self.render_agent_contract_payload(content)
+            except AgentContractRendererUnavailable as exc:
+                return None, str(exc)
+            metadata = projection["metadata"]
+            assert isinstance(metadata, dict)
+            return dict(metadata), None
+
         extra = content.extra or {}
         privacy = str(extra.get("youtube_privacy", "private"))
         if privacy not in {"private", "unlisted", "public"}:
@@ -299,15 +411,13 @@ class YoutubeUploaderPublisher(PublisherBase):
         if any(len(tag) > 100 for tag in tags):
             return None, "YouTube 单个 tag 不能超过 100 字符"
         metadata = {
-            "title": content.title.strip(),
+            "title": content.title if content.exact_approval else content.title.strip(),
             "description": content.body,
             "tags": tags,
             "privacyStatus": privacy,
             "language": language,
             "madeForKids": bool(extra.get("youtube_made_for_kids", False)),
-            "containsSyntheticMedia": bool(
-                extra.get("youtube_contains_synthetic_media", False)
-            ),
+            "containsSyntheticMedia": bool(extra.get("youtube_contains_synthetic_media", False)),
         }
         if category_id:
             metadata["categoryId"] = category_id
@@ -316,11 +426,7 @@ class YoutubeUploaderPublisher(PublisherBase):
     @staticmethod
     def _read_receipt(path: Path) -> tuple[str, str, dict] | None:
         try:
-            if (
-                path.is_symlink()
-                or not path.is_file()
-                or path.stat().st_size > 2 * 1024 * 1024
-            ):
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
                 return None
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -411,8 +517,11 @@ class YoutubeUploaderPublisher(PublisherBase):
             if content.operation_id and re.fullmatch(r"[a-f0-9]{32}", content.operation_id)
             else uuid.uuid4().hex
         )
-        metadata["tags"] = [*metadata["tags"], f"aiops_{attempt_id[:12]}"]
-        with tempfile.TemporaryDirectory(prefix=f"upload-{attempt_id[:12]}-", dir=runs) as temp_name:
+        if not content.exact_approval:
+            metadata["tags"] = [*metadata["tags"], f"aiops_{attempt_id[:12]}"]
+        with tempfile.TemporaryDirectory(
+            prefix=f"upload-{attempt_id[:12]}-", dir=runs
+        ) as temp_name:
             temp = Path(temp_name)
             meta_path = temp / "metadata.json"
             receipt_path = temp / "receipt.json"
@@ -454,9 +563,7 @@ class YoutubeUploaderPublisher(PublisherBase):
             if receipt is not None:
                 _, _, receipt_data = receipt
                 status = receipt_data.get("status")
-                actual_privacy = (
-                    status.get("privacyStatus") if isinstance(status, dict) else None
-                )
+                actual_privacy = status.get("privacyStatus") if isinstance(status, dict) else None
                 if actual_privacy != metadata["privacyStatus"]:
                     evidence_outcome = "privacy_mismatch"
                 elif result.returncode == 0 and not result.timed_out:
@@ -494,9 +601,7 @@ class YoutubeUploaderPublisher(PublisherBase):
         if receipt is not None:
             video_id, video_url, receipt_data = receipt
             status = receipt_data.get("status")
-            actual_privacy = (
-                status.get("privacyStatus") if isinstance(status, dict) else None
-            )
+            actual_privacy = status.get("privacyStatus") if isinstance(status, dict) else None
             privacy_matches = actual_privacy == metadata["privacyStatus"]
             if not privacy_matches:
                 raw.update(
@@ -519,7 +624,8 @@ class YoutubeUploaderPublisher(PublisherBase):
                     ),
                 )
             raw["outcome"] = (
-                "confirmed" if result.returncode == 0 and not result.timed_out
+                "confirmed"
+                if result.returncode == 0 and not result.timed_out
                 else "published_partial"
             )
             if raw["outcome"] == "published_partial":

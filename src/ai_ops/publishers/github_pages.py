@@ -660,7 +660,11 @@ class GitHubPagesPublisher(PublisherBase):
         asset_root: Path | None = None
         total_bytes = 0
         if content.images:
-            configured_root = settings.github_pages_asset_root.expanduser()
+            configured_root = (
+                settings.agent_asset_vault_root
+                if content.exact_approval
+                else settings.github_pages_asset_root
+            ).expanduser()
             if configured_root.is_symlink():
                 raise ValueError("GitHub Pages 受控图片目录不能是符号链接")
             try:
@@ -889,9 +893,7 @@ class GitHubPagesPublisher(PublisherBase):
             if relative in seen:
                 raise ValueError("回滚目标路径重复")
             seen.add(relative)
-            if path.is_symlink() or not path.resolve(strict=False).is_relative_to(
-                resolved_repo
-            ):
+            if path.is_symlink() or not path.resolve(strict=False).is_relative_to(resolved_repo):
                 raise ValueError(f"回滚目标路径不安全: {relative}")
             if path.exists():
                 metadata = path.stat(follow_symlinks=False)
@@ -1290,11 +1292,7 @@ class GitHubPagesPublisher(PublisherBase):
         timeout_seconds: int,
     ) -> _CommandResult:
         """Run a fixed argv command and always reap it on timeout/cancellation."""
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key in _SUBPROCESS_ENV_ALLOWLIST
-        }
+        env = {key: value for key, value in os.environ.items() if key in _SUBPROCESS_ENV_ALLOWLIST}
         env.update(
             {
                 "GIT_TERMINAL_PROMPT": "0",

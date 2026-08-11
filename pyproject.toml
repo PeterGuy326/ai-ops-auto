@@ -39,8 +39,8 @@ dependencies = [
     # 浏览器自动化（主流，微软官方维护）
     # 默认走 playwright + 本地 Chrome channel，足以覆盖知乎/头条/公众号
     "playwright>=1.45",
-    # Markdown → HTML，用于编辑器粘贴注入（Draft.js / ProseMirror）
-    "markdown>=3.6",
+    # Markdown → HTML；知乎 v1 exact renderer 的审批摘要绑定该精确版本。
+    "markdown==3.10.3",
     # 图片反指纹处理（asset_processor：EXIF/微裁剪/微旋转/调色）
     "Pillow>=10",
     # FastAPI Jinja2Templates 渲染 /ui/* 页面（api/main.py 直接 import）
@@ -70,7 +70,7 @@ dev = [
 ]
 
 [project.scripts]
-ai-ops = "ai_ops.cli:app"
+ai-ops = "ai_ops.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/PeterGuy326/ai-ops-auto"

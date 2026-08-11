@@ -1,4 +1,5 @@
 """Metrics must follow the adapter that actually performed the publish."""
+
 from __future__ import annotations
 
 import asyncio
@@ -60,9 +61,7 @@ def _seed_job(SessionLocal, *, publisher_kind: str, status: JobStatus) -> int:
             body="clean body",
             content_type=ContentType.LONG_ARTICLE,
             status=(
-                ArticleStatus.SCHEDULED
-                if status == JobStatus.PENDING
-                else ArticleStatus.PUBLISHED
+                ArticleStatus.SCHEDULED if status == JobStatus.PENDING else ArticleStatus.PUBLISHED
             ),
             extra={},
         )
@@ -78,9 +77,7 @@ def _seed_job(SessionLocal, *, publisher_kind: str, status: JobStatus) -> int:
             max_attempts=3,
             platform_post_id=None if status == JobStatus.PENDING else "7788",
             platform_url=(
-                None
-                if status == JobStatus.PENDING
-                else "https://zhuanlan.zhihu.com/p/7788"
+                None if status == JobStatus.PENDING else "https://zhuanlan.zhihu.com/p/7788"
             ),
             finished_at=None if status == JobStatus.PENDING else datetime.utcnow(),
         )
@@ -168,14 +165,20 @@ def test_enabled_zhihu_cli_registry_routes_only_browser_metrics(monkeypatch):
         PublisherKind.ZHIHU_CLI,
         PublisherKind.SOCIAL_AUTO_UPLOAD,
     ]
-    assert registry.resolve_collector(
-        Platform.ZHIHU,
-        PublisherKind.ZHIHU_CLI.value,
-    ) is None
-    assert registry.resolve_collector(
-        Platform.ZHIHU,
-        PublisherKind.SOCIAL_AUTO_UPLOAD.value,
-    ).kind == PublisherKind.SOCIAL_AUTO_UPLOAD
+    assert (
+        registry.resolve_collector(
+            Platform.ZHIHU,
+            PublisherKind.ZHIHU_CLI.value,
+        )
+        is None
+    )
+    assert (
+        registry.resolve_collector(
+            Platform.ZHIHU,
+            PublisherKind.SOCIAL_AUTO_UPLOAD.value,
+        ).kind
+        == PublisherKind.SOCIAL_AUTO_UPLOAD
+    )
     # Legacy rows with no kind skip the unsupported CLI and choose only the
     # explicitly capable Playwright collector.
     assert registry.resolve_collector(Platform.ZHIHU).kind == PublisherKind.SOCIAL_AUTO_UPLOAD
@@ -249,7 +252,11 @@ def test_actual_fallback_kind_is_persisted_and_drives_collector(
     )
     monkeypatch.setattr(worker_mod, "mark_published", lambda *args: None)
     monkeypatch.setattr(worker_mod, "is_paused", lambda *args: False)
-    monkeypatch.setattr(worker_mod, "_pre_publish_check", lambda *args: (True, None))
+    monkeypatch.setattr(
+        worker_mod,
+        "_pre_publish_check",
+        lambda *args, **kwargs: (True, None),
+    )
     monkeypatch.setattr(metrics_mod, "schedule_after_publish", lambda *args: [])
 
     import ai_ops.notify as notify_mod

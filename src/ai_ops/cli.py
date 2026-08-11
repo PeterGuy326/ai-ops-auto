@@ -1,15 +1,26 @@
 """命令行入口 — typer 驱动。"""
+
 from __future__ import annotations
 
 import json
+import ipaddress
 from pathlib import Path
 
+from pydantic import ValidationError
+from pydantic_settings import SettingsError
 import typer
 
+from .agent_contract.cli_commands import agent_app
 from .jobhunt.cli_commands import jobhunt_app
 from .reports.cli_commands import report_app
 
-app = typer.Typer(help="ai-ops-auto CLI")
+app = typer.Typer(
+    help="ai-ops-auto CLI",
+    # A command bug must never make Rich render Settings internals and their
+    # credential-bearing local variables. Configuration errors also have a
+    # dedicated redacted process boundary in :func:`main` below.
+    pretty_exceptions_show_locals=False,
+)
 _DEMO_VERSION = "offline-demo-v1"
 
 
@@ -26,6 +37,15 @@ class _LazySettings:
 # CLI remains safe when configuration is invalid, which lets doctor report a
 # structured, redacted error instead of failing before Typer starts.
 settings = _LazySettings()
+
+
+def _is_loopback_bind_host(value: str) -> bool:
+    if value.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
 
 
 def _init_db():
@@ -78,7 +98,7 @@ def cmd_doctor(
     except Exception as exc:
         # Doctor itself is a trust boundary: never echo arbitrary exception text,
         # because database drivers may include a credential-bearing endpoint.
-        invalid_config = type(exc).__name__ == "ValidationError"
+        invalid_config = type(exc).__name__ in {"ValidationError", "SettingsError"}
         code = "invalid_configuration" if invalid_config else "doctor_failed"
         message = (
             "配置校验失败；请检查环境变量和 .env"
@@ -189,9 +209,18 @@ def cmd_serve(
     """启动控制面 API（后台调度请另跑 ``ai-ops worker``）。"""
     import uvicorn
 
+    from .api.auth import api_key_dev_mode
+
+    effective_host = host or settings.api_host
+    if api_key_dev_mode() and not _is_loopback_bind_host(effective_host):
+        typer.echo(
+            "ERROR: LEGACY_DEV_AUTH_BYPASS may only bind to a loopback host",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     uvicorn.run(
         "ai_ops.api.main:app",
-        host=host or settings.api_host,
+        host=effective_host,
         port=port or settings.api_port,
         log_level=log_level or settings.api_log_level,
         reload=False,
@@ -241,6 +270,22 @@ def cmd_gen_fernet_key():
     typer.echo(Fernet.generate_key().decode())
 
 
+@app.command("gen-principal-token")
+def cmd_gen_principal_token():
+    """生成一次性 Bearer token 及其 AGENT_PRINCIPALS SHA-256 verifier。"""
+    import hashlib
+    import secrets
+
+    token = "aop_" + secrets.token_urlsafe(32)
+    _echo_json(
+        {
+            "schema_version": 1,
+            "token": token,
+            "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        }
+    )
+
+
 @app.command("zhihu-login")
 def cmd_zhihu_login(account_id: int = typer.Argument(..., min=1)):
     """为一个知乎账号建立隔离的 CLI 扫码登录态。"""
@@ -261,14 +306,24 @@ def cmd_zhihu_login(account_id: int = typer.Argument(..., min=1)):
             raise typer.Exit(code=1)
 
     publisher = ZhihuCliPublisher()
-    typer.echo(
-        "将启动第三方 zhihu-cli 的二维码登录；cookie 只保存在该 account_id 的隔离目录。"
-    )
+    typer.echo("将启动第三方 zhihu-cli 的二维码登录；cookie 只保存在该 account_id 的隔离目录。")
     ok = asyncio.run(publisher.login_interactive(account_id))
     if not ok:
         typer.echo(f"ERROR: {publisher.last_login_error or '知乎 CLI 登录失败'}", err=True)
         raise typer.Exit(code=1)
     typer.echo(f"OK: account {account_id} 的知乎 CLI 登录态已在线验证")
+    if publisher.last_external_account_id is None:
+        typer.echo(
+            "WARNING: whoami 未返回稳定 id；该账号暂不能用于 Agent exact 发布。",
+            err=True,
+        )
+        return
+    typer.echo(f"知乎稳定账号标识: {publisher.last_external_account_id}")
+    typer.echo(
+        "请通过 PATCH /accounts/"
+        f'{account_id} 提交 {{"external_account_id":"{publisher.last_external_account_id}"}}；'
+        "服务会将其保存到 Account.profile，本命令不会自动修改数据库。"
+    )
 
 
 # 数据回流自动出报子组：`python -m ai_ops.cli report daily/weekly`
@@ -277,6 +332,22 @@ app.add_typer(report_app, name="report")
 # 求职投递专题：`python -m ai_ops.cli jobhunt parse-resume ...`
 app.add_typer(jobhunt_app, name="jobhunt")
 
+# Agent-native HTTP 契约：只访问控制面，不直连数据库。
+app.add_typer(agent_app, name="agent")
+
+
+def main() -> None:
+    """Console boundary that redacts configuration validation failures."""
+
+    try:
+        app()
+    except (ValidationError, SettingsError):
+        typer.echo(
+            "ERROR: configuration validation failed; secret values were not logged",
+            err=True,
+        )
+        raise SystemExit(1) from None
+
 
 if __name__ == "__main__":
-    app()
+    main()

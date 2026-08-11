@@ -4,10 +4,11 @@ The cases focus on state transitions and conflict paths: duplicate claims,
 terminal-state rejection, retry boundaries, restart recovery, and Article fan-out
 aggregation.  Every publisher is an in-process fake; no platform is contacted.
 """
+
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -74,6 +75,8 @@ def _create_article_and_jobs(
     attempts: int = 0,
     max_attempts: int = 3,
     scheduled_at: datetime | None = None,
+    plan_id: int | None = None,
+    approved_planned_for: datetime | None = None,
 ) -> tuple[int, list[int]]:
     with SessionLocal() as session:
         topic = Topic(
@@ -116,6 +119,8 @@ def _create_article_and_jobs(
                 publisher_kind="fake",
                 attempts=attempts,
                 max_attempts=max_attempts,
+                plan_id=plan_id,
+                approved_planned_for=approved_planned_for,
                 scheduled_at=scheduled_at,
                 raw_response={},
             )
@@ -124,6 +129,103 @@ def _create_article_and_jobs(
             job_ids.append(job.id)
         session.commit()
         return article.id, job_ids
+
+
+def test_manual_execute_cannot_run_exact_job_before_approved_time(
+    runtime_db,
+    monkeypatch,
+):
+    approved_time = datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=1)
+    _, (job_id,) = _create_article_and_jobs(
+        runtime_db,
+        plan_id=999,
+        approved_planned_for=approved_time,
+        scheduled_at=approved_time,
+    )
+    publisher_calls = 0
+
+    async def should_not_publish(*args, **kwargs):
+        nonlocal publisher_calls
+        publisher_calls += 1
+        return PublishResult(success=True)
+
+    monkeypatch.setattr(worker_mod, "_try_publishers", should_not_publish)
+    result = asyncio.run(worker_mod.execute_job(job_id))
+
+    assert result.success is False
+    assert "尚未到审批计划执行时间" in (result.error or "")
+    assert publisher_calls == 0
+    with runtime_db() as session:
+        job = session.get(PublishJob, job_id)
+        assert job.status == JobStatus.PENDING
+        assert job.attempts == 0
+        assert job.started_at is None
+
+
+def test_due_scanner_cannot_bypass_exact_approved_time_with_mutable_schedule(
+    runtime_db,
+):
+    now = datetime.now(UTC).replace(tzinfo=None)
+    _, (job_id,) = _create_article_and_jobs(
+        runtime_db,
+        plan_id=1000,
+        approved_planned_for=now + timedelta(hours=1),
+        scheduled_at=now - timedelta(minutes=1),
+    )
+
+    assert job_id not in runtime_mod.get_due_job_ids(now=now)
+    assert job_id in runtime_mod.get_due_job_ids(now=now + timedelta(hours=1))
+
+
+def test_exact_retry_moves_only_mutable_schedule(runtime_db, monkeypatch):
+    approved_time = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
+    _, (job_id,) = _create_article_and_jobs(
+        runtime_db,
+        statuses=(JobStatus.RUNNING,),
+        attempts=1,
+        plan_id=1002,
+        approved_planned_for=approved_time,
+        scheduled_at=approved_time,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "settings",
+        SimpleNamespace(job_retry_base_seconds=10),
+    )
+    finished_at = datetime.now(UTC).replace(tzinfo=None)
+
+    with runtime_db() as session:
+        job = session.get(PublishJob, job_id)
+        worker_mod._finish_failed_attempt(
+            session,
+            job,
+            "temporary exact failure",
+            now=finished_at,
+        )
+        session.commit()
+
+    with runtime_db() as session:
+        job = session.get(PublishJob, job_id)
+        assert job.status == JobStatus.RETRYING
+        assert job.approved_planned_for == approved_time
+        assert job.scheduled_at == finished_at + timedelta(seconds=10)
+
+
+def test_manual_execute_keeps_legacy_future_job_compatibility(runtime_db, monkeypatch):
+    _, (job_id,) = _create_article_and_jobs(
+        runtime_db,
+        scheduled_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=1),
+    )
+
+    async def succeed(*args, **kwargs):
+        return PublishResult(success=True, platform_post_id="manual-legacy")
+
+    monkeypatch.setattr(worker_mod, "_try_publishers", succeed)
+    result = asyncio.run(worker_mod.execute_job(job_id))
+
+    assert result.success is True
+    with runtime_db() as session:
+        assert session.get(PublishJob, job_id).status == JobStatus.SUCCESS
 
 
 def test_concurrent_execute_only_one_call_enters_publisher(runtime_db, monkeypatch):
@@ -228,9 +330,7 @@ def test_terminal_or_running_job_is_rejected(runtime_db, monkeypatch, status):
         assert job.attempts == 0
 
 
-def test_failure_sets_exponential_retry_schedule_and_scanner_recovers(
-    runtime_db, monkeypatch
-):
+def test_failure_sets_exponential_retry_schedule_and_scanner_recovers(runtime_db, monkeypatch):
     _, (job_id,) = _create_article_and_jobs(runtime_db)
     monkeypatch.setattr(
         worker_mod,
@@ -613,9 +713,7 @@ def test_cancelled_publish_preserves_cancellation_when_reconciliation_fails(
     asyncio.run(cancel_in_flight())
 
 
-def test_successful_platform_call_with_db_finalize_error_fails_closed(
-    runtime_db, monkeypatch
-):
+def test_successful_platform_call_with_db_finalize_error_fails_closed(runtime_db, monkeypatch):
     """A finalize error must fail closed without erasing a confirmed receipt."""
     _, (job_id,) = _create_article_and_jobs(runtime_db)
 
@@ -647,9 +745,7 @@ def test_successful_platform_call_with_db_finalize_error_fails_closed(
         assert job.raw_response["reconciliation_required"] is True
 
 
-def test_stale_reconciliation_recovers_durable_confirmed_receipt(
-    runtime_db, tmp_path, monkeypatch
-):
+def test_stale_reconciliation_recovers_durable_confirmed_receipt(runtime_db, tmp_path, monkeypatch):
     """A process crash after journaling must retain the exact platform identity."""
     _, (job_id,) = _create_article_and_jobs(
         runtime_db,
@@ -720,9 +816,7 @@ def test_publish_timeout_is_terminal_unknown_outcome(runtime_db, monkeypatch):
         assert job.raw_response["outcome_uncertain"] is True
 
 
-def test_busy_account_operation_lease_retries_without_entering_publisher(
-    runtime_db, monkeypatch
-):
+def test_busy_account_operation_lease_retries_without_entering_publisher(runtime_db, monkeypatch):
     """Profile contention is a known no-write failure, never an unknown effect."""
     _, (job_id,) = _create_article_and_jobs(runtime_db, max_attempts=3)
 
@@ -914,9 +1008,7 @@ def test_worker_loop_stays_alive_when_auto_publish_disabled(runtime_db, monkeypa
 
     async def exercise_loop():
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            runtime_mod.run_worker_loop(poll_seconds=0.01, stop_event=stop)
-        )
+        task = asyncio.create_task(runtime_mod.run_worker_loop(poll_seconds=0.01, stop_event=stop))
         await asyncio.sleep(0.02)
         assert task.done() is False
         stop.set()

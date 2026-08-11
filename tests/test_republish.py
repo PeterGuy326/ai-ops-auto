@@ -11,9 +11,11 @@
 走的 session 套路：复用 tests/test_superseded_by.py 同款（SessionLocal.configure(bind=engine)
 + Base.metadata.create_all），不引入临时 sessionmaker，与生产路径同构。
 """
+
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -94,6 +96,8 @@ def _mk_job(
     max_attempts: int = 3,
     publisher_kind: str = "xhs_camoufox",
     platform: Platform = Platform.XIAOHONGSHU,
+    plan_id: int | None = None,
+    approved_planned_for: datetime | None = None,
 ) -> PublishJob:
     job = PublishJob(
         article_id=art_id,
@@ -103,10 +107,36 @@ def _mk_job(
         attempts=attempts,
         max_attempts=max_attempts,
         publisher_kind=publisher_kind,
+        plan_id=plan_id,
+        approved_planned_for=approved_planned_for,
     )
     s.add(job)
     s.flush()
     return job
+
+
+def test_republish_rejects_agent_contract_job_without_downgrading(
+    session_in_memory,
+) -> None:
+    SessionLocal = session_in_memory
+    with SessionLocal() as s:
+        _, art, acc = _mk_topic_article_account(s)
+        exact = _mk_job(
+            s,
+            art.id,
+            acc.id,
+            status=JobStatus.DEAD,
+            attempts=3,
+            plan_id=999,
+            approved_planned_for=datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=1),
+        )
+        s.commit()
+
+        with pytest.raises(ValueError, match="new publication plan"):
+            republish_job(s, exact.id, reason="manual", platform_checked=True)
+
+        assert exact.superseded_by_job_id is None
+        assert s.query(PublishJob).count() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +151,9 @@ def test_republish_creates_new_job_with_same_fields(session_in_memory) -> None:
     with SessionLocal() as s:
         _, art, acc = _mk_topic_article_account(s)
         v1 = _mk_job(
-            s, art.id, acc.id,
+            s,
+            art.id,
+            acc.id,
             status=JobStatus.DEAD,
             attempts=3,
             max_attempts=3,
@@ -323,9 +355,7 @@ def test_auto_republish_off_by_default() -> None:
     )
 
 
-def test_auto_republish_branch_not_triggered_when_off(
-    session_in_memory, monkeypatch
-) -> None:
+def test_auto_republish_branch_not_triggered_when_off(session_in_memory, monkeypatch) -> None:
     """execute_job 走完 attempts >= max_attempts → DEAD 时，常量 False → 不调 republish_job。
 
     路径：
@@ -342,7 +372,9 @@ def test_auto_republish_branch_not_triggered_when_off(
     with SessionLocal() as s:
         _, art, acc = _mk_topic_article_account(s)
         v1 = _mk_job(
-            s, art.id, acc.id,
+            s,
+            art.id,
+            acc.id,
             status=JobStatus.PENDING,
             attempts=2,
             max_attempts=3,
@@ -361,9 +393,11 @@ def test_auto_republish_branch_not_triggered_when_off(
     monkeypatch.setattr(worker_mod, "is_paused", lambda acc: False)
 
     from ai_ops.scheduler import metrics as metrics_mod
+
     monkeypatch.setattr(metrics_mod, "schedule_after_publish", lambda jid: [])
 
     import ai_ops.notify as notify_mod
+
     monkeypatch.setattr(notify_mod, "publish_success", lambda snap: None)
     monkeypatch.setattr(notify_mod, "publish_failed", lambda snap: None)
 
@@ -395,3 +429,66 @@ def test_auto_republish_branch_not_triggered_when_off(
         assert fresh.superseded_by_job_id is None, (
             "AUTO_REPUBLISH_ON_DEAD=False 时不应建 v2，故 superseded_by 应为 None"
         )
+
+
+def test_auto_republish_never_downgrades_agent_contract_job(
+    session_in_memory,
+    monkeypatch,
+) -> None:
+    """Even when legacy auto-republish is enabled, exact jobs require reapproval."""
+    from ai_ops.accounts.manager import RateCheckResult
+
+    SessionLocal = session_in_memory
+    with SessionLocal() as s:
+        _, art, acc = _mk_topic_article_account(s)
+        exact = _mk_job(
+            s,
+            art.id,
+            acc.id,
+            status=JobStatus.PENDING,
+            attempts=2,
+            max_attempts=3,
+            plan_id=1001,
+            approved_planned_for=datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=1),
+        )
+        s.commit()
+        exact_id = exact.id
+
+    monkeypatch.setattr(worker_mod, "get_credential", lambda s, aid: {"fake": "cred"})
+    monkeypatch.setattr(
+        worker_mod,
+        "check_rate_limit",
+        lambda s, aid, **kwargs: RateCheckResult(allowed=True, reason=""),
+    )
+    monkeypatch.setattr(worker_mod, "mark_published", lambda s, aid: None)
+    monkeypatch.setattr(worker_mod, "is_paused", lambda acc: False)
+    monkeypatch.setattr(
+        worker_mod,
+        "_build_verified_contract_content",
+        lambda s, job, account: worker_mod._build_content(s.get(Article, job.article_id)),
+    )
+
+    from ai_ops.scheduler import metrics as metrics_mod
+
+    monkeypatch.setattr(metrics_mod, "schedule_after_publish", lambda jid: [])
+    import ai_ops.notify as notify_mod
+
+    monkeypatch.setattr(notify_mod, "publish_success", lambda snap: None)
+    monkeypatch.setattr(notify_mod, "publish_failed", lambda snap: None)
+
+    async def fail(*args, **kwargs):
+        return PublishResult(success=False, error="forced exact failure")
+
+    monkeypatch.setattr(worker_mod, "_try_publishers", fail)
+    monkeypatch.setattr(worker_mod, "AUTO_REPUBLISH_ON_DEAD", True)
+
+    with patch.object(worker_mod, "republish_job") as mock_republish:
+        result = asyncio.run(execute_job(exact_id))
+
+    assert result.success is False
+    assert mock_republish.call_count == 0
+    with SessionLocal() as s:
+        exact = s.get(PublishJob, exact_id)
+        assert exact.status == JobStatus.DEAD
+        assert exact.superseded_by_job_id is None
+        assert s.query(PublishJob).count() == 1

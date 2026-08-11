@@ -5,17 +5,36 @@
 
 注意：发布器列表有优先级，fallback 自动切换。
 """
+
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+import os
 from pathlib import Path
-from typing import Any, Callable
+import stat
+import tempfile
+from typing import Any, Callable, Iterator
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 
+from ..agent_contract.bindings import account_binding_digest
+from ..agent_contract.assets import (
+    AssetVaultError,
+    VaultedAsset,
+    copy_verified_vaulted_asset,
+)
+from ..agent_contract.digest import canonical_sha256, plan_digest
+from ..agent_contract.schemas import PublicationTarget
+from ..agent_contract.snapshot import (
+    parse_stored_content_snapshot,
+    publish_content_from_snapshot,
+    stored_content_digest,
+    validate_stored_content_total,
+)
 from ..accounts.health_monitor import (
     BAN_PAUSE_HOURS,
     get_paused_until,
@@ -25,9 +44,10 @@ from ..accounts.health_monitor import (
 from ..accounts.manager import check_rate_limit, get_credential, mark_published, update_health
 from ..core.db import session_scope
 from ..core.dedup import is_too_similar
-from ..core.enums import AccountHealth, ArticleStatus, ContentType, JobStatus, Platform
-from ..core.models import Account, Article, Metrics, PublishJob
-from ..core.schemas import PublishContent, PublishResult
+from ..core.enums import AccountHealth, ArticleStatus, AssetType, ContentType, JobStatus, Platform
+from ..core.external_identity import normalize_zhihu_external_account_id
+from ..core.models import Account, Article, Metrics, PublicationPlan, PublishJob
+from ..core.schemas import ApprovedAssetExecution, PublishContent, PublishResult
 from ..core.time import as_utc_naive
 from ..config import settings
 from ..observability import get_logger
@@ -44,6 +64,7 @@ from ..runtime.account_lease import (
     AccountOperationLease,
     AccountOperationLeaseTimeout,
 )
+
 # parse_count 已沉到 core/parsers（TD-Z3-debt 闭环, 2026 Q2）：
 # 通用 UI 数字解析（"1.2万" / "3.5k" → int）是基础设施层，不该绑在 publisher 实现里。
 # 上 sprint 用 `from ..publishers.toutiao import _parse_count` 是反向依赖（L5 调 L4），
@@ -73,22 +94,22 @@ NONTERMINAL_JOB_STATUSES: frozenset[JobStatus] = frozenset(
     {JobStatus.PENDING, JobStatus.RUNNING, JobStatus.RETRYING}
 )
 
-INTERRUPTED_EXECUTION_ERROR = (
-    "发布执行被中断，平台结果未知；请先在平台核验，再手动重发"
-)
-TIMED_OUT_EXECUTION_ERROR = (
-    "发布执行超时，平台结果未知；请先在平台核验，再手动重发"
-)
-PERSISTENCE_EXECUTION_ERROR = (
-    "发布结果写库失败，平台结果未知；请先在平台核验，再手动重发"
-)
+INTERRUPTED_EXECUTION_ERROR = "发布执行被中断，平台结果未知；请先在平台核验，再手动重发"
+TIMED_OUT_EXECUTION_ERROR = "发布执行超时，平台结果未知；请先在平台核验，再手动重发"
+PERSISTENCE_EXECUTION_ERROR = "发布结果写库失败，平台结果未知；请先在平台核验，再手动重发"
 PERSISTENCE_CONFIRMED_EFFECT_ERROR = (
     "平台写入回执已确认，但控制面写库失败；已保留发布标识，请人工对账，禁止重发"
 )
-UNCONFIRMED_EXECUTION_ERROR = (
-    "发布器未能确认写入结果，平台结果未知；请先在平台核验，再手动重发"
-)
+UNCONFIRMED_EXECUTION_ERROR = "发布器未能确认写入结果，平台结果未知；请先在平台核验，再手动重发"
 PREWRITE_CANCELLED_ERROR = "发布尚未开始：等待账号操作锁时任务被取消"
+EXACT_ASSET_MATERIALIZATION_ERROR = (
+    "Agent contract approved assets failed secure execution materialization"
+)
+
+
+class ExactAssetMaterializationError(RuntimeError):
+    """Raised before a Publisher sees an unmaterialized approved asset."""
+
 
 # Carries the already-redacted adapter result across the final DB transaction.
 # ContextVar keeps concurrent async jobs isolated.  If commit/finalization
@@ -137,9 +158,7 @@ def _report_worker_exception(
     **details,
 ) -> None:
     reporter = (
-        capture_exception
-        if execution_context is None
-        else execution_context.report_exception
+        capture_exception if execution_context is None else execution_context.report_exception
     )
     try:
         reporter(exc, **details)
@@ -165,9 +184,7 @@ def _claim_job(session, job_id: int, *, now: datetime) -> PublishJob | None:
     both SQLite and PostgreSQL and ensures concurrent callbacks/scanners cannot
     both enter the external publisher.
     """
-    account_id = session.scalar(
-        select(PublishJob.account_id).where(PublishJob.id == job_id)
-    )
+    account_id = session.scalar(select(PublishJob.account_id).where(PublishJob.id == job_id))
     if account_id is None:
         return None
 
@@ -175,11 +192,7 @@ def _claim_job(session, job_id: int, *, now: datetime) -> PublishJob | None:
     # This closes the gap where two different jobs pass min-interval/quota checks
     # before either one records a successful publish. SQLite remains supported by
     # its single-writer behavior and the documented single-worker topology.
-    session.scalar(
-        select(Account.id)
-        .where(Account.id == account_id)
-        .with_for_update()
-    )
+    session.scalar(select(Account.id).where(Account.id == account_id).with_for_update())
     other_running = session.scalar(
         select(PublishJob.id)
         .where(PublishJob.account_id == account_id)
@@ -190,13 +203,26 @@ def _claim_job(session, job_id: int, *, now: datetime) -> PublishJob | None:
     if other_running is not None:
         return None
 
+    claim_time = as_utc_naive(now) or datetime.utcnow()
     claimed = session.execute(
         update(PublishJob)
         .where(PublishJob.id == job_id)
         .where(PublishJob.status.in_(CLAIMABLE_JOB_STATUSES))
+        # Manual and legacy HTTP execution calls reach this same CAS. Exact
+        # jobs cannot bypass their human-approved not-before timestamp, and a
+        # missing immutable timestamp fails closed.
+        .where(
+            or_(
+                PublishJob.plan_id.is_(None),
+                and_(
+                    PublishJob.approved_planned_for.is_not(None),
+                    PublishJob.approved_planned_for <= claim_time,
+                ),
+            )
+        )
         .values(
             status=JobStatus.RUNNING,
-            started_at=now,
+            started_at=claim_time,
             finished_at=None,
             attempts=PublishJob.attempts + 1,
         )
@@ -267,9 +293,7 @@ def _finish_failed_attempt(
     job.finished_at = finished_at
     if retryable and job.attempts < job.max_attempts:
         job.status = JobStatus.RETRYING
-        job.scheduled_at = finished_at + timedelta(
-            seconds=_retry_delay_seconds(job.attempts)
-        )
+        job.scheduled_at = finished_at + timedelta(seconds=_retry_delay_seconds(job.attempts))
     elif retryable:
         job.status = JobStatus.DEAD
         job.scheduled_at = None
@@ -388,8 +412,7 @@ def mark_running_job_uncertain(
         ]
         if started_before is not None:
             conditions.append(
-                (PublishJob.started_at.is_(None))
-                | (PublishJob.started_at <= started_before)
+                (PublishJob.started_at.is_(None)) | (PublishJob.started_at <= started_before)
             )
         updated = session.execute(
             update(PublishJob)
@@ -564,11 +587,23 @@ async def _execute_job_once(
         if existing is None:
             return PublishResult(success=False, error=f"job {job_id} 不存在")
 
-        job = _claim_job(s, job_id, now=datetime.utcnow())
+        claim_time = datetime.utcnow()
+        job = _claim_job(s, job_id, now=claim_time)
         if job is None:
             # Another worker already claimed it, or it is terminal.  This path
             # never reaches credential loading/the external publisher.
             s.refresh(existing)
+            approved_not_before = as_utc_naive(existing.approved_planned_for)
+            if (
+                existing.status in CLAIMABLE_JOB_STATUSES
+                and existing.plan_id is not None
+                and (approved_not_before is None or claim_time < approved_not_before)
+            ):
+                return PublishResult(
+                    success=False,
+                    retryable=False,
+                    error=f"job {job_id} 尚未到审批计划执行时间，或审批时间绑定缺失",
+                )
             return PublishResult(
                 success=False,
                 error=f"job {job_id} 当前状态 {existing.status}，不可执行",
@@ -586,9 +621,7 @@ async def _execute_job_once(
 
         # 风控限流校验（养号期 + 间隔 + 单日上限）
         rate_limit_checker = (
-            check_rate_limit
-            if execution_context is None
-            else execution_context.rate_limit_checker
+            check_rate_limit if execution_context is None else execution_context.rate_limit_checker
         )
         gate = rate_limit_checker(s, job.account_id, exclude_job_id=job.id)
         if not gate.allowed:
@@ -631,15 +664,36 @@ async def _execute_job_once(
             _finish_failed_attempt(s, job, error, retryable=False)
             return PublishResult(success=False, retryable=False, error=error)
 
+        contract_content: PublishContent | None = None
+        if job.plan_id is not None:
+            try:
+                contract_content = _build_verified_contract_content(s, job, account)
+            except Exception as exc:
+                # Never reflect snapshot, filesystem, account profile, or
+                # credential-binding details into the public job error.
+                logger.warning(
+                    "worker.contract_snapshot_rejected",
+                    extra={"job_id": job.id, "error_type": type(exc).__name__},
+                )
+                error = "Agent contract approval snapshot failed verification"
+                _finish_failed_attempt(s, job, error, retryable=False)
+                return PublishResult(success=False, retryable=False, error=error)
+
         # 内容层前置兜底：TAINT 词 + simhash 查重。
         # 任何一个命中即 fail-fast，不再消耗下游的解密 / 浏览器开销。
         if execution_context is None:
-            ok, pre_err = _pre_publish_check(s, job, article)
+            ok, pre_err = _pre_publish_check(
+                s,
+                job,
+                article,
+                body_override=(contract_content.body if contract_content else None),
+            )
         else:
             ok, pre_err = _pre_publish_check(
                 s,
                 job,
                 article,
+                body_override=(contract_content.body if contract_content else None),
                 similarity_checker=execution_context.similarity_checker,
                 exception_reporter=execution_context.report_exception,
             )
@@ -676,7 +730,7 @@ async def _execute_job_once(
             }
         )
         job.raw_response = claim_response
-        content = _build_content(article)
+        content = contract_content or _build_content(article)
         content.job_id = job.id
         content.operation_id = operation_id
 
@@ -686,9 +740,11 @@ async def _execute_job_once(
             platform == Platform.XIAOHONGSHU
             and content.content_type == ContentType.IMAGE_TEXT
             and content.images
+            and job.plan_id is None
         ):
             try:
                 from ..content.asset_processor import process_images
+
                 content.images = process_images(content.images, job.account_id)
             except Exception as e:
                 # 处理失败不阻断发布，沿用原图——但事故必须可观测，不能闷声
@@ -733,14 +789,19 @@ async def _execute_job_once(
         async with lease:
             write_lease_acquired = True
             if execution_context is None:
-                publish_call = _try_publishers(platform, account_id, credential, content)
+                publish_call = _try_publishers_with_materialized_assets(
+                    platform,
+                    account_id,
+                    credential,
+                    content,
+                )
                 if timeout_seconds > 0:
                     result = await asyncio.wait_for(publish_call, timeout=timeout_seconds)
                 else:
                     result = await publish_call
             else:
                 with receipt_data_dir_scope(execution_context.receipt_data_dir):
-                    publish_call = _try_publishers(
+                    publish_call = _try_publishers_with_materialized_assets(
                         platform,
                         account_id,
                         credential,
@@ -783,6 +844,15 @@ async def _execute_job_once(
             extra={"job_id": job_id, "marked_failed": marked},
         )
         raise
+    except ExactAssetMaterializationError:
+        result = PublishResult(
+            success=False,
+            effect_applied=False,
+            retryable=False,
+            outcome_uncertain=False,
+            error=EXACT_ASSET_MATERIALIZATION_ERROR,
+            raw_response={"write_started": False, "asset_materialization_failed": True},
+        )
     except AccountOperationLeaseTimeout:
         result = PublishResult(
             success=False,
@@ -852,10 +922,7 @@ async def _execute_job_once(
         # chain. Persist that execution fact (not the originally planned/first
         # registry entry) so metrics route back to the same implementation.
         actual_publisher_kind = (result.raw_response or {}).get("publisher_kind")
-        if (
-            isinstance(actual_publisher_kind, str)
-            and 0 < len(actual_publisher_kind) <= 64
-        ):
+        if isinstance(actual_publisher_kind, str) and 0 < len(actual_publisher_kind) <= 64:
             job.publisher_kind = actual_publisher_kind
         if result.success:
             job.status = JobStatus.SUCCESS
@@ -944,9 +1011,7 @@ async def _execute_job_once(
                 failure_error,
                 now=finished_at,
                 retryable=(
-                    result.retryable
-                    and not execution_uncertain
-                    and not result.outcome_uncertain
+                    result.retryable and not execution_uncertain and not result.outcome_uncertain
                 ),
             )
             if job.status == JobStatus.DEAD:
@@ -954,8 +1019,15 @@ async def _execute_job_once(
                 # 默认关（AUTO_REPUBLISH_ON_DEAD=False）——避免 publisher 真挂时无限建 v2 → v3 → ...
                 # 风暴。本钩子仅"建 v2 + 标 v1 superseded"，**不真触发 v2 执行**：
                 # 让 scheduler.queue 按既有节奏拉起，复用风控 / 限流 / dedup 全套兜底。
-                # 异常吞 + capture：自动重发是辅助通道，挂了不能拖累 job 状态本身的落库。
-                if AUTO_REPUBLISH_ON_DEAD:
+                # Exact contract job 必须新建 plan 并重新独立审批，绝不降级成
+                # planless legacy v2。异常吞 + capture：自动重发是辅助通道，挂了
+                # 不能拖累 job 状态本身的落库。
+                if AUTO_REPUBLISH_ON_DEAD and job.plan_id is not None:
+                    logger.info(
+                        "worker.auto_republish: exact job requires a new approved plan",
+                        extra={"job_id": job.id, "plan_id": job.plan_id},
+                    )
+                elif AUTO_REPUBLISH_ON_DEAD:
                     try:
                         v2 = republish_job(s, job.id, reason="auto_retry_exhausted")
                         logger.info(
@@ -1028,6 +1100,312 @@ async def _execute_job_once(
     return result
 
 
+def _validated_exact_asset_manifest(
+    content: PublishContent,
+) -> list[ApprovedAssetExecution]:
+    """Match the private approval manifest to every publisher-facing path."""
+
+    manifest = list(content.approved_assets)
+    supported_types = {AssetType.IMAGE, AssetType.VIDEO}
+    if any(asset.asset_type not in supported_types for asset in manifest):
+        raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+
+    image_assets = [asset for asset in manifest if asset.asset_type == AssetType.IMAGE]
+    video_assets = [asset for asset in manifest if asset.asset_type == AssetType.VIDEO]
+    if [asset.storage_path for asset in image_assets] != list(content.images):
+        raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+    if [asset.storage_path for asset in video_assets] != list(content.videos):
+        raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+    if len(manifest) != len(content.images) + len(content.videos):
+        raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+
+    for asset in manifest:
+        try:
+            filename = Path(asset.storage_path).name
+        except (OSError, TypeError, ValueError):
+            raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR) from None
+        if filename != f"{asset.sha256}{asset.storage_suffix}":
+            raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+    return manifest
+
+
+def _copy_verified_asset_to_execution_file(
+    asset: ApprovedAssetExecution,
+    *,
+    directory_fd: int,
+    destination_name: str,
+) -> None:
+    """Copy one approved inode through the same FD that was securely verified."""
+
+    destination_fd: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        destination_fd = os.open(destination_name, flags, 0o400, dir_fd=directory_fd)
+        copied = copy_verified_vaulted_asset(
+            VaultedAsset(
+                sha256=asset.sha256,
+                size_bytes=asset.size_bytes,
+                vault_path=Path(asset.storage_path),
+            ),
+            destination_fd=destination_fd,
+            vault_root=settings.agent_asset_vault_root,
+            max_bytes=settings.agent_asset_max_bytes,
+        )
+        if copied.sha256 != asset.sha256 or copied.size_bytes != asset.size_bytes:
+            raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+
+        os.fsync(destination_fd)
+        os.fchmod(destination_fd, 0o400)
+        destination_stat = os.fstat(destination_fd)
+        if (
+            not stat.S_ISREG(destination_stat.st_mode)
+            or destination_stat.st_size != copied.size_bytes
+            or destination_stat.st_mode & 0o222
+        ):
+            raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+        visible_stat = os.stat(destination_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (visible_stat.st_dev, visible_stat.st_ino) != (
+            destination_stat.st_dev,
+            destination_stat.st_ino,
+        ):
+            raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+    finally:
+        if destination_fd is not None:
+            try:
+                os.close(destination_fd)
+            except OSError:
+                pass
+
+
+def _cleanup_exact_asset_temporary_directory(
+    temporary: tempfile.TemporaryDirectory[str],
+) -> None:
+    try:
+        temporary.cleanup()
+    except OSError:
+        # Cleanup must not replace a path-free pre-write rejection or erase a
+        # known external result after the Publisher returned.
+        logger.exception("worker exact asset execution directory cleanup failed")
+
+
+@contextmanager
+def _materialized_exact_assets(content: PublishContent) -> Iterator[PublishContent]:
+    """Yield immutable private execution copies for an exact-contract publish.
+
+    Legacy jobs are returned unchanged. Exact jobs first match every path to the
+    approved digest/size/suffix manifest, then securely open and hash the vault
+    inode. The already-open, rewound FD is copied into a new 0700 directory
+    below the configured vault so audited adapters retain their controlled-root
+    boundary. Each destination is created with O_EXCL and changed to 0400.
+    """
+
+    if not content.exact_approval:
+        yield content
+        return
+
+    manifest = _validated_exact_asset_manifest(content)
+    if not manifest:
+        yield content
+        return
+
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    vault_root_fd: int | None = None
+    directory_fd: int | None = None
+    try:
+        configured_root = Path(settings.agent_asset_vault_root).expanduser()
+        if not hasattr(os, "getuid"):
+            raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+        root_lexical_stat = os.lstat(configured_root)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        vault_root_fd = os.open(configured_root, directory_flags)
+        root_opened_stat = os.fstat(vault_root_fd)
+        vault_root = configured_root.resolve(strict=True)
+        root_resolved_stat = os.stat(vault_root, follow_symlinks=False)
+        root_identity = (root_opened_stat.st_dev, root_opened_stat.st_ino)
+        if (
+            not stat.S_ISDIR(root_lexical_stat.st_mode)
+            or stat.S_ISLNK(root_lexical_stat.st_mode)
+            or not stat.S_ISDIR(root_opened_stat.st_mode)
+            or not stat.S_ISDIR(root_resolved_stat.st_mode)
+            or (root_lexical_stat.st_dev, root_lexical_stat.st_ino) != root_identity
+            or (root_resolved_stat.st_dev, root_resolved_stat.st_ino) != root_identity
+            or stat.S_IMODE(root_opened_stat.st_mode) != 0o700
+            or root_opened_stat.st_uid != os.getuid()
+        ):
+            raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+
+        temporary = tempfile.TemporaryDirectory(prefix=".agent-execution-", dir=vault_root)
+        execution_directory = Path(temporary.name)
+        os.chmod(execution_directory, 0o700)
+        lexical_stat = os.lstat(execution_directory)
+        directory_fd = os.open(execution_directory, directory_flags)
+        opened_stat = os.fstat(directory_fd)
+        opened_parent_stat = os.stat("..", dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(lexical_stat.st_mode)
+            or stat.S_ISLNK(lexical_stat.st_mode)
+            or not stat.S_ISDIR(opened_stat.st_mode)
+            or (lexical_stat.st_dev, lexical_stat.st_ino)
+            != (opened_stat.st_dev, opened_stat.st_ino)
+            or (opened_parent_stat.st_dev, opened_parent_stat.st_ino) != root_identity
+            or stat.S_IMODE(opened_stat.st_mode) != 0o700
+            or opened_stat.st_uid != os.getuid()
+        ):
+            raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR)
+
+        materialized: list[tuple[ApprovedAssetExecution, str]] = []
+        for ordinal, asset in enumerate(manifest):
+            destination_name = f"{asset.asset_type.value}-{ordinal:03d}{asset.storage_suffix}"
+            _copy_verified_asset_to_execution_file(
+                asset,
+                directory_fd=directory_fd,
+                destination_name=destination_name,
+            )
+            materialized.append((asset, str(execution_directory / destination_name)))
+        os.fsync(directory_fd)
+        execution_content = content.model_copy(
+            update={
+                "images": [
+                    path for asset, path in materialized if asset.asset_type == AssetType.IMAGE
+                ],
+                "videos": [
+                    path for asset, path in materialized if asset.asset_type == AssetType.VIDEO
+                ],
+                # The manifest has served its scheduler-only purpose. Do not
+                # expose the original vault paths to the external adapter.
+                "approved_assets": [],
+            }
+        )
+    except ExactAssetMaterializationError:
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+            directory_fd = None
+        if vault_root_fd is not None:
+            try:
+                os.close(vault_root_fd)
+            except OSError:
+                pass
+            vault_root_fd = None
+        if temporary is not None:
+            _cleanup_exact_asset_temporary_directory(temporary)
+        raise
+    except (AssetVaultError, OSError, RuntimeError, TypeError, ValueError):
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+            directory_fd = None
+        if vault_root_fd is not None:
+            try:
+                os.close(vault_root_fd)
+            except OSError:
+                pass
+            vault_root_fd = None
+        if temporary is not None:
+            _cleanup_exact_asset_temporary_directory(temporary)
+        raise ExactAssetMaterializationError(EXACT_ASSET_MATERIALIZATION_ERROR) from None
+
+    assert temporary is not None
+    try:
+        yield execution_content
+    finally:
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+        if vault_root_fd is not None:
+            try:
+                os.close(vault_root_fd)
+            except OSError:
+                pass
+        _cleanup_exact_asset_temporary_directory(temporary)
+
+
+async def _try_publishers_with_materialized_assets(
+    platform: Platform,
+    account_id: int,
+    credential: dict,
+    content: PublishContent,
+    *,
+    registry: PublisherRegistry | None = None,
+    receipt_writer: Callable[..., object] | None = None,
+) -> PublishResult:
+    """Materialize approved assets off-loop, retaining them through Publisher exit."""
+
+    async def publish(execution_content: PublishContent) -> PublishResult:
+        if registry is None and receipt_writer is None:
+            # Keep the production call shape compatible with injected legacy
+            # worker tests and operators that replace this internal boundary.
+            return await _try_publishers(
+                platform,
+                account_id,
+                credential,
+                execution_content,
+            )
+        return await _try_publishers(
+            platform,
+            account_id,
+            credential,
+            execution_content,
+            registry=registry,
+            receipt_writer=receipt_writer,
+        )
+
+    if not content.exact_approval:
+        return await publish(content)
+
+    materialization = _materialized_exact_assets(content)
+    enter_task = asyncio.create_task(asyncio.to_thread(materialization.__enter__))
+    execution_content, enter_cancellation = await _await_shielded_task_completion(enter_task)
+    if enter_cancellation is not None:
+        try:
+            await _exit_materialized_exact_assets(materialization)
+        finally:
+            raise enter_cancellation
+
+    try:
+        return await publish(execution_content)
+    finally:
+        await _exit_materialized_exact_assets(materialization)
+
+
+async def _await_shielded_task_completion(
+    task: asyncio.Task[Any],
+) -> tuple[Any, asyncio.CancelledError | None]:
+    """Wait for a non-cancellable thread task while remembering caller cancellation."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return await asyncio.shield(task), cancellation
+        except asyncio.CancelledError as exc:
+            if task.done() and task.cancelled():
+                if cancellation is not None:
+                    raise cancellation
+                raise
+            cancellation = cancellation or exc
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation
+            raise
+
+
+async def _exit_materialized_exact_assets(materialization: Any) -> None:
+    cleanup_task = asyncio.create_task(
+        asyncio.to_thread(materialization.__exit__, None, None, None)
+    )
+    _, cleanup_cancellation = await _await_shielded_task_completion(cleanup_task)
+    if cleanup_cancellation is not None:
+        raise cleanup_cancellation
+
+
 async def _try_publishers(
     platform: Platform,
     account_id: int,
@@ -1042,6 +1420,42 @@ async def _try_publishers(
     publishers = active_registry.resolve(platform)
     if not publishers:
         return PublishResult(success=False, error=f"未注册 {platform} 的 Publisher")
+
+    if content.exact_approval:
+        required_kind = content.approved_publisher_kind
+        expected_payload_digest = content.approved_renderer_payload_digest
+        if not required_kind or not expected_payload_digest:
+            return PublishResult(
+                success=False,
+                retryable=False,
+                error="Agent contract job is missing its approved renderer binding",
+            )
+        publishers = [
+            publisher
+            for publisher in publishers
+            if getattr(publisher.kind, "value", str(publisher.kind)) == required_kind
+        ]
+        if len(publishers) != 1:
+            return PublishResult(
+                success=False,
+                retryable=False,
+                error="Approved Agent renderer is unavailable or ambiguous",
+            )
+        try:
+            material = publishers[0].agent_contract_digest_material(content)
+            current_payload_digest = canonical_sha256(material)
+        except Exception:
+            return PublishResult(
+                success=False,
+                retryable=False,
+                error="Approved Agent renderer failed payload verification",
+            )
+        if current_payload_digest != expected_payload_digest:
+            return PublishResult(
+                success=False,
+                retryable=False,
+                error="Approved Agent renderer payload changed after planning",
+            )
 
     last: PublishResult | None = None
     for pub in publishers:
@@ -1068,9 +1482,7 @@ async def _try_publishers(
         publisher_kind = getattr(pub.kind, "value", str(pub.kind))
         raw_response["publisher_kind"] = publisher_kind
         result = result.model_copy(update={"raw_response": raw_response})
-        active_receipt_writer = (
-            write_publish_receipt if receipt_writer is None else receipt_writer
-        )
+        active_receipt_writer = write_publish_receipt if receipt_writer is None else receipt_writer
         try:
             active_receipt_writer(
                 job_id=content.job_id,
@@ -1100,12 +1512,15 @@ def _escalate_health_on_failure(session, account_id: int) -> None:
     from sqlalchemy import func, select
 
     window_start = datetime.utcnow() - timedelta(hours=24)
-    recent_dead = session.scalar(
-        select(func.count(PublishJob.id))
-        .where(PublishJob.account_id == account_id)
-        .where(PublishJob.status == JobStatus.DEAD)
-        .where(PublishJob.finished_at >= window_start)
-    ) or 0
+    recent_dead = (
+        session.scalar(
+            select(func.count(PublishJob.id))
+            .where(PublishJob.account_id == account_id)
+            .where(PublishJob.status == JobStatus.DEAD)
+            .where(PublishJob.finished_at >= window_start)
+        )
+        or 0
+    )
 
     if recent_dead >= 3:
         pause_account(
@@ -1133,11 +1548,105 @@ def _build_content(article: Article) -> PublishContent:
     )
 
 
+def _build_verified_contract_content(
+    session,
+    job: PublishJob,
+    account: Account,
+) -> PublishContent:
+    """Load one exact approved payload and fail closed on every drift vector."""
+
+    plan = session.get(PublicationPlan, job.plan_id)
+    if (
+        plan is None
+        or plan.state != "scheduled"
+        or plan.article_id != job.article_id
+        or as_utc_naive(job.approved_planned_for) != as_utc_naive(plan.planned_for)
+    ):
+        raise ValueError("contract plan is not executable")
+
+    snapshot = parse_stored_content_snapshot(plan.content_snapshot)
+    if snapshot.content_id != plan.article_id:
+        raise ValueError("contract content identity changed")
+    validate_stored_content_total(
+        snapshot,
+        max_total_bytes=settings.agent_asset_max_total_bytes,
+    )
+    if any(asset.size_bytes > settings.agent_asset_max_bytes for asset in snapshot.assets):
+        raise ValueError("contract asset metadata exceeds the per-file limit")
+    content_hash = stored_content_digest(snapshot)
+    if content_hash != plan.content_digest:
+        raise ValueError("contract content digest changed")
+
+    targets = [PublicationTarget.model_validate(value) for value in plan.targets]
+    if not targets:
+        raise ValueError("contract targets are missing")
+    recomputed_plan_digest = plan_digest(
+        content_digest=content_hash,
+        targets=targets,
+        planned_for=plan.planned_for,
+    )
+    if recomputed_plan_digest != plan.plan_digest:
+        raise ValueError("contract plan digest changed")
+
+    matching_targets = [target for target in targets if target.account_id == job.account_id]
+    if len(matching_targets) != 1:
+        raise ValueError("contract job target is not approved")
+    target = matching_targets[0]
+    if Platform(job.platform) != target.platform or Platform(account.platform) != target.platform:
+        raise ValueError("contract target platform changed")
+    if account_binding_digest(account) != target.account_binding_digest:
+        raise ValueError("contract target binding changed")
+    if target.approved_external_account_id is not None:
+        profile = account.profile
+        raw_external_account_id = (
+            profile.get("external_account_id") if isinstance(profile, dict) else None
+        )
+        try:
+            current_external_account_id = normalize_zhihu_external_account_id(
+                raw_external_account_id
+            )
+        except ValueError:
+            raise ValueError("contract target external identity is invalid") from None
+        if current_external_account_id != target.approved_external_account_id:
+            raise ValueError("contract target external identity changed")
+
+    matching_approvals = [
+        approval
+        for approval in plan.approval_requests
+        if approval.status == "approved" and approval.plan_digest == plan.plan_digest
+    ]
+    if len(matching_approvals) != 1:
+        raise ValueError("contract approval is missing")
+    approval = matching_approvals[0]
+    if (
+        approval.decided_by_type != "human"
+        or approval.decided_at is None
+        or approval.decided_by in {approval.requested_by, plan.created_by}
+    ):
+        raise ValueError("contract approval is not independent")
+    content = publish_content_from_snapshot(snapshot)
+    content.approved_publisher_kind = target.execution.renderer.publisher_kind.value
+    content.approved_renderer_payload_digest = target.execution.payload_digest
+    content.approved_external_account_id = target.approved_external_account_id
+    content.approved_assets = [
+        ApprovedAssetExecution(
+            asset_type=asset.asset_type,
+            storage_path=asset.storage_path,
+            sha256=asset.sha256,
+            size_bytes=asset.size_bytes,
+            storage_suffix=asset.storage_suffix,
+        )
+        for asset in snapshot.assets
+    ]
+    return content
+
+
 def _pre_publish_check(
     session,
     job: PublishJob,
     article: Article,
     *,
+    body_override: str | None = None,
     similarity_checker=None,
     exception_reporter=None,
 ) -> tuple[bool, str | None]:
@@ -1159,7 +1668,7 @@ def _pre_publish_check(
 
     职责单一：只判断"能不能发"，不动 job / article 任何字段——状态机由调用方处理。
     """
-    body = (article.body or "")
+    body = article.body or "" if body_override is None else body_override
 
     # TAINT 词 grep：命中第一个即返回，避免拼接所有命中浪费日志位
     for pattern in TAINT_PATTERNS:
@@ -1186,9 +1695,7 @@ def _pre_publish_check(
             "worker.simhash_check: swallowed",
             extra={"job_id": job.id, "account_id": job.account_id, "error": str(e)},
         )
-        active_reporter = (
-            capture_exception if exception_reporter is None else exception_reporter
-        )
+        active_reporter = capture_exception if exception_reporter is None else exception_reporter
         try:
             active_reporter(
                 e,
@@ -1415,7 +1922,9 @@ def republish_job(
         新建的 v2 PublishJob 实例（已 add 进 session 并 flush，id 已分配）
 
     Raises:
-        ValueError: 旧 job 不存在 / 状态不在白名单。调用方负责转译为 HTTP 400 等。
+        ValueError: 旧 job 不存在 / 状态不在白名单 / 属于 Agent contract。
+            Exact job 必须创建新 plan 并重新独立审批，不能降级为 planless v2。
+            调用方负责转译为 HTTP 400 等。
 
     数据契约（v2 vs v1）：
       - 复用：article_id / account_id / platform / publisher_kind / max_attempts
@@ -1427,10 +1936,14 @@ def republish_job(
     if old is None:
         raise ValueError(f"job {old_job_id} not found")
 
-    if old.status not in _REPUBLISHABLE_STATUSES:
+    if old.plan_id is not None:
         raise ValueError(
-            f"can only republish FAILED/DEAD jobs, got {old.status}"
+            "Agent contract jobs require a new publication plan and independent "
+            "approval before republishing"
         )
+
+    if old.status not in _REPUBLISHABLE_STATUSES:
+        raise ValueError(f"can only republish FAILED/DEAD jobs, got {old.status}")
     prior_result = old.raw_response or {}
     needs_platform_check = bool(
         prior_result.get("outcome_uncertain")
