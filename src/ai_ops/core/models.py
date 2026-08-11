@@ -8,6 +8,8 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
+    Index,
     Integer,
     String,
     Text,
@@ -22,6 +24,7 @@ from .enums import (
     AssetType,
     ContentType,
     JobStatus,
+    MetricsTaskStatus,
     Platform,
 )
 
@@ -366,6 +369,128 @@ class PublishJob(Base):
 
     article: Mapped["Article"] = relationship(back_populates="jobs")
     plan: Mapped[Optional["PublicationPlan"]] = relationship(back_populates="jobs")
+    metrics_collection_tasks: Mapped[list["MetricsCollectionTask"]] = relationship(
+        back_populates="job"
+    )
+
+
+class MetricsCollectionTask(Base):
+    """Durable ownership ledger for one scheduled metrics collection window."""
+
+    __tablename__ = "metrics_collection_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "interval_index",
+            name="uq_metrics_collection_tasks_job_interval",
+        ),
+        UniqueConstraint(
+            "job_id",
+            "window_seconds",
+            name="uq_metrics_collection_tasks_job_window",
+        ),
+        UniqueConstraint(
+            "id",
+            "job_id",
+            name="uq_metrics_collection_tasks_id_job",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'claimed', 'succeeded', 'failed')",
+            name="ck_metrics_collection_tasks_status",
+        ),
+        CheckConstraint(
+            "interval_index >= 0 AND window_seconds > 0 "
+            "AND collection_deadline_at > due_at "
+            "AND ((interval_index = 0 AND window_seconds = 3600) "
+            "OR (interval_index = 1 AND window_seconds = 86400) "
+            "OR (interval_index = 2 AND window_seconds = 604800))",
+            name="ck_metrics_collection_tasks_window",
+        ),
+        CheckConstraint(
+            "attempts >= 0 AND max_attempts >= 1 AND max_attempts <= 20 "
+            "AND attempts <= max_attempts",
+            name="ck_metrics_collection_tasks_attempts",
+        ),
+        CheckConstraint(
+            "((status = 'queued' AND next_attempt_at IS NOT NULL "
+            "AND next_attempt_at >= due_at AND next_attempt_at < collection_deadline_at "
+            "AND attempts < max_attempts AND lease_token IS NULL "
+            "AND lease_expires_at IS NULL AND finished_at IS NULL) OR "
+            "(status = 'claimed' AND next_attempt_at IS NULL "
+            "AND lease_token IS NOT NULL AND length(lease_token) = 64 "
+            "AND lease_expires_at IS NOT NULL AND finished_at IS NULL) OR "
+            "(status = 'succeeded' AND attempts > 0 AND next_attempt_at IS NULL "
+            "AND lease_token IS NULL AND lease_expires_at IS NULL "
+            "AND last_error IS NULL AND finished_at IS NOT NULL) OR "
+            "(status = 'failed' AND next_attempt_at IS NULL "
+            "AND lease_token IS NULL AND lease_expires_at IS NULL "
+            "AND last_error IS NOT NULL AND length(last_error) > 0 "
+            "AND finished_at IS NOT NULL))",
+            name="ck_metrics_collection_tasks_lifecycle",
+        ),
+        Index(
+            "ix_metrics_collection_tasks_due",
+            "status",
+            "next_attempt_at",
+            "id",
+        ),
+        Index(
+            "ix_metrics_collection_tasks_expired_lease",
+            "status",
+            "lease_expires_at",
+            "id",
+        ),
+        Index(
+            "ix_metrics_collection_tasks_deadline",
+            "status",
+            "collection_deadline_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("publish_jobs.id"), nullable=False)
+    interval_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    window_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    # ``due_at`` is immutable evidence of the intended post-publication window;
+    # retries move only ``next_attempt_at``.
+    due_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # A current snapshot collected weeks late is not historical 1h/24h/7d
+    # evidence. Overdue tasks terminate explicitly instead of relabeling data.
+    collection_deadline_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    status: Mapped[MetricsTaskStatus] = mapped_column(
+        String(32),
+        default=MetricsTaskStatus.QUEUED,
+        server_default=MetricsTaskStatus.QUEUED.value,
+        nullable=False,
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer,
+        default=5,
+        server_default="5",
+        nullable=False,
+    )
+    lease_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )
+
+    job: Mapped["PublishJob"] = relationship(back_populates="metrics_collection_tasks")
 
 
 class Metrics(Base):
@@ -374,6 +499,29 @@ class Metrics(Base):
         UniqueConstraint(
             "agent_operation_id",
             name="uq_metrics_agent_operation_id",
+        ),
+        UniqueConstraint(
+            "collection_task_id",
+            name="uq_metrics_collection_task_id",
+        ),
+        ForeignKeyConstraint(
+            ["collection_task_id", "job_id"],
+            ["metrics_collection_tasks.id", "metrics_collection_tasks.job_id"],
+            name="fk_metrics_collection_task_job",
+        ),
+        CheckConstraint(
+            "agent_operation_id IS NULL OR collection_task_id IS NULL",
+            name="ck_metrics_single_ledger_owner",
+        ),
+        CheckConstraint(
+            "collection_task_id IS NULL OR source = 'scheduled'",
+            name="ck_metrics_collection_task_source",
+        ),
+        Index(
+            "ix_metrics_job_collected_id",
+            "job_id",
+            "collected_at",
+            "id",
         ),
     )
 
@@ -384,6 +532,12 @@ class Metrics(Base):
     # this row rather than calling the external collector again.
     agent_operation_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("agent_operations.id"),
+        nullable=True,
+    )
+    # Scheduled collections bind one normalized snapshot to one durable task.
+    # The unique FK makes callback/scanner races and crash recovery replay the
+    # same evidence row instead of inserting duplicate windows.
+    collection_task_id: Mapped[Optional[int]] = mapped_column(
         nullable=True,
     )
     collected_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

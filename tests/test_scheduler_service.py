@@ -73,6 +73,9 @@ def test_worker_cli_explains_safe_mode(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "AUTO_PUBLISH_ENABLED=false" in result.output
+    assert "指标读取" in result.output
+    assert "外部平台" in result.output
+    assert "请停止 worker" in result.output
 
 
 def test_init_db_cli_never_prints_database_credentials(monkeypatch):

@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ai_ops.agent_contract import approval_content_digest, plan_digest
@@ -543,6 +543,176 @@ async def test_full_agent_control_plane_workflow_is_durable_and_redacted(control
     assert review.findings == []
     assert review.items[0].metrics == collected.metrics
     assert "adapter_secret" not in review.model_dump_json()
+
+
+def test_performance_review_selects_only_each_jobs_latest_in_window_snapshot(
+    control_plane,
+):
+    window_start = datetime(2031, 6, 1, 8, 0, tzinfo=UTC)
+    window_end = datetime(2031, 6, 1, 11, 0, tzinfo=UTC)
+
+    with control_plane.session_factory() as session:
+        articles = [
+            Article(
+                topic_id=control_plane.topic_id,
+                title=f"Performance article {index}",
+                body="bounded performance body",
+                content_type=ContentType.LONG_ARTICLE,
+                status=ArticleStatus.PUBLISHED,
+                target_platforms=[Platform.ZHIHU.value],
+                target_account_ids=[control_plane.account_id],
+                extra={},
+            )
+            for index in range(3)
+        ]
+        session.add_all(articles)
+        session.flush()
+        plans = [
+            PublicationPlan(
+                article_id=article.id,
+                state="scheduled",
+                content_digest=f"{index + 1:064x}",
+                plan_digest=f"{index + 101:064x}",
+                content_snapshot={"content_id": article.id},
+                targets=[],
+                planned_for=datetime(2031, 6, 1, 7, 0),
+                created_by="performance-test-agent",
+                created_by_type="agent",
+            )
+            for index, article in enumerate(articles)
+        ]
+        session.add_all(plans)
+        session.flush()
+        jobs = [
+            PublishJob(
+                article_id=article.id,
+                plan_id=plan.id,
+                account_id=control_plane.account_id,
+                platform=Platform.ZHIHU,
+                status=JobStatus.SUCCESS,
+                approved_planned_for=datetime(2031, 6, 1, 7, 0),
+            )
+            for article, plan in zip(articles, plans, strict=True)
+        ]
+        session.add_all(jobs)
+        session.flush()
+        requested_job_ids = [jobs[1].id, jobs[0].id]
+
+        snapshots = [
+            # Out-of-window rows, including one newer than every valid row,
+            # must not influence the latest-in-window selection.
+            Metrics(
+                job_id=jobs[0].id,
+                collected_at=datetime(2031, 6, 1, 7, 59, 59),
+                likes=900,
+                source="scheduled",
+            ),
+            Metrics(
+                job_id=jobs[0].id,
+                collected_at=datetime(2031, 6, 1, 9, 0),
+                likes=1,
+                source="scheduled",
+            ),
+            Metrics(
+                job_id=jobs[0].id,
+                collected_at=datetime(2031, 6, 1, 10, 0),
+                likes=11,
+                source="scheduled",
+            ),
+            Metrics(
+                job_id=jobs[0].id,
+                collected_at=datetime(2031, 6, 1, 10, 0),
+                likes=22,
+                comments=2,
+                shares=3,
+                views=220,
+                source="manual",
+            ),
+            Metrics(
+                job_id=jobs[0].id,
+                collected_at=datetime(2031, 6, 1, 11, 0),
+                likes=1_000,
+                source="scheduled",
+            ),
+            Metrics(
+                job_id=jobs[1].id,
+                collected_at=datetime(2031, 6, 1, 8, 30),
+                likes=2,
+                views=20,
+                source="scheduled",
+            ),
+            Metrics(
+                job_id=jobs[1].id,
+                collected_at=datetime(2031, 6, 1, 9, 30),
+                likes=3,
+                comments=4,
+                shares=5,
+                views=30,
+                source="scheduled",
+            ),
+            # A newer snapshot on another plan/job is outside the explicit
+            # review subject and must not affect totals or the review digest.
+            Metrics(
+                job_id=jobs[2].id,
+                collected_at=datetime(2031, 6, 1, 10, 30),
+                likes=9_999,
+                comments=9_999,
+                shares=9_999,
+                views=9_999,
+                source="scheduled",
+            ),
+        ]
+        session.add_all(snapshots)
+        session.commit()
+        expected_metric_ids = {snapshots[3].id, snapshots[6].id}
+
+    loaded_metric_ids: list[int] = []
+
+    def record_metric_load(metric: Metrics, _context: object) -> None:
+        loaded_metric_ids.append(metric.id)
+
+    event.listen(Metrics, "load", record_metric_load)
+    try:
+        review = control_plane.service.review_performance(
+            control_plane.agent,
+            PerformanceReviewRequest(
+                job_ids=requested_job_ids,
+                window_start=window_start,
+                window_end=window_end,
+            ),
+        )
+    finally:
+        event.remove(Metrics, "load", record_metric_load)
+
+    # The service hydrates only one database-ranked Metrics row per job, not
+    # the eight-row history used to derive them.
+    assert set(loaded_metric_ids) == expected_metric_ids
+    assert len(loaded_metric_ids) == 2
+    assert [item.job_id for item in review.items] == sorted(requested_job_ids)
+    assert review.items[0].metrics is not None
+    assert review.items[0].metrics.likes == 22
+    assert review.items[0].metrics.source == "manual"
+    assert review.items[1].metrics is not None
+    assert review.items[1].metrics.likes == 3
+    assert review.totals.jobs_reviewed == 2
+    assert review.totals.jobs_with_metrics == 2
+    assert review.totals.likes == 25
+    assert review.totals.comments == 6
+    assert review.totals.shares == 8
+    assert review.totals.views == 250
+    assert review.findings == []
+
+    replay = control_plane.service.review_performance(
+        control_plane.agent,
+        PerformanceReviewRequest(
+            job_ids=requested_job_ids,
+            window_start=window_start,
+            window_end=window_end,
+        ),
+    )
+    assert replay.review_id == review.review_id
+    assert replay.items == review.items
+    assert replay.totals == review.totals
 
 
 @pytest.mark.parametrize(

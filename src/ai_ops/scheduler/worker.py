@@ -938,20 +938,24 @@ async def _execute_job_once(
             # 双层防御：helper 内已 try/except + capture；这里再套一层，防 helper
             # 被未来重构 / mock 替换破坏自吞契约后把 publish 主流程拖垮
             try:
-                _persist_initial_metrics(
-                    s,
-                    job.id,
-                    (result.raw_response or {}).get("initial_metadata") or {},
-                    exception_reporter=(
-                        capture_exception
-                        if execution_context is None
-                        else execution_context.report_exception
-                    ),
-                )
+                # A helper that catches its own flush error still leaves the
+                # current transaction rollback-only. A savepoint lets the
+                # confirmed publication and durable task intent commit safely.
+                with s.begin_nested():
+                    _persist_initial_metrics(
+                        s,
+                        job.id,
+                        (result.raw_response or {}).get("initial_metadata") or {},
+                        exception_reporter=(
+                            capture_exception
+                            if execution_context is None
+                            else execution_context.report_exception
+                        ),
+                    )
             except Exception as e:
                 logger.warning(
                     "worker.persist_initial_metrics_outer: swallowed",
-                    extra={"job_id": job.id, "error": str(e)},
+                    extra={"job_id": job.id, "exception_type": type(e).__name__},
                 )
                 _report_worker_exception(
                     execution_context,
@@ -960,29 +964,37 @@ async def _execute_job_once(
                     job_id=job.id,
                 )
 
-            _sync_article_status(s, job.article_id)
-            article = s.get(Article, job.article_id)
-
-            # 飞轮闭环：发布成功 → 调度 1h/24h/7d 数据采集
+            # Persist the exact 1h/24h/7d intent in the same outer transaction
+            # as PublishJob.SUCCESS. The savepoint preserves an already-
+            # confirmed external publication if an unexpected ledger error
+            # occurs; the durable scanner can then repair the explicitly marked
+            # row instead of relying on an in-memory callback.
             try:
-                if execution_context is None:
-                    from .metrics import schedule_after_publish
+                from .metrics import ensure_metrics_collection_tasks
 
-                    schedule_after_publish(job.id)
-                else:
-                    execution_context.schedule_after_publish(job.id)
+                with s.begin_nested():
+                    ensure_metrics_collection_tasks(
+                        s,
+                        job.id,
+                        anchor=finished_at,
+                    )
             except Exception as e:
-                # 采集失败不影响主流程——但必须留观测痕迹，否则飞轮长期断掉无人知
+                raw_response = dict(job.raw_response or {})
+                raw_response["metrics_task_backfill_required"] = True
+                job.raw_response = raw_response
                 logger.warning(
-                    "worker.schedule_metrics: swallowed",
-                    extra={"job_id": job.id, "error": str(e)},
+                    "worker.persist_metrics_tasks: repair required",
+                    extra={"job_id": job.id, "error_type": type(e).__name__},
                 )
                 _report_worker_exception(
                     execution_context,
                     e,
-                    scope="worker.schedule_metrics",
+                    scope="worker.persist_metrics_tasks",
                     job_id=job.id,
                 )
+
+            _sync_article_status(s, job.article_id)
+            article = s.get(Article, job.article_id)
             # 通知模块快照（Task B）：在 session 内拼好数据，出块后再发——
             # 避免 notify 调用失败/慢回写影响 job 状态落库
             notify_snapshot = {
@@ -1005,15 +1017,31 @@ async def _execute_job_once(
             failure_error = result.error or "unknown"
             if result.outcome_uncertain and "平台结果未知" not in failure_error:
                 failure_error = f"{UNCONFIRMED_EXECUTION_ERROR}（{failure_error}）"
-            _finish_failed_attempt(
-                s,
-                job,
-                failure_error,
-                now=finished_at,
-                retryable=(
-                    result.retryable and not execution_uncertain and not result.outcome_uncertain
-                ),
-            )
+            if raw_response.get("write_started") is False and (
+                raw_response.get("account_operation_busy") is True
+                or raw_response.get("account_operation_lock_error") is True
+            ):
+                # Waiting for a shared profile is not a publisher attempt. Undo
+                # the CAS reservation so repeated metrics/health contention
+                # cannot exhaust a publication before its adapter is entered.
+                _defer_without_consuming_attempt(
+                    s,
+                    job,
+                    failure_error,
+                    retry_at=finished_at + timedelta(seconds=_retry_delay_seconds(job.attempts)),
+                )
+            else:
+                _finish_failed_attempt(
+                    s,
+                    job,
+                    failure_error,
+                    now=finished_at,
+                    retryable=(
+                        result.retryable
+                        and not execution_uncertain
+                        and not result.outcome_uncertain
+                    ),
+                )
             if job.status == JobStatus.DEAD:
                 # 自动重发钩子（publishing-sop §五 / §八"笔记发了发现内容错"自动通道）：
                 # 默认关（AUTO_REPUBLISH_ON_DEAD=False）——避免 publisher 真挂时无限建 v2 → v3 → ...
@@ -1807,7 +1835,7 @@ def _persist_initial_metrics(
         # 体感差。必须 capture 让 Sentry 兜底告警
         logger.warning(
             "worker.persist_initial_metrics: swallowed",
-            extra={"job_id": job_id, "error": str(e)},
+            extra={"job_id": job_id, "exception_type": type(e).__name__},
         )
         try:
             exception_reporter(

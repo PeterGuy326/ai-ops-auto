@@ -12,7 +12,7 @@ Publisher result
 Metrics row (source=initial)
 
 successful PublishJob with platform_post_id
-   | manual collect or in-memory 1h/24h/7d callback
+   | manual collect or durable 1h/24h/7d task
    v
 Publisher.collect_metrics
    v
@@ -38,6 +38,10 @@ daily / weekly local Markdown report
 - `raw`：适配器返回的已允许原始字段
 - `collected_at`
 
+自动回采的 `MetricsCollectionTask` 另存固定 `window_seconds`、不可移动的 `due_at`、
+`collection_deadline_at`、下一次重试时间、尝试次数和 expiring owner lease。每个 job/window 唯一，
+每个 task 最多绑定一条 `source=scheduled` 的 Metrics；手动/initial 快照不能占用这个绑定。
+
 `Account`、`Article` 和平台侧 post identity 通过 PublishJob 间接关联。不同平台对“阅读/播放/展示”
 的定义并不一致；当前只做基础字段归一化，不提供可直接比较的跨平台 ROI/CPM 结论。
 
@@ -56,14 +60,23 @@ curl -fsS -X POST \
 
 ## 自动采集边界
 
-发布成功后，代码会尝试注册 1h/24h/7d 三个 APScheduler callback。当前这些 callback 是
-**内存任务**，不像 PublishJob 一样持久化：
+发布成功后，代码以 `finished_at` 为锚点持久化 1h/24h/7d 三个数据库任务，不再注册 APScheduler
+一次性 callback。worker 每轮做有界扫描，以条件 claim、64 字符 fencing token、过期 lease、独立
+并发上限和有界指数退避执行；任务与唯一快照在一个事务内结束，因此重启或重复扫描不会生成同一
+窗口的第二条指标。
 
-- worker 重启可能丢失尚未触发的回采计划。
-- API 进程不持有 scheduler；显式 API 发布不应被理解为自动回采有保证。
-- 没有 post identity 或真实 collector 的平台会跳过或写出无业务价值的数据。
+这里的唯一性只约束数据库快照，不是平台读取的 exactly-once 保证。若进程在 collector 已返回、
+但事务尚未提交时崩溃或被终止，lease 过期后的恢复可能再次读取同一平台数据；fencing token 会阻止
+旧 owner 随后提交第二条快照。
 
-因此关键运营数据应通过人工核验/回填或外部持久采集器补齐，直到 Metrics 任务也进入数据库账本。
+固定窗口也有诚实性截止时间：1h、24h、7d 任务分别最多迟到 1h、6h、24h；越过截止时间后任务
+明确失败，不把数天后的当前累计值标成早期窗口证据。新的 24h task 当次健康评估按
+`window_seconds=86400` 和绑定 metric 精确取数，手动采集或 7d 快照不会替代本次证据；没有
+task-bound 快照的 legacy 历史 job 仍保留 latest-metric 兼容回退。
+
+`AUTO_PUBLISH_ENABLED=false` 只阻止新的后台发布，不停止已有成功 job 的只读指标任务。要完全停止
+平台访问必须停止 worker。没有 post identity、真实 collector 或有效凭证时任务会失败/跳过，账本
+不会生成合成 0，也不把控制面持久性等同于平台数据可用性。
 
 ## 日报和周报
 
@@ -91,7 +104,6 @@ ai-ops report weekly --week 2026-W33 --out-dir ./reports --no-notify
 
 ## 待办
 
-- 将 1h/24h/7d 指标节点持久化，支持重启恢复和去重。
 - 为每个平台记录指标字段语义、最后验证日期和数据质量等级。
 - 增加覆盖率/缺失率，让报表区分“0”和“未知”。
 - 建立人工回填与来源标记，不让手填数据冒充自动采集。

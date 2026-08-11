@@ -397,41 +397,73 @@ async def api_login_account(account_id: int):
     """
     import asyncio
     from ..accounts.manager import get_credential
+    from ..config import settings
     from ..core.db import session_scope
     from ..core.models import Account
     from ..core.enums import Platform
     from ..publishers.registry import default_registry
+    from ..runtime.account_lease import AccountOperationLease, AccountOperationLeaseTimeout
 
     with session_scope() as s:
         a = s.get(Account, account_id)
         if a is None:
             raise HTTPException(404, f"account {account_id} 不存在")
-        try:
-            cred = get_credential(s, account_id)
-        except Exception:
-            cred = {}
         platform = Platform(a.platform)
 
-    pubs = default_registry.resolve(platform)
+    try:
+        pubs = default_registry.resolve(platform)
+    except Exception:
+        raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
     if not pubs:
-        raise HTTPException(400, f"无 {platform} publisher")
+        raise HTTPException(503, "登录服务暂时不可用，请稍后重试")
 
     try:
-        ok = await asyncio.wait_for(pubs[0].login(account_id, cred), timeout=300)
-    except asyncio.TimeoutError:
-        raise HTTPException(408, "登录超时（5 分钟内未完成扫码）")
+        async with AccountOperationLease(
+            account_id,
+            timeout_seconds=float(settings.account_operation_lock_timeout_seconds),
+        ):
+            # Load, consume, and replace credential/profile state under the same
+            # cross-process account lock used by publish, health, and metrics.
+            with session_scope() as s:
+                try:
+                    cred = get_credential(s, account_id)
+                except ValueError:
+                    cred = {}
+                except Exception:
+                    raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
 
-    # publisher.login 会把凭证写回 cred dict（cookies-based / profile_dir-based 都可能）
-    # — 只要登录成功且 cred 非空就 Fernet 加密落库，兼容所有 publisher
-    if ok and cred:
-        with session_scope() as s:
-            from ..accounts.store import get_store
+            try:
+                ok = await asyncio.wait_for(pubs[0].login(account_id, cred), timeout=300)
+            except TimeoutError:
+                raise HTTPException(408, "登录超时（5 分钟内未完成扫码）") from None
+            except Exception:
+                raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
 
-            a = s.get(Account, account_id)
-            if a is not None:
-                a.encrypted_credential = get_store().encrypt(cred)
+            # publisher.login 会把凭证写回 cred dict（cookies-based / profile_dir-based
+            # 都可能）。持锁直到加密写事务提交，防止并行发布/采集读取半更新状态。
+            if ok and cred:
+                try:
+                    with session_scope() as s:
+                        from ..accounts.store import get_store
 
-    error = None if ok else getattr(pubs[0], "last_login_error", None)
+                        a = s.get(Account, account_id)
+                        if a is None:
+                            raise HTTPException(404, f"account {account_id} 不存在")
+                        a.encrypted_credential = get_store().encrypt(cred)
+                except HTTPException:
+                    raise
+                except Exception:
+                    raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
+    except AccountOperationLeaseTimeout:
+        raise HTTPException(409, "账号正在执行其他操作，请稍后重试") from None
+    except HTTPException:
+        raise
+    except OSError:
+        raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
+    except Exception:
+        raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
+
+    error = None if ok else "登录未成功；请检查账号状态或在可信终端完成登录"
     return {"ok": ok, "account_id": account_id, "error": error}
 
 

@@ -27,6 +27,7 @@
 session 模板：沿用 P9 上轮收口的"单一信任源" SessionLocal.configure(bind=engine)，
 production-safe（expire_on_commit=False）必须生效。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -135,15 +136,17 @@ def _seed_metric(
 ) -> None:
     """预塞一条已采集的 Metrics 行，模拟历史采集事件。"""
     with SessionLocal() as s:
-        s.add(Metrics(
-            job_id=job_id,
-            likes=int(views * 0.05),
-            comments=int(views * 0.01),
-            shares=0,
-            views=views,
-            collected_at=collected_at,
-            raw={},
-        ))
+        s.add(
+            Metrics(
+                job_id=job_id,
+                likes=int(views * 0.05),
+                comments=int(views * 0.01),
+                shares=0,
+                views=views,
+                collected_at=collected_at,
+                raw={},
+            )
+        )
         s.commit()
 
 
@@ -168,6 +171,7 @@ def _patch_collect_one_externals(monkeypatch, *, collected_views: int = 200):
 
     # heat_refresh 不抛、不干扰
     import ai_ops.content.heat_engine as he_mod
+
     monkeypatch.setattr(he_mod, "recompute_topic_heat_for_article", lambda aid: None)
 
 
@@ -223,10 +227,12 @@ class TestIntervalIndexExplicitPath:
         _patch_collect_one_externals(monkeypatch, collected_views=200)
         eval_calls = _install_eval_spy(monkeypatch)
 
-        asyncio.run(metrics_mod.collect_one(
-            job_id,
-            interval_index=metrics_mod.HEALTH_EVAL_INTERVAL_INDEX,
-        ))
+        asyncio.run(
+            metrics_mod.collect_one(
+                job_id,
+                interval_index=metrics_mod.HEALTH_EVAL_INTERVAL_INDEX,
+            )
+        )
 
         assert eval_calls == [job_id], (
             f"显式 interval_index=HEALTH_EVAL_INTERVAL_INDEX 必须触发 health_eval，"
@@ -251,18 +257,16 @@ class TestIntervalIndexExplicitPath:
         _patch_collect_one_externals(monkeypatch, collected_views=1500)
         eval_calls = _install_eval_spy(monkeypatch)
 
-        asyncio.run(metrics_mod.collect_one(
-            job_id,
-            interval_index=metrics_mod.HEALTH_EVAL_INTERVAL_INDEX,
-        ))
-
-        assert eval_calls == [job_id], (
-            f"显式路径 + 表里 0 条历史也应触发，实际 {eval_calls}"
+        asyncio.run(
+            metrics_mod.collect_one(
+                job_id,
+                interval_index=metrics_mod.HEALTH_EVAL_INTERVAL_INDEX,
+            )
         )
 
-    def test_interval_index_0_does_not_trigger(
-        self, production_session_in_memory, monkeypatch
-    ):
+        assert eval_calls == [job_id], f"显式路径 + 表里 0 条历史也应触发，实际 {eval_calls}"
+
+    def test_interval_index_0_does_not_trigger(self, production_session_in_memory, monkeypatch):
         """显式 interval_index=0（1h 节点）不触发 health_eval。"""
         SessionLocal = production_session_in_memory
         now = datetime.utcnow()
@@ -278,9 +282,7 @@ class TestIntervalIndexExplicitPath:
             f"interval_index=0 是 1h 节点，绝不应触发 health_eval，实际 {eval_calls}"
         )
 
-    def test_interval_index_2_does_not_trigger(
-        self, production_session_in_memory, monkeypatch
-    ):
+    def test_interval_index_2_does_not_trigger(self, production_session_in_memory, monkeypatch):
         """显式 interval_index=2（7d 节点）不触发 health_eval。"""
         SessionLocal = production_session_in_memory
         now = datetime.utcnow()
@@ -319,7 +321,9 @@ class TestIntervalIndexNoneBackwardCompat:
         job_id = _mk_published_job(SessionLocal, finished_at=finished_at)
 
         _seed_metric(SessionLocal, job_id, collected_at=finished_at, views=50)  # initial
-        _seed_metric(SessionLocal, job_id, collected_at=finished_at + timedelta(hours=1), views=300)  # 1h 飞轮
+        _seed_metric(
+            SessionLocal, job_id, collected_at=finished_at + timedelta(hours=1), views=300
+        )  # 1h 飞轮
 
         _patch_collect_one_externals(monkeypatch, collected_views=1500)
         eval_calls = _install_eval_spy(monkeypatch)
@@ -328,8 +332,7 @@ class TestIntervalIndexNoneBackwardCompat:
         asyncio.run(metrics_mod.collect_one(job_id))
 
         assert eval_calls == [job_id], (
-            f"interval_index=None 兼容路径必须保留 cutoff+count 行为，"
-            f"实际 {eval_calls}"
+            f"interval_index=None 兼容路径必须保留 cutoff+count 行为，实际 {eval_calls}"
         )
 
     def test_interval_index_none_falls_back_to_count_no_trigger(
@@ -352,62 +355,29 @@ class TestIntervalIndexNoneBackwardCompat:
 
         asyncio.run(metrics_mod.collect_one(job_id))
 
-        assert eval_calls == [], (
-            f"兼容路径 + count == 1 不应触发，实际 {eval_calls}"
-        )
+        assert eval_calls == [], f"兼容路径 + count == 1 不应触发，实际 {eval_calls}"
 
 
-class TestScheduleAfterPublishClosureCapture:
-    """schedule_after_publish 闭包陷阱守护——Python late-binding 经典 bug 防线。"""
+class TestScheduleAfterPublishDurability:
+    """Compatibility API exposes database rows and registers no date callback."""
 
-    def test_schedule_after_publish_passes_interval_index(self, monkeypatch):
-        """spy queue.schedule_once，验证 3 次调度传给 callback 的 interval_index 是 0/1/2。
+    def test_schedule_after_publish_returns_durable_task_ids(
+        self,
+        production_session_in_memory,
+    ):
+        SessionLocal = production_session_in_memory
+        finished_at = datetime.utcnow()
+        job_id = _mk_published_job(SessionLocal, finished_at=finished_at)
+        with SessionLocal() as session:
+            tasks = metrics_mod.ensure_metrics_collection_tasks(
+                session,
+                job_id,
+                anchor=finished_at,
+            )
+            expected = [f"metrics-task-{task.id}" for task in tasks]
+            session.commit()
 
-        如果 for 内 lambda 没用默认参数捕获 idx，3 个回调会全捕获最后一次 idx=2
-        （Python late-binding 经典 bug）。本用例真实执行回调把 i 抓出来比对，
-        强制证明 early-binding 生效。
-        """
-        captured_interval_indexes: list[int] = []
-        captured_job_ids: list[int] = []
-
-        # 让 collect_one 被回调时把 (job_id, interval_index) 抓下来；
-        # 不实际跑业务，立刻返回避免 asyncio.create_task 报 no event loop
-        async def spy_collect_one(jid, *, interval_index=None):
-            captured_job_ids.append(jid)
-            captured_interval_indexes.append(interval_index)
-            return {"spy": True}
-
-        monkeypatch.setattr(metrics_mod, "collect_one", spy_collect_one)
-
-        # spy queue.schedule_once：记录每次 coro_factory 并立即 drive 回调协程。
-        registered_ids: list[str] = []
-
-        def fake_schedule_once(when, coro_factory, job_id=None):
-            registered_ids.append(job_id)
-            coro = coro_factory()
-            try:
-                coro.send(None)
-            except StopIteration:
-                pass
-            return job_id or f"sched-{len(registered_ids)}"
-
-        monkeypatch.setattr(metrics_mod.queue, "schedule_once", fake_schedule_once)
-
-        # 跑 schedule_after_publish
-        ids = metrics_mod.schedule_after_publish(job_id=12345)
-
-        # 必须注册 3 次（默认 3 档）
-        assert len(ids) == 3, f"应注册 3 次，实际 {len(ids)}: {ids}"
-
-        # 闭包陷阱核心断言：3 次回调的 interval_index 必须是 0, 1, 2（不是全 2）
-        assert captured_interval_indexes == [0, 1, 2], (
-            f"闭包 late-binding bug！期望 [0,1,2]，实际 {captured_interval_indexes}。"
-            f"修法：for idx, delay in enumerate(...) 内 lambda 必须 `i=idx` 默认参数捕获。"
-        )
-        # job_id 也应每次都是 12345（同样的 early-binding 守护）
-        assert captured_job_ids == [12345, 12345, 12345], (
-            f"job_id 闭包也炸了！实际 {captured_job_ids}"
-        )
+        assert metrics_mod.schedule_after_publish(job_id) == expected
 
 
 class TestHealthEvalIntervalIndexConstant:

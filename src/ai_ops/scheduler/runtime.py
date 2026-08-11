@@ -21,6 +21,7 @@ from ..core.schemas import PublishResult
 from ..core.time import as_utc_naive
 from ..observability import get_logger
 from ..observability.sentry import capture_exception
+from .metrics import scan_due_metrics_collection_tasks
 
 logger = get_logger(__name__)
 
@@ -214,30 +215,71 @@ async def run_worker_loop(
         # mean "no external action", not "worker crashed/exited".
         logger.warning("scheduler worker running with auto publish disabled")
 
-    consecutive_failures = 0
-    while not stopper.is_set():
+    async def scan_metrics_once() -> None:
+        # Metrics reads remain active when automatic publishing is disabled:
+        # they reconcile already-authorized publications and are protected by
+        # their own durable CAS/lease ledger.  Keep failures isolated from the
+        # publishing cadence.
         try:
-            await scan_due_jobs(limit=limit)
-            consecutive_failures = 0
-            delay = interval
+            await scan_due_metrics_collection_tasks(limit=limit)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            consecutive_failures += 1
-            delay = min(interval * (2 ** min(consecutive_failures - 1, 6)), 60.0)
-            logger.exception(
-                "scheduler worker scan failed; retrying",
-                extra={
-                    "consecutive_failures": consecutive_failures,
-                    "retry_in_seconds": delay,
-                },
-            )
-            capture_exception(
-                exc,
-                scope="scheduler.run_worker_loop",
-                consecutive_failures=consecutive_failures,
-            )
-        try:
-            await asyncio.wait_for(stopper.wait(), timeout=delay)
-        except TimeoutError:
-            continue
+            logger.exception("scheduler metrics scan failed; retrying")
+            try:
+                capture_exception(exc, scope="scheduler.metrics.scan")
+            except Exception:
+                logger.exception("scheduler metrics scan failure could not be reported")
+
+    consecutive_failures = 0
+    metrics_scan_task: asyncio.Task[None] | None = None
+    try:
+        while not stopper.is_set():
+            # Give due publishing first opportunity to acquire each account
+            # profile. A metrics read that starts first could otherwise make an
+            # already-claimed publish wait through its lock timeout and consume
+            # a publisher attempt without ever entering the publisher.
+            try:
+                await scan_due_jobs(limit=limit)
+                consecutive_failures = 0
+                delay = interval
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_failures += 1
+                delay = min(interval * (2 ** min(consecutive_failures - 1, 6)), 60.0)
+                logger.exception(
+                    "scheduler worker scan failed; retrying",
+                    extra={
+                        "consecutive_failures": consecutive_failures,
+                        "retry_in_seconds": delay,
+                    },
+                )
+                capture_exception(
+                    exc,
+                    scope="scheduler.run_worker_loop",
+                    consecutive_failures=consecutive_failures,
+                )
+
+            # A large/busy metrics backlog must not postpone later publication
+            # polls. Run at most one metrics batch in the background; when it
+            # finishes, the next polling iteration starts another batch.
+            if metrics_scan_task is None or metrics_scan_task.done():
+                if metrics_scan_task is not None:
+                    await metrics_scan_task
+                metrics_scan_task = asyncio.create_task(scan_metrics_once())
+                # Ensure a one-shot loop whose publish scan sets stop_event still
+                # starts the metrics scanner before orderly cleanup.
+                await asyncio.sleep(0)
+            try:
+                await asyncio.wait_for(stopper.wait(), timeout=delay)
+            except TimeoutError:
+                continue
+    finally:
+        if metrics_scan_task is not None and not metrics_scan_task.done():
+            metrics_scan_task.cancel()
+        if metrics_scan_task is not None:
+            try:
+                await metrics_scan_task
+            except asyncio.CancelledError:
+                pass

@@ -29,13 +29,18 @@ Agent contract v1 已把 Agent 与审批者拆成独立 Bearer principal，并�
 
 ## 现在已有什么
 
-- Topic → Article / Asset → Review → PublishJob → Metrics 的领域模型。
+- Topic → Article / Asset → Review → PublishJob → Metrics 的领域模型，以及固定
+  1h/24h/7d 窗口的持久化指标任务账本。
 - 内容入库、审核状态流、按账号分发、历史回填和服务端运营界面。
 - 数据库凭证字段的 Fernet 加密、账号健康、限流、内容查重与 Publisher Registry / fallback；
   外部 CLI/浏览器的 profile、cookie 和 OAuth 文件仍由部署机文件权限保护。
-- API 与唯一 APScheduler worker 分进程，以持久化 `PublishJob` 为任务真相；当前**不支持 Celery**。
+- API 与唯一 APScheduler worker 分进程，以持久化 `PublishJob` 和 `MetricsCollectionTask`
+  为任务真相；当前**不支持 Celery**。
 - 版本化 Agent Python/HTTP/CLI 契约：内容暂存、精确发布计划、独立审批、幂等排程、任务状态、
   手动指标采集和结构化复盘。详见 [Agent contract v1](docs/agent-contract.md)。
+- 发布成功会持久化固定 1h/24h/7d 指标任务；worker 通过数据库扫描、带 fencing 的到期 lease、
+  有界重试和窗口截止时间恢复执行。每个任务最多绑定一份 `scheduled` 指标快照，新的 24h 任务用
+  自己精确绑定的快照做当次健康判断；没有真实 post identity/collector 时仍不会伪造数据。
 - v1 计划把 Publisher kind、renderer identity/contract/adapter version 和无宿主路径的最终平台
   payload projection 及其摘要一起交给 human review；worker 执行前重算，不允许切换到另一
   Publisher。当前只有显式启用、且配置了稳定公开账号身份的知乎 CLI 具备 exact renderer；
@@ -99,13 +104,14 @@ API_KEY='<与 .env 相同的管理 key>' bash scripts/seed_demo.sh
 
 打开 <http://127.0.0.1:8000/ui>。`seed_demo.sh` 只是旧的 UI 占位数据脚本，不是价值链路或
 发布成功证据。种子数据只写本地数据库；
-`AUTO_PUBLISH_ENABLED=false` 会阻止后台扫描器自动真发布。
+`AUTO_PUBLISH_ENABLED=false` 会阻止后台扫描器自动真发布，但不会停止已成功发布内容的到期指标读取
+或账号健康检查；两者仍可能访问外部平台。要停止全部 worker 侧平台访问，请停止 worker。
 
 完整步骤、前端开发和真平台启用前检查见 [Getting Started](docs/getting-started.md)。
 
 ## 安全默认
 
-- `AUTO_PUBLISH_ENABLED=false`：后台调度不会自动真发布。
+- `AUTO_PUBLISH_ENABLED=false`：后台调度不会自动真发布，但到期指标读取和账号健康检查仍可能访问外部平台。
 - 该开关不禁用显式管理操作；持有管理 `API_KEY` 的调用方仍可调用 `/jobs/{id}/run` 等有副作用端点。
 - `/v1` 使用独立 Bearer principal 和最小 scope，永不继承空 `API_KEY` 的开发放行；
   `approval:read` / `approval:decide` 只能配置给 `type=human`，审批者必须回传实际审阅的
@@ -154,10 +160,10 @@ Codex / Claude / OpenClaw / custom agent
 2. **Five-minute value**：`doctor` / `demo` / Fake Publisher/Fake Metrics 的离线 tranche 已交付；
    独立身份、最小 scope 和不可自签审批已进入 v1 契约；首个 Stable 中国平台与
    `accepted/deployed/verified` 结果分层仍在进行中。
-3. **Agent-native contract**：Python/HTTP/CLI 的十操作 v1 纵切和知乎 CLI 的目标账号/exact renderer
-   绑定已落地，YouTube exact 等待只读频道身份探针；下一步补 MCP，并把发布后
-   指标回采从内存回调升级为可恢复的数据库任务。平台侧继续优先复用能返回 post identity 的
-   版本化 CLI/API，浏览器自动化作为受控 fallback。
+3. **Agent-native contract**：Python/HTTP/CLI 的十操作 v1 纵切、知乎 CLI 的目标账号/exact renderer
+   绑定，以及可恢复的 1h/24h/7d 数据库指标任务已经落地；YouTube exact 等待只读频道身份探针，
+   下一步补 MCP。平台侧继续优先复用能返回 post identity 的版本化 CLI/API，浏览器自动化作为
+   受控 fallback。
 4. **Evidence moat**：版本化 Adapter、平台 canary、跨平台指标归一化和实验追踪。
 
 详细里程碑与成功指标见 [Roadmap](docs/roadmap.md)。

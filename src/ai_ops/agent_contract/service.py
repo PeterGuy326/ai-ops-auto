@@ -18,7 +18,7 @@ import secrets
 from typing import Any, BinaryIO, Protocol, TypeVar
 
 from pydantic import BaseModel
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -35,6 +35,7 @@ from ..config import (
     settings,
 )
 from ..core.enums import AccountHealth, ArticleStatus, JobStatus, Platform
+from ..core.db_clock import database_utc_now
 from ..core.external_identity import normalize_zhihu_external_account_id
 from ..core.models import (
     Account,
@@ -1674,7 +1675,7 @@ class AgentControlPlane:
                     AgentOperation.operation == operation,
                     AgentOperation.idempotency_key == idempotency_key,
                     AgentOperation.lease_token == claim.lease_token,
-                    AgentOperation.lease_expires_at > finished_at,
+                    AgentOperation.lease_expires_at > database_utc_now(session),
                     AgentOperation.response_json.is_(None),
                 )
                 .values(
@@ -1864,25 +1865,35 @@ class AgentControlPlane:
                     "One or more requested jobs do not exist",
                     status_code=404,
                 )
-            metric_query = select(Metrics).where(Metrics.job_id.in_(request.job_ids))
+            # Rank inside the database so review memory and ORM hydration stay
+            # bounded by the requested job count, regardless of metric history
+            # depth.  ``id`` is the deterministic tie-breaker when collectors
+            # persist multiple snapshots with the same timestamp.
+            ranked_metric_query = select(
+                Metrics.id.label("metric_id"),
+                func.row_number()
+                .over(
+                    partition_by=Metrics.job_id,
+                    order_by=(Metrics.collected_at.desc(), Metrics.id.desc()),
+                )
+                .label("metric_rank"),
+            ).where(Metrics.job_id.in_(request.job_ids))
             if request.window_start is not None:
-                metric_query = metric_query.where(
+                ranked_metric_query = ranked_metric_query.where(
                     Metrics.collected_at >= as_utc_naive(request.window_start),
                     Metrics.collected_at < as_utc_naive(request.window_end),
                 )
+            ranked_metrics = ranked_metric_query.subquery()
             metrics = list(
                 session.scalars(
-                    metric_query.order_by(
-                        Metrics.job_id.asc(),
-                        Metrics.collected_at.desc(),
-                        Metrics.id.desc(),
-                    )
+                    select(Metrics)
+                    .join(ranked_metrics, Metrics.id == ranked_metrics.c.metric_id)
+                    .where(ranked_metrics.c.metric_rank == 1)
+                    .order_by(Metrics.job_id.asc())
                 ).all()
             )
 
-            latest: dict[int, Metrics] = {}
-            for metric in metrics:
-                latest.setdefault(metric.job_id, metric)
+            latest = {metric.job_id: metric for metric in metrics}
             items = [
                 PerformanceReviewItem(
                     job_id=job.id,

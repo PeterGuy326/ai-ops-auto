@@ -93,7 +93,13 @@ version、无宿主路径的 payload projection 和摘要，worker 执行前重�
 只读频道身份探针只保留 legacy canary；其他平台在 v1 计划阶段 fail closed。审批素材的存储后缀进入内容摘要，单文件/快照总量门禁、同一已验证文件
 句柄的下载流和 Range 拒绝完成了素材审阅边界。这些是契约一致性证据，不代表平台已达 Stable。
 
-待交付：MCP 适配、审批 SSO/组织身份集成、指标回采的持久任务账本，以及随使用数据建立的
+发布后的反馈意图也已进入数据库：成功 job 固定创建 1h/24h/7d 三个 `MetricsCollectionTask`，
+worker 用带过期时间和 fencing token 的 lease、有界重试/并发及窗口截止时间恢复执行。每个任务
+唯一绑定一份 `scheduled` 快照；新的 24h task 当次健康判断按 `window_seconds=86400` 和绑定
+metric 精确取数，不让手动采集或较晚的 7d 快照替代本次证据。缺少 post identity 或真实 collector 仍会明确失败，
+不会因账本存在而伪造平台数据。
+
+待交付：MCP 适配、审批 SSO/组织身份集成，以及随使用数据建立的
 调用成功率/状态可解释性基线。
 
 控制面对 Agent 的交付形式优先级：稳定 Python/HTTP 契约 → CLI → MCP。平台执行层则优先选择
@@ -110,6 +116,8 @@ version、无宿主路径的 payload projection 和摘要，worker 执行前重�
 - Publisher Plugin SDK 和适配器兼容性 manifest。
 - 平台 canary、最后验证日期、上游版本与失效报警。
 - 跨平台 Metrics 归一化、数据来源和质量标记。
+- 独立的健康反馈 outbox 与经 canary 校准的冻结基线，避免评估器故障重复读取平台，
+  也避免连续低值把自身基线逐步拉低。
 - 内容变体/实验追踪，把指标可解释地回流给 Agent。
 - 将 `jobhunt` 等非 Creator Ops 垂直能力迁出 core，改为独立插件或示例。
 

@@ -17,6 +17,7 @@
   - 不跑真实 worker.execute_job（依赖 DB / publisher / Account 整套）；
     用 in-memory SQLite + mock publisher，仿照 test_pre_publish_check.py
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -223,7 +224,14 @@ def _mk_job(SessionLocal, *, content_type=ContentType.IMAGE_TEXT, with_images=Tr
         if with_images:
             from ai_ops.core.models import Asset
 
-            s.add(Asset(article_id=article.id, asset_type="image", source="local", local_path="/fake/x.jpg"))
+            s.add(
+                Asset(
+                    article_id=article.id,
+                    asset_type="image",
+                    source="local",
+                    local_path="/fake/x.jpg",
+                )
+            )
             s.flush()
         job = PublishJob(
             article_id=article.id,
@@ -277,7 +285,9 @@ class TestWorkerObservabilityHooks:
 
         asyncio.run(worker_mod.execute_job(job_id))
 
-        image_captures = [c for c in capture_calls if c.get("scope") == "worker.image_anti_fingerprint"]
+        image_captures = [
+            c for c in capture_calls if c.get("scope") == "worker.image_anti_fingerprint"
+        ]
         assert len(image_captures) == 1, f"expected 1 image capture, got {capture_calls}"
         cap = image_captures[0]
         assert cap["exc_type"] == "RuntimeError"
@@ -285,8 +295,10 @@ class TestWorkerObservabilityHooks:
         assert "job_id" in cap
         assert "account_id" in cap
 
-    def test_schedule_metrics_failure_captured(self, db_engine_with_worker, monkeypatch):
-        """schedule_after_publish 抛 → capture(scope='worker.schedule_metrics')。"""
+    def test_persist_metrics_tasks_failure_is_marked_for_repair(
+        self, db_engine_with_worker, monkeypatch
+    ):
+        """Ledger savepoint failure is captured without losing publish evidence."""
         SessionLocal, capture_calls = db_engine_with_worker
         # 用纯文本路径，绕开 image 黑洞干扰
         job_id = _mk_job(SessionLocal, content_type=ContentType.LONG_ARTICLE, with_images=False)
@@ -304,10 +316,10 @@ class TestWorkerObservabilityHooks:
 
         from ai_ops.scheduler import metrics as metrics_mod
 
-        def boom_schedule(jid):
-            raise RuntimeError("scheduler down")
+        def boom_persist(*args, **kwargs):
+            raise RuntimeError("metrics ledger unavailable")
 
-        monkeypatch.setattr(metrics_mod, "schedule_after_publish", boom_schedule)
+        monkeypatch.setattr(metrics_mod, "ensure_metrics_collection_tasks", boom_persist)
 
         import ai_ops.notify as notify_mod
 
@@ -315,12 +327,18 @@ class TestWorkerObservabilityHooks:
 
         asyncio.run(worker_mod.execute_job(job_id))
 
-        sched_captures = [c for c in capture_calls if c.get("scope") == "worker.schedule_metrics"]
+        sched_captures = [
+            c for c in capture_calls if c.get("scope") == "worker.persist_metrics_tasks"
+        ]
         assert len(sched_captures) == 1, f"expected 1 schedule capture, got {capture_calls}"
         cap = sched_captures[0]
         assert cap["exc_type"] == "RuntimeError"
-        assert "scheduler down" in cap["exc_msg"]
+        assert "metrics ledger unavailable" in cap["exc_msg"]
         assert "job_id" in cap
+        with SessionLocal() as session:
+            job = session.get(PublishJob, job_id)
+            assert job.status == JobStatus.SUCCESS
+            assert job.raw_response["metrics_task_backfill_required"] is True
 
     def test_notify_failure_captured(self, db_engine_with_worker, monkeypatch):
         """notify 抛 → capture(scope='worker.notify') + kind 透传。"""

@@ -2,6 +2,7 @@
 
 用 in-memory SQLite 起独立 engine，不打主库。
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ai_ops.accounts.health_monitor import (
     BAN_PAUSE_HOURS,
+    _count_recent_low_views,
     compute_baseline,
     evaluate_after_metrics,
     get_ban_probe_at,
@@ -21,8 +23,16 @@ from ai_ops.accounts.health_monitor import (
     pause_account,
     recover_banned_account,
 )
-from ai_ops.core.enums import AccountHealth, JobStatus, Platform
-from ai_ops.core.models import Account, Article, Base, Metrics, PublishJob, Topic
+from ai_ops.core.enums import AccountHealth, JobStatus, MetricsTaskStatus, Platform
+from ai_ops.core.models import (
+    Account,
+    Article,
+    Base,
+    Metrics,
+    MetricsCollectionTask,
+    PublishJob,
+    Topic,
+)
 
 
 @pytest.fixture
@@ -53,7 +63,9 @@ def _mk_article(s, topic_id: int) -> Article:
 
 
 def _mk_account(s) -> Account:
-    a = Account(platform=Platform.XIAOHONGSHU, nickname="acc1", profile={}, health=AccountHealth.HEALTHY)
+    a = Account(
+        platform=Platform.XIAOHONGSHU, nickname="acc1", profile={}, health=AccountHealth.HEALTHY
+    )
     s.add(a)
     s.flush()
     return a
@@ -85,6 +97,60 @@ def _mk_success_job_with_metric(
     return job, metric
 
 
+def _add_metrics_task(
+    s: Session,
+    job: PublishJob,
+    *,
+    interval_index: int,
+    status: MetricsTaskStatus,
+    views: int | None = None,
+) -> tuple[MetricsCollectionTask, Metrics | None]:
+    windows = {
+        0: (3600, 3600),
+        1: (86400, 21600),
+        2: (604800, 86400),
+    }
+    window_seconds, grace_seconds = windows[interval_index]
+    due_at = job.finished_at + timedelta(seconds=window_seconds)
+    task = MetricsCollectionTask(
+        job_id=job.id,
+        interval_index=interval_index,
+        window_seconds=window_seconds,
+        due_at=due_at,
+        collection_deadline_at=due_at + timedelta(seconds=grace_seconds),
+        next_attempt_at=due_at if status == MetricsTaskStatus.QUEUED else None,
+        status=status,
+        attempts=0 if status == MetricsTaskStatus.QUEUED else 1,
+        max_attempts=5,
+        last_error="collector failed" if status == MetricsTaskStatus.FAILED else None,
+        started_at=due_at if status != MetricsTaskStatus.QUEUED else None,
+        finished_at=(
+            due_at + timedelta(minutes=1)
+            if status in {MetricsTaskStatus.SUCCEEDED, MetricsTaskStatus.FAILED}
+            else None
+        ),
+    )
+    s.add(task)
+    s.flush()
+
+    metric = None
+    if views is not None:
+        metric = Metrics(
+            job_id=job.id,
+            collection_task_id=task.id,
+            source="scheduled",
+            views=views,
+            likes=int(views * 0.05),
+            comments=int(views * 0.01),
+            shares=0,
+            raw={},
+            collected_at=due_at,
+        )
+        s.add(metric)
+        s.flush()
+    return task, metric
+
+
 # ---------------------------------------------------------------------------- #
 # compute_baseline
 # ---------------------------------------------------------------------------- #
@@ -107,6 +173,147 @@ def test_compute_baseline_median(db_session):
     baseline = compute_baseline(db_session, acc.id, lookback_days=7)
     assert baseline["sample_size"] == 3
     assert baseline["views"] == 2000
+
+
+def test_compute_baseline_prefers_24h_and_only_falls_back_for_legacy(db_session):
+    topic = _mk_topic(db_session)
+    acc = _mk_account(db_session)
+    art = _mk_article(db_session, topic.id)
+
+    exact_job, _ = _mk_success_job_with_metric(db_session, acc.id, art.id, views=50, days_ago=10)
+    db_session.query(Metrics).filter(Metrics.job_id == exact_job.id).delete()
+    _add_metrics_task(
+        db_session,
+        exact_job,
+        interval_index=1,
+        status=MetricsTaskStatus.SUCCEEDED,
+        views=1000,
+    )
+    _add_metrics_task(
+        db_session,
+        exact_job,
+        interval_index=2,
+        status=MetricsTaskStatus.SUCCEEDED,
+        views=9000,
+    )
+
+    queued_job, _ = _mk_success_job_with_metric(db_session, acc.id, art.id, views=8000, days_ago=9)
+    queued_metric = db_session.query(Metrics).filter(Metrics.job_id == queued_job.id).one()
+    queued_metric.source = "manual"
+    _add_metrics_task(
+        db_session,
+        queued_job,
+        interval_index=1,
+        status=MetricsTaskStatus.QUEUED,
+    )
+
+    failed_job, _ = _mk_success_job_with_metric(db_session, acc.id, art.id, views=70, days_ago=8)
+    db_session.query(Metrics).filter(Metrics.job_id == failed_job.id).delete()
+    _add_metrics_task(
+        db_session,
+        failed_job,
+        interval_index=1,
+        status=MetricsTaskStatus.FAILED,
+    )
+    _add_metrics_task(
+        db_session,
+        failed_job,
+        interval_index=2,
+        status=MetricsTaskStatus.SUCCEEDED,
+        views=7000,
+    )
+
+    _mk_success_job_with_metric(db_session, acc.id, art.id, views=2000, days_ago=7)
+
+    baseline = compute_baseline(db_session, acc.id, lookback_days=30)
+
+    assert baseline == {
+        "views": 1500,
+        "likes": 75,
+        "comments": 15,
+        "sample_size": 2,
+    }
+
+
+def test_recent_low_views_stops_at_first_healthy_job(db_session):
+    topic = _mk_topic(db_session)
+    acc = _mk_account(db_session)
+    art = _mk_article(db_session, topic.id)
+    for views, days_ago in zip(
+        [100, 5000, 100, 5000, 100],
+        [4, 3, 2, 1, 0],
+        strict=True,
+    ):
+        _mk_success_job_with_metric(
+            db_session,
+            acc.id,
+            art.id,
+            views=views,
+            days_ago=days_ago,
+        )
+
+    assert _count_recent_low_views(db_session, acc.id, 5000, 5) == 1
+
+
+@pytest.mark.parametrize(
+    ("missing_status", "later_evidence"),
+    [
+        (MetricsTaskStatus.QUEUED, "manual"),
+        (MetricsTaskStatus.FAILED, "7d"),
+    ],
+)
+def test_recent_low_views_stops_at_missing_durable_24h_evidence(
+    db_session,
+    missing_status,
+    later_evidence,
+):
+    topic = _mk_topic(db_session)
+    acc = _mk_account(db_session)
+    art = _mk_article(db_session, topic.id)
+
+    older_job, _ = _mk_success_job_with_metric(db_session, acc.id, art.id, views=10, days_ago=10)
+    db_session.query(Metrics).filter(Metrics.job_id == older_job.id).delete()
+    _add_metrics_task(
+        db_session,
+        older_job,
+        interval_index=1,
+        status=MetricsTaskStatus.SUCCEEDED,
+        views=100,
+    )
+
+    missing_job, fallback_metric = _mk_success_job_with_metric(
+        db_session, acc.id, art.id, views=100, days_ago=9
+    )
+    if later_evidence == "manual":
+        fallback_metric.source = "manual"
+    else:
+        db_session.delete(fallback_metric)
+    _add_metrics_task(
+        db_session,
+        missing_job,
+        interval_index=1,
+        status=missing_status,
+    )
+    if later_evidence == "7d":
+        _add_metrics_task(
+            db_session,
+            missing_job,
+            interval_index=2,
+            status=MetricsTaskStatus.SUCCEEDED,
+            views=100,
+        )
+
+    current_job, _ = _mk_success_job_with_metric(db_session, acc.id, art.id, views=10, days_ago=8)
+    db_session.query(Metrics).filter(Metrics.job_id == current_job.id).delete()
+    _add_metrics_task(
+        db_session,
+        current_job,
+        interval_index=1,
+        status=MetricsTaskStatus.SUCCEEDED,
+        views=100,
+    )
+
+    assert _count_recent_low_views(db_session, acc.id, 5000, 3) == 1
 
 
 # ---------------------------------------------------------------------------- #
@@ -197,9 +404,7 @@ def test_recovery_rechecks_deadline_and_clears_pause(db_session):
     acc.profile = {"paused_until": deadline.isoformat(), "paused_reason": "risk"}
     db_session.flush()
 
-    assert not recover_banned_account(
-        db_session, acc.id, now=deadline - timedelta(seconds=1)
-    )
+    assert not recover_banned_account(db_session, acc.id, now=deadline - timedelta(seconds=1))
     assert acc.health == AccountHealth.BANNED
 
     assert recover_banned_account(db_session, acc.id, now=deadline)

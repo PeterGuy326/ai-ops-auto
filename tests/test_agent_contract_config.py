@@ -106,6 +106,13 @@ def test_agent_metrics_timeout_must_fit_inside_recovery_lease():
             agent_external_operation_lease_seconds=300,
         )
 
+    with pytest.raises(ValidationError, match="finalization margin"):
+        Settings(
+            _env_file=None,
+            agent_metrics_collection_timeout_seconds=120,
+            agent_external_operation_lease_seconds=150,
+        )
+
 
 def test_agent_metrics_recovery_has_bounded_defaults():
     configured = Settings(_env_file=None)
