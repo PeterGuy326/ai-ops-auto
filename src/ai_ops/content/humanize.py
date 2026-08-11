@@ -230,7 +230,7 @@ def ai_smell_score(text: str) -> float:
     if len(sentences) >= 3:
         lens = [len(s) for s in sentences]
         mean = sum(lens) / len(lens)
-        var = sum((l - mean) ** 2 for l in lens) / len(lens)
+        var = sum((length - mean) ** 2 for length in lens) / len(lens)
         std = var ** 0.5
         # 标准差 < 8 字判定可疑
         if std < 8:

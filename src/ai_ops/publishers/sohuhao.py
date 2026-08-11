@@ -210,6 +210,7 @@ class SohuhaoPublisher(PublisherBase):
 
     platform = Platform.SOHUHAO
     kind = PublisherKind.SOCIAL_AUTO_UPLOAD  # 复用枚举
+    supports_metrics = True
 
     async def login(self, account_id: int, credential: dict) -> bool:
         """有窗口模式打开搜狐号登录页，等用户扫码完成后从 context 拿 cookies。
@@ -264,6 +265,7 @@ class SohuhaoPublisher(PublisherBase):
 
         async_playwright = get_async_playwright()
         kwargs = get_launch_kwargs()
+        result: PublishResult | None = None
 
         try:
             async with async_playwright() as p:
@@ -272,10 +274,15 @@ class SohuhaoPublisher(PublisherBase):
                     ctx = await browser.new_context()
                     await ctx.add_cookies(cookies)
                     page = await ctx.new_page()
-                    return await self._do_publish(page, content)
+                    result = await self._do_publish(page, content)
                 finally:
                     await browser.close()
+            return result
         except Exception as e:
+            if result is not None:
+                raw = dict(result.raw_response or {})
+                raw["teardown_error"] = type(e).__name__
+                return result.model_copy(update={"raw_response": raw})
             return PublishResult(success=False, error=f"搜狐号发布异常: {e}")
 
     async def health_check(self, account_id: int, credential: dict) -> AccountHealth:
@@ -435,47 +442,72 @@ class SohuhaoPublisher(PublisherBase):
         await _random_delay(1, 2)
 
         url_before = page.url
-        await publish_btn.click()
-        await _random_delay(5, 8)
-        url_after = page.url
+        # 最终发布按钮是远端写边界。调用开始后，即使 Playwright 抛错或后置
+        # metadata 抓取失败，也不能把结果标成可安全重试，否则可能重复发文。
+        try:
+            await publish_btn.click()
+            await _random_delay(5, 8)
+            url_after = page.url
 
-        # 闭环关键：跳到作品管理后台抓真实 /a/<id>_<author> 链接 + 互动指标快照
-        # 抓不到任何字段都不破坏发布——publish 已成功，metadata 是 bonus。
-        metadata = await self._fetch_post_metadata(page)
-        real_url = (metadata.get("url") if metadata else None) or url_after
+            # 闭环关键：跳到作品管理后台抓真实 /a/<id>_<author> 链接 + 互动指标快照
+            metadata = await self._fetch_post_metadata(page)
+            real_url = (metadata.get("url") if metadata else None) or url_after
 
-        # 防虚假闭环：用 _check_published_url 严格判 url 形态
-        is_published, normalized_url = _check_published_url(real_url)
-        if not is_published:
+            # 防虚假闭环：用 _check_published_url 严格判 url 形态
+            is_published, normalized_url = _check_published_url(real_url)
+            if not is_published:
+                draft_confirmed = bool(
+                    real_url
+                    and re.search(
+                        r"/(?:edit|draft)/[^/?#]+(?:[/?#]|$)",
+                        real_url,
+                    )
+                )
+                return PublishResult(
+                    success=False,
+                    effect_applied=draft_confirmed,
+                    retryable=False,
+                    outcome_uncertain=not draft_confirmed,
+                    platform_url=real_url,
+                    error=f"搜狐号 URL 异常或仍处草稿状态: {real_url}",
+                    raw_response={
+                        "final_url": url_after,
+                        "real_url": real_url,
+                        "is_published": False,
+                        "url_changed": url_after != url_before,
+                        "initial_metadata": metadata or {},
+                        "write_started": True,
+                    },
+                )
+
+            # 提取 article_id：搜狐公开链 /a/<id>_<authorid>，取斜杠后整体作为 post_id
+            article_id = normalized_url.rsplit("/", 1)[-1]
+
             return PublishResult(
-                success=False,
-                platform_url=real_url,
-                error=f"搜狐号 URL 异常或仍处草稿状态: {real_url}",
+                success=True,
+                effect_applied=True,
+                retryable=False,
+                platform_post_id=article_id,
+                platform_url=normalized_url,
                 raw_response={
                     "final_url": url_after,
-                    "real_url": real_url,
-                    "is_published": False,
+                    "real_url": normalized_url,
+                    "url_resolved_from_backend": bool(metadata and metadata.get("url")),
                     "url_changed": url_after != url_before,
+                    "is_published": True,
                     "initial_metadata": metadata or {},
+                    "write_started": True,
                 },
             )
-
-        # 提取 article_id：搜狐公开链 /a/<id>_<authorid>，取斜杠后整体作为 post_id
-        article_id = normalized_url.rsplit("/", 1)[-1]
-
-        return PublishResult(
-            success=True,
-            platform_post_id=article_id,
-            platform_url=normalized_url,
-            raw_response={
-                "final_url": url_after,
-                "real_url": normalized_url,
-                "url_resolved_from_backend": bool(metadata and metadata.get("url")),
-                "url_changed": url_after != url_before,
-                "is_published": True,
-                "initial_metadata": metadata or {},
-            },
-        )
+        except Exception as exc:
+            return PublishResult(
+                success=False,
+                effect_applied=False,
+                retryable=False,
+                outcome_uncertain=True,
+                error=f"搜狐号发布写入后状态无法确认: {type(exc).__name__}",
+                raw_response={"write_started": True},
+            )
 
     async def _fetch_post_metadata(self, page, match_post_id: str | None = None) -> dict | None:
         """跳到作品管理后台 + 抓卡片上的全字段（真链 + 三个互动数）。

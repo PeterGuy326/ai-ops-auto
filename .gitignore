@@ -33,6 +33,8 @@ data/assets/*
 data/outputs/*
 data/cookies/
 data/clips/
+data/cli_profiles/
+data/secrets/
 !data/assets/.gitkeep
 !data/outputs/.gitkeep
 

@@ -18,14 +18,13 @@ env 隔离：alembic Python API 走 env.py 的 `_resolve_database_url()`，
 """
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
 from ai_ops.core import db as db_mod
-from ai_ops.core.models import Base
+from ai_ops.core.models import Base, Topic
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +105,30 @@ def _run_alembic_command(action: str, rev: str | None = None) -> None:
         raise ValueError(f"unknown alembic action: {action}")
 
 
+def _script_head() -> str:
+    """Read the migration graph independently from the helper under test."""
+    from alembic.script import ScriptDirectory
+
+    cfg = db_mod._alembic_config()
+    assert cfg is not None
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    assert head is not None
+    return head
+
+
+def _upgrade_path(lower: str | None) -> list[str]:
+    """Return the graph's expected base/lower -> head upgrade order."""
+    from alembic.script import ScriptDirectory
+
+    cfg = db_mod._alembic_config()
+    assert cfg is not None
+    script = ScriptDirectory.from_config(cfg)
+    return [
+        revision.revision
+        for revision in reversed(list(script.iterate_revisions(_script_head(), lower)))
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Cases
 # ---------------------------------------------------------------------------
@@ -114,14 +137,30 @@ def _run_alembic_command(action: str, rev: str | None = None) -> None:
 def test_get_code_head_returns_latest_revision():
     """code_head 必须返回 alembic/versions/ 最新 migration 的 revision id。
 
-    硬钉 7c7c50aecd6a（Round 6: add metrics.source）—— 当前仓库 head。
-    若以后加新 migration，本断言会显眼提醒更新（这是 feature 不是 bug）。
+    与 Alembic 独立解析出的 migration graph head 对齐。新增 migration
+    不应因测试里的历史硬编码让整个 CI 失败。
     """
     head = db_mod.get_code_alembic_head()
-    assert head == "7c7c50aecd6a", (
-        f"code head 期望 7c7c50aecd6a (Round 6 metrics.source migration)，实际 {head}；"
-        "如新增了 migration 请同步更新本测试"
-    )
+    assert head == _script_head()
+
+
+def test_alembic_config_falls_back_to_wheel_share(tmp_path, monkeypatch):
+    """A non-editable wheel can locate the packaged migration resources."""
+    fake_prefix = tmp_path / "venv"
+    installed_ini = fake_prefix / "share" / "ai-ops-auto" / "alembic.ini"
+    installed_alembic = installed_ini.parent / "alembic"
+    installed_alembic.mkdir(parents=True)
+    installed_ini.write_text("[alembic]\nscript_location = alembic\n", encoding="utf-8")
+
+    fake_module = tmp_path / "site-packages" / "ai_ops" / "core" / "db.py"
+    fake_module.parent.mkdir(parents=True)
+    fake_module.touch()
+    monkeypatch.setattr(db_mod, "__file__", str(fake_module))
+    monkeypatch.setattr(db_mod.sys, "prefix", str(fake_prefix))
+
+    cfg = db_mod._alembic_config()
+    assert cfg is not None
+    assert Path(cfg.config_file_name) == installed_ini
 
 
 def test_check_schema_drift_in_sync_when_db_at_head(
@@ -134,8 +173,8 @@ def test_check_schema_drift_in_sync_when_db_at_head(
 
     drift = db_mod.check_schema_drift()
     assert drift["in_sync"] is True
-    assert drift["db_head"] == "7c7c50aecd6a"
-    assert drift["code_head"] == "7c7c50aecd6a"
+    assert drift["db_head"] == _script_head()
+    assert drift["code_head"] == _script_head()
     assert drift["missing_migrations"] == []
 
 
@@ -160,10 +199,10 @@ def test_check_schema_drift_detects_no_alembic_version_table(
 
     drift = db_mod.check_schema_drift()
     assert drift["db_head"] is None, "create_all 建的 DB 应无 db_head"
-    assert drift["code_head"] == "7c7c50aecd6a"
+    assert drift["code_head"] == _script_head()
     assert drift["in_sync"] is False, "P9 事故场景必须被识别为漂移"
     # missing 应列出所有 rev（base → head）
-    assert drift["missing_migrations"] == ["b09fbf0bf0f0", "7c183c0ba12a", "7c7c50aecd6a"]
+    assert drift["missing_migrations"] == _upgrade_path(None)
 
 
 def test_check_schema_drift_detects_old_db_stamped_at_baseline(tmp_db_url):
@@ -177,11 +216,9 @@ def test_check_schema_drift_detects_old_db_stamped_at_baseline(tmp_db_url):
 
     drift = db_mod.check_schema_drift()
     assert drift["db_head"] == "b09fbf0bf0f0"
-    assert drift["code_head"] == "7c7c50aecd6a"
+    assert drift["code_head"] == _script_head()
     assert drift["in_sync"] is False
-    assert drift["missing_migrations"] == ["7c183c0ba12a", "7c7c50aecd6a"], (
-        f"应缺 2 个 migration（superseded + source），实际 {drift['missing_migrations']}"
-    )
+    assert drift["missing_migrations"] == _upgrade_path("b09fbf0bf0f0")
 
 
 def test_try_auto_upgrade_does_nothing_when_in_sync(tmp_db_url):
@@ -248,19 +285,19 @@ def test_try_auto_upgrade_promotes_old_db_to_head(
     drift_before = db_mod.check_schema_drift()
     assert drift_before["in_sync"] is False
     assert drift_before["db_head"] == "b09fbf0bf0f0"
-    assert drift_before["missing_migrations"] == ["7c183c0ba12a", "7c7c50aecd6a"]
+    assert drift_before["missing_migrations"] == _upgrade_path("b09fbf0bf0f0")
 
     # 步骤 2: 触发自动升级（force=True 绕开 settings.auto_upgrade_db 默认 False）
     result = db_mod.try_auto_upgrade(force=True)
     assert result["attempted"] is True, f"应真跑 upgrade，实际 {result}"
     assert result["ok"] is True, f"upgrade 应成功，实际 error={result['error']}"
     assert result["from_rev"] == "b09fbf0bf0f0"
-    assert result["to_rev"] == "7c7c50aecd6a"
+    assert result["to_rev"] == _script_head()
 
     # 步骤 3: 验证 schema 已对齐 + 字段真加上了
     drift_after = db_mod.check_schema_drift()
     assert drift_after["in_sync"] is True
-    assert drift_after["db_head"] == "7c7c50aecd6a"
+    assert drift_after["db_head"] == _script_head()
     assert drift_after["missing_migrations"] == []
 
     cols_after = [c["name"] for c in _inspect(engine).get_columns("publish_jobs")]
@@ -279,7 +316,80 @@ def test_try_auto_upgrade_dry_run_does_not_change_db(tmp_db_url):
     assert result["ok"] is True
     assert "dry_run" in result["reason"]
     assert result["from_rev"] == "b09fbf0bf0f0"
-    assert result["to_rev"] == "7c7c50aecd6a"
+    assert result["to_rev"] == _script_head()
 
     # DB 仍停在 baseline，未被改动
     assert db_mod.get_db_alembic_head() == "b09fbf0bf0f0"
+
+
+def test_safe_init_runs_real_migrations_on_empty_database(tmp_db_url, tmp_db_path):
+    """The public initializer must build an empty DB through Alembic, not create_all."""
+    result = db_mod.init_db()
+
+    assert result["ok"] is True
+    assert result["attempted"] is True
+    assert result["reason"] == "upgrade executed"
+    assert db_mod.get_db_alembic_head() == _script_head()
+
+    engine = create_engine(tmp_db_url, future=True)
+    try:
+        tables = set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+    assert set(Base.metadata.tables).issubset(tables)
+    assert "alembic_version" in tables
+    assert tmp_db_path.exists()
+
+
+def test_safe_init_adopts_only_exact_current_create_all_schema(
+    production_session_on_tmp,
+):
+    """An exact legacy create_all DB is stamped at head with its data preserved."""
+    SessionLocal, engine = production_session_on_tmp
+    Base.metadata.create_all(engine)
+    with SessionLocal() as session:
+        session.add(Topic(name="legacy-row"))
+        session.commit()
+
+    result = db_mod.init_db()
+
+    assert result["ok"] is True
+    assert result["attempted"] is True
+    assert result["from_rev"] is None
+    assert result["reason"] == "exact current unversioned schema stamped at head"
+    assert db_mod.get_db_alembic_head() == _script_head()
+    with SessionLocal() as session:
+        assert session.query(Topic).filter_by(name="legacy-row").one().name == "legacy-row"
+
+
+def test_safe_init_refuses_partial_unversioned_business_schema_without_mutation(
+    production_session_on_tmp,
+):
+    """A vaguely legacy-looking DB must never be guessed/stamped/migrated in place."""
+    _, engine = production_session_on_tmp
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE topics ("
+                "id INTEGER PRIMARY KEY, name VARCHAR(128) NOT NULL)"
+            )
+        )
+
+    with pytest.raises(db_mod.DatabaseSchemaError, match="unsafe unversioned schema refused"):
+        db_mod.init_db()
+
+    inspector = inspect(engine)
+    assert set(inspector.get_table_names()) == {"topics"}
+    assert {column["name"] for column in inspector.get_columns("topics")} == {"id", "name"}
+
+
+def test_runtime_gate_refuses_empty_database_when_auto_upgrade_is_disabled(tmp_db_url):
+    """API/worker startup validation must not silently create an empty schema."""
+    with pytest.raises(db_mod.DatabaseSchemaError, match="ai-ops init-db"):
+        db_mod.require_database_at_head(allow_upgrade=False)
+
+    engine = create_engine(tmp_db_url, future=True)
+    try:
+        assert inspect(engine).get_table_names() == []
+    finally:
+        engine.dispose()

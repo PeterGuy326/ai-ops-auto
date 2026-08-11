@@ -22,13 +22,17 @@ import {
 } from "@/components/ui/select"
 import { TopicCard } from "@/components/topics/topic-card"
 import { CreateTopicForm } from "@/components/topics/create-topic-form"
-import { MOCK_CATEGORIES } from "@/lib/mock-topics"
+import { TOPIC_CATEGORIES } from "@/lib/topic-categories"
 import { categoryLabel } from "@/lib/topic-utils"
+import { QueryError } from "@/components/query-error"
 
 const ALL = "__all__"
 
 export default function Topics() {
-  const { data, isLoading } = useQuery({ queryKey: ["topics"], queryFn: () => api.topics() })
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["topics"],
+    queryFn: () => api.topics(),
+  })
   const [open, setOpen] = useState(false)
   const [q, setQ] = useState("")
   const [cat, setCat] = useState<string>(ALL)
@@ -91,7 +95,7 @@ export default function Topics() {
           </SelectTrigger>
           <SelectContent>
             <SelectItem value={ALL}>全部分类</SelectItem>
-            {MOCK_CATEGORIES.map((c) => (
+            {TOPIC_CATEGORIES.map((c) => (
               <SelectItem key={c} value={c}>
                 {categoryLabel(c)}
               </SelectItem>
@@ -103,7 +107,9 @@ export default function Topics() {
         </span>
       </div>
 
-      {isLoading ? (
+      {error ? (
+        <QueryError error={error} />
+      ) : isLoading ? (
         <Card>
           <CardContent className="py-12 text-center text-sm text-muted-foreground">
             加载中...

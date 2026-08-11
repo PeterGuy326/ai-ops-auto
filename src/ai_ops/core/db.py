@@ -1,5 +1,7 @@
 from contextlib import contextmanager
-from typing import Iterator
+from pathlib import Path
+import sys
+from typing import Any, Iterator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -30,9 +32,20 @@ SessionLocal = sessionmaker(
 )
 
 
-def init_db() -> None:
+class DatabaseSchemaError(RuntimeError):
+    """The configured database cannot safely be used by this code version."""
+
+
+def init_db() -> dict[str, Any]:
+    """Safely initialize or upgrade the configured database to Alembic head.
+
+    This is the public initialization path used by the CLI.  It deliberately
+    never calls ``Base.metadata.create_all``: an empty database is migrated
+    from Alembic base, while an existing unversioned database is adopted only
+    when its reflected schema exactly matches the current ORM metadata.
+    """
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(_engine)
+    return require_database_at_head(allow_upgrade=True)
 
 
 @contextmanager
@@ -50,17 +63,16 @@ def session_scope() -> Iterator[Session]:
 # ============================================================================
 # Round 5 · schema 漂移自检 + 自动 alembic 升级
 # ----------------------------------------------------------------------------
-# 底层逻辑：dev/prod schema parity。生产走 Dockerfile entrypoint 跑 subprocess
-# alembic upgrade（已稳定）；dev 本地 uvicorn 启动期长期裸奔——开发者 git pull
-# 拿到新 model 后 init_db() 只对全新空 DB 有效，已存在的旧 DB 不会被 create_all
-# 自动 ALTER 加字段，启动可能炸。本节提供：
+# 底层逻辑：dev/prod schema parity。生产走 Dockerfile entrypoint 的安全初始化
+# 命令；dev 本地可选择在进程启动期自动升级。应用运行入口不再调用 create_all，
+# 防止无 alembic_version 的数据库进入“看似可用、实际无法升级”的状态。本节提供：
 #   - check_schema_drift()     : 启动期自检（lifespan SCHEMA-CHECK 调）
 #   - try_auto_upgrade()       : dev 默认开/prod 默认关的应用进程内 upgrade
+#   - require_database_at_head(): 应用启动闸门，只接受 head（可显式允许安全升级）
 #   - get_db_alembic_head()    : 查 DB 当前 alembic head（无表/无 DB 返 None）
 #   - get_code_alembic_head()  : 扫 alembic/versions/ 拿代码侧 head
-# 全部容错：异常 → 返 None / {ok: False}，不抛（让 lifespan 自己决定是否 raise）。
+# 查询/升级 helper 结构化返回；启动闸门失败时抛 DatabaseSchemaError。
 # ============================================================================
-from pathlib import Path as _Path
 
 
 def _alembic_config():
@@ -74,11 +86,15 @@ def _alembic_config():
     """
     from alembic.config import Config
 
-    # alembic.ini 在仓库根（src 的上上级）。lifespan / scripts 入口 cwd 不固定，
-    # 用 db.py 文件路径上溯解析最可靠。
-    repo_root = _Path(__file__).resolve().parents[3]
-    ini_path = repo_root / "alembic.ini"
-    if not ini_path.exists():
+    # 可编辑/源码安装时读仓库根；普通 wheel 安装时读
+    # pyproject data-files 放到 sys.prefix/share 下的副本。
+    source_root = Path(__file__).resolve().parents[3]
+    candidates = (
+        source_root / "alembic.ini",
+        Path(sys.prefix) / "share" / "ai-ops-auto" / "alembic.ini",
+    )
+    ini_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if ini_path is None:
         return None
     cfg = Config(str(ini_path))
     # alembic 的 script_location 是相对 alembic.ini 所在目录的"alembic"——
@@ -190,57 +206,80 @@ def check_schema_drift():
         "missing_migrations": missing,
     }
 
+def _summarize_schema_diffs(diffs: list[Any]) -> str:
+    """Return stable, credential-free labels for Alembic schema differences."""
+    labels: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, tuple) and value and isinstance(value[0], str):
+            labels.add(value[0])
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    collect(diffs)
+    return ", ".join(sorted(labels)) or "schema differences"
 
 
+def _inspect_unversioned_schema() -> tuple[str, str | None]:
+    """Classify a database whose Alembic revision is absent.
 
-def _detect_legacy_create_all_db() -> tuple[bool, str | None]:
-    """检测"业务表已存在但无 alembic_version 表"的早期 dev DB 场景。
+    Returns ``("empty", None)`` for a truly empty default schema,
+    ``("current", None)`` only when the reflected schema exactly matches
+    ``Base.metadata``, and ``("unsafe", reason)`` for everything else.
 
-    这是 Round 5 P9 事故的另一面：DB 是 create_all 建的，alembic 跑 baseline migration
-    时会撞 "table already exists"，正确做法是先 stamp 到 baseline 再 upgrade 跑增量。
-
-    返回 (是否是 legacy create_all DB, 推断的 baseline rev)。baseline rev 永远是 alembic
-    versions 链路的最早 rev（无 down_revision 的那个）。
+    The exact comparison is intentionally stricter than checking a handful of
+    well-known tables.  Alembic autogenerate compares columns, types,
+    nullability, defaults, indexes, unique constraints and foreign keys.  The
+    explicit table/view-set check additionally rejects an empty
+    ``alembic_version`` table left by a failed migration and unrelated tables.
     """
+    from alembic.autogenerate import compare_metadata
+    from alembic.migration import MigrationContext
     from sqlalchemy import create_engine, inspect
 
+    eng = create_engine(
+        settings.database_url,
+        future=True,
+        connect_args={"check_same_thread": False}
+        if settings.database_url.startswith("sqlite")
+        else {},
+    )
     try:
-        eng = create_engine(
-            settings.database_url,
-            future=True,
-            connect_args={"check_same_thread": False}
-            if settings.database_url.startswith("sqlite")
-            else {},
-        )
         with eng.connect() as conn:
-            insp = inspect(conn)
-            tables = set(insp.get_table_names())
-            # 业务表存在 + DB head 为空（无 alembic_version 表或表里没 row）→ legacy
-            # 注意：alembic 失败迁移可能留下空 alembic_version 表，单看 "表是否存在" 不够，
-            # 要看 get_db_alembic_head() 是否真有 rev —— 这才是 alembic 认知的 "schema 在哪"。
-            has_business = bool(tables & {"topics", "accounts", "publish_jobs"})
-            if not has_business:
-                return False, None
-            if get_db_alembic_head() is not None:
-                # 已有 alembic rev → 不是 legacy（正规迁移路径）
-                return False, None
-    except Exception:
-        return False, None
+            inspector = inspect(conn)
+            actual_tables = set(inspector.get_table_names())
+            actual_views = set(inspector.get_view_names())
+            if not actual_tables and not actual_views:
+                return "empty", None
 
-    # 找 baseline（无 down_revision 的 rev）
-    try:
-        from alembic.script import ScriptDirectory
+            expected_tables = {table.name for table in Base.metadata.sorted_tables}
+            missing = sorted(expected_tables - actual_tables)
+            unexpected = sorted(actual_tables - expected_tables)
+            if missing or unexpected or actual_views:
+                parts = []
+                if missing:
+                    parts.append(f"missing tables={missing}")
+                if unexpected:
+                    parts.append(f"unexpected tables={unexpected}")
+                if actual_views:
+                    parts.append(f"unexpected views={sorted(actual_views)}")
+                return "unsafe", "; ".join(parts)
 
-        cfg = _alembic_config()
-        if cfg is None:
-            return False, None
-        script = ScriptDirectory.from_config(cfg)
-        for rev in script.walk_revisions():
-            if rev.down_revision is None:
-                return True, rev.revision
-    except Exception:
-        return False, None
-    return False, None
+            context = MigrationContext.configure(
+                conn,
+                opts={
+                    "compare_type": True,
+                    "compare_server_default": True,
+                },
+            )
+            diffs = compare_metadata(context, Base.metadata)
+            if diffs:
+                return "unsafe", f"metadata mismatch: {_summarize_schema_diffs(diffs)}"
+            return "current", None
+    finally:
+        eng.dispose()
 
 def try_auto_upgrade(dry_run: bool = False, force: bool = False) -> dict:
     """应用进程内尝试 alembic upgrade head。
@@ -264,6 +303,8 @@ def try_auto_upgrade(dry_run: bool = False, force: bool = False) -> dict:
       - 默认不动 schema：settings.auto_upgrade_db=False 时直接返回 attempted=False
         （生产应用进程不该改 schema —— prod 走 Dockerfile entrypoint subprocess）
       - 已 in_sync 不重复跑：节省启动时间 + 避免不必要的 alembic 锁
+      - 无版本数据库只允许两种状态：真空库从 base 升级；与当前 ORM metadata
+        精确一致的历史 create_all 库直接 stamp head。部分/未知 schema 一律拒绝。
     """
     drift = check_schema_drift()
     from_rev = drift["db_head"]
@@ -289,38 +330,61 @@ def try_auto_upgrade(dry_run: bool = False, force: bool = False) -> dict:
             "reason": "auto_upgrade_db disabled (prod default; set AUTO_UPGRADE_DB=true for dev)",
         }
 
-    if dry_run:
-        return {
-            "attempted": False,
-            "from_rev": from_rev,
-            "to_rev": to_rev,
-            "ok": True,
-            "error": None,
-            "reason": f"dry_run: would upgrade {from_rev} -> {to_rev}",
-        }
-
     try:
         from alembic import command
 
         cfg = _alembic_config()
-        if cfg is None:
+        if cfg is None or to_rev is None:
             return {
                 "attempted": False,
                 "from_rev": from_rev,
                 "to_rev": to_rev,
                 "ok": False,
-                "error": "alembic.ini not found",
-                "reason": "config missing",
+                "error": "Alembic config or a unique code head is unavailable",
+                "reason": "migration graph unavailable",
             }
-        # Round 5 P9 事故关键路径：legacy create_all DB（业务表已存在但无 alembic_version）
-        # 直接 upgrade 会撞 "table already exists"。正确做法：先 stamp baseline，再 upgrade
-        # 跑增量。stamp 只写 alembic_version 表，不动业务表，安全。
+
+        unversioned_state = None
+        unversioned_error = None
         if from_rev is None:
-            is_legacy, baseline_rev = _detect_legacy_create_all_db()
-            if is_legacy and baseline_rev:
-                command.stamp(cfg, baseline_rev)
-                from_rev = baseline_rev  # 升级日志体现真实起点
-        command.upgrade(cfg, "head")
+            unversioned_state, unversioned_error = _inspect_unversioned_schema()
+            if unversioned_state == "unsafe":
+                return {
+                    "attempted": False,
+                    "from_rev": None,
+                    "to_rev": to_rev,
+                    "ok": False,
+                    "error": unversioned_error,
+                    "reason": "unsafe unversioned schema refused",
+                }
+
+        if dry_run:
+            action = (
+                "stamp current schema at head"
+                if unversioned_state == "current"
+                else f"upgrade {from_rev} -> {to_rev}"
+            )
+            return {
+                "attempted": False,
+                "from_rev": from_rev,
+                "to_rev": to_rev,
+                "ok": True,
+                "error": None,
+                "reason": f"dry_run: would {action}",
+            }
+
+        if unversioned_state == "current":
+            # The database already has the exact current schema.  Running any
+            # migration would collide with existing tables/columns, so adopt
+            # it without touching business data.
+            command.stamp(cfg, "head")
+            reason = "exact current unversioned schema stamped at head"
+        else:
+            # Covers a truly empty unversioned DB and a normal versioned DB
+            # behind head.  Both must traverse the real migration graph.
+            command.upgrade(cfg, "head")
+            reason = "upgrade executed"
+
         # 再查一次确认（不依赖 alembic 内部返回值，事实证明最稳）
         new_head = get_db_alembic_head()
         ok = new_head == to_rev
@@ -330,7 +394,7 @@ def try_auto_upgrade(dry_run: bool = False, force: bool = False) -> dict:
             "to_rev": to_rev,
             "ok": ok,
             "error": None if ok else f"after upgrade db head={new_head}, expected {to_rev}",
-            "reason": "upgrade executed",
+            "reason": reason,
         }
     except Exception as e:
         return {
@@ -341,3 +405,47 @@ def try_auto_upgrade(dry_run: bool = False, force: bool = False) -> dict:
             "error": f"{type(e).__name__}: {e}",
             "reason": "upgrade raised",
         }
+
+
+def require_database_at_head(*, allow_upgrade: bool | None = None) -> dict[str, Any]:
+    """Gate application startup on a verified Alembic head revision.
+
+    ``allow_upgrade`` defaults to ``AUTO_UPGRADE_DB``.  Production API/worker
+    processes therefore validate only, while development can opt into the
+    same safe upgrade/adoption path used by ``ai-ops init-db``.
+    """
+    if allow_upgrade is None:
+        allow_upgrade = settings.auto_upgrade_db
+
+    drift = check_schema_drift()
+    if drift["in_sync"]:
+        return {
+            "attempted": False,
+            "from_rev": drift["db_head"],
+            "to_rev": drift["code_head"],
+            "ok": True,
+            "error": None,
+            "reason": "already in sync",
+        }
+
+    if not allow_upgrade:
+        raise DatabaseSchemaError(
+            "database schema is not at Alembic head "
+            f"(db={drift['db_head']}, code={drift['code_head']}); "
+            "run `ai-ops init-db` before starting the service"
+        )
+
+    result = try_auto_upgrade(force=True)
+    if not result["ok"]:
+        raise DatabaseSchemaError(
+            "database initialization refused or failed "
+            f"(reason={result['reason']})"
+        )
+
+    verified = check_schema_drift()
+    if not verified["in_sync"]:
+        raise DatabaseSchemaError(
+            "database initialization did not reach the unique Alembic head "
+            f"(db={verified['db_head']}, code={verified['code_head']})"
+        )
+    return result

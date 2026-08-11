@@ -1,9 +1,10 @@
 # AI 播客 & AI 短剧 —— 云集成方案（本地验证版）
 
-> 状态：调研 + 云适配器实现 + mock 集成验证完成，**未推云端**。
+> 这是一份历史方案记录，不是当前云服务可用性承诺。
+> 状态：调研 + 云适配器实现 + mock 集成契约，**本次开源收口未调用真实云端点**。
 > 口径修正：用户「AI 博客 = ListenHub 这种」实指 **AI 播客**；两个场景一律
-> **云 API 集成，本地零算力**（用户本地无 GPU）。
-> 结论先行：**两条云链路集成层已 100% 本地验证（362 passed），只待配 API key 真跑。**
+> **云 API 集成，本地不运行生成模型**。
+> 结论先行：两条云链路有本地 mock 测试，但“配 API key”本身不能证明真实服务契约和产物质量。
 
 ---
 
@@ -61,20 +62,21 @@ KLING_SECRET_KEY=...
 
 ---
 
-## 1. 现状盘点（已验证）
+## 1. 历史实现快照
 
 | 能力 | 模块 | 状态 |
 |------|------|------|
-| LLM 内容生成 | `content/generator.py`（openai/anthropic/deepseek/dashscope 可切） | ✅ |
+| LLM 内容生成 | `content/generator.py`（OpenAI-compatible / Anthropic / Claude CLI） | ✅ |
 | 博客发布 | `publishers/github_pages.py`（Hexo，dry_run 已验证） | ✅ |
 | 抖音发布 | `publishers/social_auto_upload.py`（CLI `douyin upload_video` + HTTP type=3） | ✅ 代码就位 |
 | 视频生成 | `video/money_printer.py`（MoneyPrinterTurbo） | ✅ 代码就位，⚠️ 非真剧情 |
 | 视频切片 | `video/clipper/funclip.py`（FunClip ASR 切片） | ✅ 代码就位 |
 | 切片→发布计划 | `pipeline/clip_to_publish.py` | ✅ 已验证 |
 
-**测试基线**：`346 passed`。
+**测试口径**：表中“已验证”是当时的 mock/dry-run 记录，不是当前全量测试结果或真云端 E2E。
 
-**真实缺口（两个场景共用）**：生产代码里没有"内容 → 扇出成 PublishJob"的一键编排入口（只有重发会建 Job）。本方案补的就是这层"场景编排"。
+**当时的缺口**：该方案编写时，内容到 PublishJob 的场景编排尚未收口；当前实现以代码和
+[架构文档](architecture.md) 为准。
 
 ---
 
@@ -95,7 +97,7 @@ KLING_SECRET_KEY=...
 - generator / publisher 均可注入，便于本地用 fake LLM + temp git 仓库验证。
 
 ### 落地成本
-- **零外部账号、零反风控、零 GB 级依赖**——git 即可。
+- **零外部平台账号、零浏览器适配器、零 GB 级依赖**——git 即可。
 - Phase 1（今天）：配真实博客仓库路径 + LLM key → 关 dry_run → 真发一篇。
 
 ---

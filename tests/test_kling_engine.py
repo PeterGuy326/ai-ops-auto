@@ -18,7 +18,6 @@ import json
 
 import pytest
 
-import ai_ops.video.kling as kling_mod
 from ai_ops.config import settings
 from ai_ops.core.enums import Platform, VideoEngineKind
 from ai_ops.core.schemas import VideoBrief

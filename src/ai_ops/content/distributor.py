@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..core.enums import (
+    AccountHealth,
     ArticleStatus,
     AssetSource,
     AssetType,
@@ -28,6 +29,7 @@ from ..core.enums import (
     Platform,
 )
 from ..core.models import Account, Article, Asset, PublishJob
+from ..core.time import as_utc_naive
 
 # content_type → 该类素材的「主资产」类型（用于把文件挂成 Asset）
 _VIDEO_TYPES = {ContentType.VIDEO}
@@ -287,6 +289,13 @@ def distribute(
     if not accounts:
         raise ValueError("没有可分发的目标账号（检查 target_platforms / account_ids）")
 
+    # Unless the caller explicitly overrides it, a fan-out job inherits the
+    # Article plan. Dropping this value turns a future Article into an immediate
+    # due job as soon as AUTO_PUBLISH_ENABLED is enabled.
+    effective_scheduled_at = as_utc_naive(
+        scheduled_at if scheduled_at is not None else art.scheduled_at
+    )
+
     jobs: list[PublishJob] = []
     for acc in accounts:
         job = PublishJob(
@@ -294,7 +303,7 @@ def distribute(
             account_id=acc.id,
             platform=acc.platform,
             status=JobStatus.PENDING,
-            scheduled_at=scheduled_at,
+            scheduled_at=effective_scheduled_at,
         )
         session.add(job)
         jobs.append(job)
@@ -322,16 +331,28 @@ def list_account_jobs(
 def _resolve_accounts(
     session: Session, art: Article, account_ids: Optional[Sequence[int]]
 ) -> list[Account]:
+    runnable_health = {
+        AccountHealth.HEALTHY,
+        AccountHealth.UNKNOWN,
+    }
     if account_ids:
         rows = session.execute(
             select(Account).where(Account.id.in_(list(account_ids)))
         ).scalars().all()
+        blocked = [row for row in rows if AccountHealth(row.health) not in runnable_health]
+        if blocked:
+            details = ", ".join(
+                f"{row.id}:{AccountHealth(row.health).value}" for row in blocked
+            )
+            raise ValueError(f"目标账号健康状态不可分发: {details}")
         return list(rows)
     # 未指定账号：按素材 target_platforms 取这些平台下所有账号
     platforms = [Platform(p) if not isinstance(p, Platform) else p for p in (art.target_platforms or [])]
     if not platforms:
         return []
     rows = session.execute(
-        select(Account).where(Account.platform.in_([p.value for p in platforms]))
+        select(Account)
+        .where(Account.platform.in_([p.value for p in platforms]))
+        .where(Account.health.in_([health.value for health in runnable_health]))
     ).scalars().all()
     return list(rows)

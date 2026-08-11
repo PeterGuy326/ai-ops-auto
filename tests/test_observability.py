@@ -10,7 +10,6 @@
 """
 from __future__ import annotations
 
-import io
 import json
 import logging
 import sys
@@ -127,7 +126,10 @@ class TestSetupLogging:
         captured = capsys.readouterr().out
         assert "hello text mode" in captured
         # text 模式应该不是合法 JSON
-        line = next((l for l in captured.strip().splitlines() if "hello text mode" in l), "")
+        line = next(
+            (text_line for text_line in captured.strip().splitlines() if "hello text mode" in text_line),
+            "",
+        )
         with pytest.raises(json.JSONDecodeError):
             json.loads(line)
 
@@ -180,7 +182,7 @@ class TestInitObservability:
     def test_idempotent(self, capsys):
         """多次调用 init_observability 只生效一次（避免 handler 重复挂）。"""
         init_observability(log_format="text", log_level="INFO")
-        first = capsys.readouterr().out
+        capsys.readouterr()
         init_observability(log_format="text", log_level="INFO")
         init_observability(log_format="text", log_level="INFO")
         # 第二次开始不应再输出 "observability initialized"
@@ -203,7 +205,10 @@ class TestInitObservability:
         log.info("init_test", extra={"task": "G"})
         captured = capsys.readouterr().out
         # 找 init_test 那行
-        line = next((l for l in captured.strip().splitlines() if "init_test" in l), None)
+        line = next(
+            (text_line for text_line in captured.strip().splitlines() if "init_test" in text_line),
+            None,
+        )
         assert line is not None
         data = json.loads(line)
         assert data["message"] == "init_test"

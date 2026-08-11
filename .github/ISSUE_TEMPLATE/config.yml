@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Private security report
+    url: https://github.com/PeterGuy326/ai-ops-auto/security/advisories/new
+    about: Report vulnerabilities and accidental credential exposure privately.
+  - name: Platform capability matrix
+    url: https://github.com/PeterGuy326/ai-ops-auto/blob/main/docs/platform-capabilities.md
+    about: Check the current Stable/Beta/Experimental/Stub status before filing a platform request.

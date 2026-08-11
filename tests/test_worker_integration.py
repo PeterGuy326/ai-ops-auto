@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -105,6 +105,14 @@ def _mk_publishable_chain(SessionLocal) -> int:
         return job.id
 
 
+def _set_account_health(SessionLocal, job_id: int, health: AccountHealth) -> None:
+    with SessionLocal() as session:
+        job = session.get(PublishJob, job_id)
+        account = session.get(Account, job.account_id)
+        account.health = health
+        session.commit()
+
+
 def _patch_worker_externals(monkeypatch):
     """统一桩掉 worker 外部依赖（凭证 / 限流 / 风控 / 健康 / notify / metrics）。
 
@@ -118,7 +126,7 @@ def _patch_worker_externals(monkeypatch):
     monkeypatch.setattr(
         worker_mod,
         "check_rate_limit",
-        lambda s, aid: RateCheckResult(allowed=True, reason=""),
+        lambda s, aid, **kwargs: RateCheckResult(allowed=True, reason=""),
     )
     monkeypatch.setattr(worker_mod, "mark_published", lambda s, aid: None)
     monkeypatch.setattr(worker_mod, "is_paused", lambda acc: False)
@@ -234,6 +242,32 @@ class TestSessionDetachedRegression:
             assert job.status == JobStatus.RETRYING
             assert job.error == "publisher boom"
 
+    def test_unexpected_publisher_exception_is_unknown_and_not_retried(
+        self, production_session_in_memory, monkeypatch
+    ):
+        SessionLocal = production_session_in_memory
+        job_id = _mk_publishable_chain(SessionLocal)
+        _patch_worker_externals(monkeypatch)
+
+        from ai_ops.scheduler import worker as worker_mod
+
+        async def exploding_publisher(*args, **kwargs):
+            raise RuntimeError("secret-cookie-value")
+
+        monkeypatch.setattr(worker_mod, "_try_publishers", exploding_publisher)
+
+        result = asyncio.run(worker_mod.execute_job(job_id))
+
+        assert result.success is False
+        assert result.outcome_uncertain is True
+        assert result.retryable is False
+        assert "secret-cookie-value" not in (result.error or "")
+        with SessionLocal() as session:
+            job = session.get(PublishJob, job_id)
+            assert job.status == JobStatus.FAILED
+            assert job.raw_response["outcome_uncertain"] is True
+            assert "secret-cookie-value" not in (job.error or "")
+
     def test_orm_attribute_accessible_after_session_close(
         self, production_session_in_memory
     ):
@@ -256,3 +290,102 @@ class TestSessionDetachedRegression:
         assert topic.id == captured_id
         assert topic.name == "t_attr"
         assert captured_name == "t_attr"
+
+    @pytest.mark.parametrize("health", [AccountHealth.DEGRADED, AccountHealth.BANNED, AccountHealth.EXPIRED])
+    def test_unhealthy_account_is_blocked_before_publisher(
+        self, production_session_in_memory, monkeypatch, health
+    ):
+        SessionLocal = production_session_in_memory
+        job_id = _mk_publishable_chain(SessionLocal)
+        _set_account_health(SessionLocal, job_id, health)
+        _patch_worker_externals(monkeypatch)
+
+        from ai_ops.scheduler import worker as worker_mod
+
+        called = False
+
+        async def should_not_publish(*args, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("unhealthy account reached publisher")
+
+        monkeypatch.setattr(worker_mod, "_try_publishers", should_not_publish)
+
+        result = asyncio.run(worker_mod.execute_job(job_id))
+
+        assert result.success is False
+        assert result.retryable is False
+        assert health.value in result.error
+        assert called is False
+        with SessionLocal() as session:
+            assert session.get(PublishJob, job_id).status == JobStatus.FAILED
+
+    def test_expired_ban_pause_still_cannot_reach_publisher(
+        self, production_session_in_memory, monkeypatch
+    ):
+        """Pause expiry permits a health probe, never publication by itself."""
+        SessionLocal = production_session_in_memory
+        job_id = _mk_publishable_chain(SessionLocal)
+        with SessionLocal() as session:
+            job = session.get(PublishJob, job_id)
+            account = session.get(Account, job.account_id)
+            account.health = AccountHealth.BANNED
+            account.profile = {
+                "paused_until": (datetime.utcnow() - timedelta(seconds=1)).isoformat()
+            }
+            session.commit()
+
+        _patch_worker_externals(monkeypatch)
+        from ai_ops.scheduler import worker as worker_mod
+
+        called = False
+
+        async def should_not_publish(*args, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("expired BANNED account reached publisher")
+
+        monkeypatch.setattr(worker_mod, "_try_publishers", should_not_publish)
+
+        result = asyncio.run(worker_mod.execute_job(job_id))
+
+        assert result.success is False
+        assert result.retryable is False
+        assert "banned" in result.error
+        assert called is False
+
+    def test_dead_escalation_sets_seven_day_ban_probe_deadline(
+        self, production_session_in_memory
+    ):
+        SessionLocal = production_session_in_memory
+        job_id = _mk_publishable_chain(SessionLocal)
+        from ai_ops.accounts.health_monitor import BAN_PAUSE_HOURS, get_ban_probe_at
+        from ai_ops.scheduler import worker as worker_mod
+
+        with SessionLocal() as session:
+            current = session.get(PublishJob, job_id)
+            current.status = JobStatus.DEAD
+            current.finished_at = datetime.utcnow()
+            for offset in (1, 2):
+                session.add(
+                    PublishJob(
+                        article_id=current.article_id,
+                        account_id=current.account_id,
+                        platform=current.platform,
+                        status=JobStatus.DEAD,
+                        finished_at=datetime.utcnow() - timedelta(minutes=offset),
+                    )
+                )
+            session.flush()
+
+            worker_mod._escalate_health_on_failure(session, current.account_id)
+            account_id = current.account_id
+            session.commit()
+
+        with SessionLocal() as session:
+            account = session.get(Account, account_id)
+            assert account.health == AccountHealth.BANNED
+            probe_at = get_ban_probe_at(account)
+            assert probe_at is not None
+            hours = (probe_at - datetime.utcnow()).total_seconds() / 3600
+            assert BAN_PAUSE_HOURS - 1 < hours <= BAN_PAUSE_HOURS

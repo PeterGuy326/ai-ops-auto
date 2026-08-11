@@ -126,7 +126,7 @@ class TestProdMode:
 
 
 class TestMainAppIntegration:
-    """复用真实 main.py app 验证路由清单——确保 /health 和 /ui/* 公开。"""
+    """复用真实 main.py app 验证公开探活与 API 路由鉴权。"""
 
     def test_health_public_on_main_app(self, monkeypatch):
         """主 app 上 /health 不需要 key。"""

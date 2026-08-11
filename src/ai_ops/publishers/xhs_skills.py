@@ -1,4 +1,4 @@
-"""white0dew/XiaohongshuSkills 集成 wrapper（小红书专项加固，2.7k⭐）。
+"""white0dew/XiaohongshuSkills 集成 wrapper（小红书可选兼容路径）。
 
 上游真实入口（校对自 scripts/publish_pipeline.py + SKILL.md）：
   python scripts/publish_pipeline.py
@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import os
 import sys
 
 from ..config import settings
@@ -24,6 +26,14 @@ from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
 from ..core.schemas import PublishContent, PublishResult
 from ..runtime.browser_engine import build_subprocess_env
 from .base import PublisherBase
+from .subprocess_utils import communicate_bounded, stop_process_group
+
+
+@dataclass(slots=True)
+class _CommandResult:
+    started: bool
+    returncode: int | None = None
+    timed_out: bool = False
 
 
 class XhsSkillsPublisher(PublisherBase):
@@ -39,6 +49,43 @@ class XhsSkillsPublisher(PublisherBase):
     def _publish_script(self):
         return self._skills_path / "scripts" / "publish_pipeline.py"
 
+    async def _run_cli(self, cmd: list[str], *, timeout_seconds: int) -> _CommandResult:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(self._skills_path),
+                env=build_subprocess_env(),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=os.name == "posix",
+            )
+        except (FileNotFoundError, PermissionError, OSError):
+            return _CommandResult(started=False)
+        try:
+            await asyncio.wait_for(
+                communicate_bounded(proc), timeout=float(timeout_seconds)
+            )
+        except asyncio.CancelledError:
+            try:
+                await stop_process_group(proc)
+            except Exception:
+                pass
+            raise
+        except TimeoutError:
+            try:
+                await stop_process_group(proc)
+            except Exception:
+                pass
+            return _CommandResult(started=True, returncode=proc.returncode, timed_out=True)
+        except Exception:
+            try:
+                await stop_process_group(proc)
+            except Exception:
+                pass
+            return _CommandResult(started=True, returncode=proc.returncode)
+        return _CommandResult(started=True, returncode=proc.returncode)
+
     async def login(self, account_id: int, credential: dict) -> bool:
         """XHS Skills 通过 --preview 启动有窗口浏览器扫码登录。"""
         if not self._publish_script.exists():
@@ -50,14 +97,11 @@ class XhsSkillsPublisher(PublisherBase):
             "--title", "login", "--content", "login",
             # 提供占位图，XHS Skills 要求有 media；TODO 后续看是否有 login-only 子命令
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            env=build_subprocess_env(),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await self._run_cli(
+            cmd,
+            timeout_seconds=min(settings.sau_cli_timeout_seconds, 300),
         )
-        await proc.communicate()
-        return proc.returncode == 0
+        return result.started and not result.timed_out and result.returncode == 0
 
     async def publish(
         self,
@@ -100,20 +144,29 @@ class XhsSkillsPublisher(PublisherBase):
             if local_imgs:
                 cmd += ["--images", *local_imgs]
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            env=build_subprocess_env(),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await self._run_cli(
+            cmd,
+            timeout_seconds=settings.sau_cli_timeout_seconds,
         )
-        stdout, stderr = await proc.communicate()
-        ok = proc.returncode == 0
+        if not result.started:
+            return PublishResult(
+                success=False,
+                error="XHS Skills 发布命令未启动",
+                raw_response={"adapter": "xiaohongshu-skills", "write_started": False},
+            )
+        # The upstream command has no structured note ID/URL contract.  Even a
+        # zero exit code cannot be promoted to confirmed publication.
         return PublishResult(
-            success=ok,
-            error=None if ok else stderr.decode("utf-8", "ignore")[:1000],
+            success=False,
+            retryable=False,
+            outcome_uncertain=True,
+            error="XHS Skills 写入已启动但无 note ID/URL 回执；请先到平台核验",
             raw_response={
-                "stdout": stdout.decode("utf-8", "ignore")[:2000],
-                "cmd": " ".join(cmd),
+                "adapter": "xiaohongshu-skills",
+                "write_started": True,
+                "exit_code": result.returncode,
+                "timed_out": result.timed_out,
+                "outcome": "unknown",
             },
         )
 

@@ -53,8 +53,11 @@ def test_is_lark_cli_available_false_when_which_returns_none():
 # ============================================================================
 # send_via_lark_cli — 核心 7 项
 # ============================================================================
-def test_lark_cli_send_calls_subprocess_with_correct_argv():
+def test_lark_cli_send_calls_subprocess_with_correct_argv(monkeypatch):
     """验证 subprocess.run 拿到的 argv 完全正确（--as user / --chat-id / --text 全齐）。"""
+    monkeypatch.setenv("API_KEY", "management-secret")
+    monkeypatch.setenv("FERNET_KEY", "encryption-secret")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:secret@example/db")
     with patch("ai_ops.notify.lark_cli.shutil.which", return_value="/x/lark-cli"), \
          patch("ai_ops.notify.lark_cli.subprocess.run", return_value=_ok_completed()) as m_run:
         ok = lark_cli.send_via_lark_cli("hello 你好", ["oc_abc"])
@@ -69,6 +72,10 @@ def test_lark_cli_send_calls_subprocess_with_correct_argv():
     assert "--text" in argv and argv[argv.index("--text") + 1] == "hello 你好"
     # 安全红线：不能用 shell=True
     assert m_run.call_args.kwargs.get("shell", False) is False
+    child_env = m_run.call_args.kwargs["env"]
+    assert "API_KEY" not in child_env
+    assert "FERNET_KEY" not in child_env
+    assert "DATABASE_URL" not in child_env
 
 
 def test_lark_cli_send_returns_false_when_cli_not_installed():

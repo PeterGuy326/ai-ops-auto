@@ -1,7 +1,8 @@
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .enums import (
     AccountHealth,
@@ -11,6 +12,21 @@ from .enums import (
     JobStatus,
     Platform,
 )
+
+
+def _validate_account_proxy(value: str) -> str:
+    """Per-account profile data is plaintext, so it may not contain auth."""
+    if not value:
+        return value
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError("proxy URL 不合法") from exc
+    if parsed.scheme not in {"http", "https", "socks5"} or not parsed.hostname:
+        raise ValueError("proxy 必须是 http/https/socks5 URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("账号 profile 以明文存储，proxy URL 不得包含用户名或密码")
+    return value
 
 
 class TopicIn(BaseModel):
@@ -72,6 +88,13 @@ class ArticleIn(BaseModel):
     scheduled_at: Optional[datetime] = None
     extra: dict = Field(default_factory=dict)
 
+    @field_validator("scheduled_at")
+    @classmethod
+    def _normalize_scheduled_at(cls, value: datetime | None) -> datetime | None:
+        from .time import as_utc_naive
+
+        return as_utc_naive(value)
+
 
 class ArticleOut(ArticleIn):
     id: int
@@ -99,8 +122,13 @@ class AccountIn(BaseModel):
     weight: int = Field(default=1, ge=1, le=100, description="分发权重，默认 1")
     proxy: str = Field(
         default="",
-        description="账号专属代理（一机一号一IP 是反风控核心）。格式：http://user:pass@host:port",
+        description="账号专属无认证代理 URL；带用户名/密码的代理只能通过受控环境变量配置。",
     )
+
+    @field_validator("proxy")
+    @classmethod
+    def _proxy_must_not_embed_credentials(cls, value: str) -> str:
+        return _validate_account_proxy(value)
 
 
 class AccountUpdate(BaseModel):
@@ -117,6 +145,11 @@ class AccountUpdate(BaseModel):
     credential_plain: Optional[dict] = Field(default=None, description="如提供则覆盖加密凭证")
     proxy: Optional[str] = Field(default=None, description="账号专属代理；None 表示不变，空串表示清空")
 
+    @field_validator("proxy")
+    @classmethod
+    def _proxy_must_not_embed_credentials(cls, value: str | None) -> str | None:
+        return None if value is None else _validate_account_proxy(value)
+
 
 class AccountOut(BaseModel):
     id: int
@@ -129,6 +162,10 @@ class AccountOut(BaseModel):
     daily_quota: int
     last_publish_at: Optional[datetime]
     last_health_check_at: Optional[datetime]
+    health_recheck_at: Optional[datetime] = Field(
+        default=None,
+        description="BANNED 账号下次允许只读健康探测的时间；不代表自动恢复发布",
+    )
     created_at: datetime
 
     @property
@@ -157,14 +194,36 @@ class PublishContent(BaseModel):
     videos: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     extra: dict = Field(default_factory=dict)
+    # 控制面内部关联键：只用于把外部副作用回执写入 durable spool，绝不应
+    # 被序列化进平台正文、CLI metadata 或 API 响应。
+    job_id: Optional[int] = Field(default=None, exclude=True, repr=False)
+    operation_id: Optional[str] = Field(default=None, exclude=True, repr=False)
 
 
 class PublishResult(BaseModel):
     success: bool
+    # True 表示这次调用确实完成了对外发布副作用；dry-run/preview 即使渲染成功
+    # 也必须为 False，worker 不得把 Article 标成 PUBLISHED。
+    # None 会按 success 推导，兼容旧 Publisher：成功默认已生效、失败默认未生效。
+    effect_applied: Optional[bool] = None
+    # 明确的输入/配置/预览失败不需要消耗剩余自动重试次数。
+    retryable: bool = True
+    # 外部写操作已经发出、但没有拿到可验证的 post id/url 时必须置 True。
+    # 编排层看到它后会停止 Publisher fallback 和自动重试，避免重复发布。
+    outcome_uncertain: bool = False
     platform_post_id: Optional[str] = None
     platform_url: Optional[str] = None
     error: Optional[str] = None
     raw_response: dict = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _infer_effect_semantics(self):
+        if self.effect_applied is None:
+            self.effect_applied = self.success
+        # 已发生部分外部副作用但整体未达成时，自动重试会制造重复内容。
+        if self.effect_applied and not self.success:
+            self.retryable = False
+        return self
 
 
 class VideoBrief(BaseModel):
@@ -302,6 +361,7 @@ class PodcastArtifact(BaseModel):
 class JobOut(BaseModel):
     id: int
     article_id: int
+    topic_id: Optional[int] = None
     account_id: int
     platform: Platform
     status: JobStatus

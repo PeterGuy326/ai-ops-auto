@@ -29,6 +29,7 @@ _SCREEN_POOL = [
 class RateCheckResult:
     allowed: bool
     reason: str = ""
+    retry_at: datetime | None = None
 
     def __bool__(self) -> bool:
         return self.allowed
@@ -38,6 +39,9 @@ def create_account(session: Session, data: AccountIn) -> AccountOut:
     blob = get_store().encrypt(data.credential_plain) if data.credential_plain else b""
     # tags/group/weight 合并进 profile（避免动 ORM schema）
     profile = dict(data.profile)
+    # `proxy` is a reserved top-level input with URL validation. Do not allow
+    # arbitrary profile JSON to bypass that validation.
+    profile.pop("proxy", None)
     if data.tags:
         profile["tags"] = data.tags
     if data.group:
@@ -153,7 +157,12 @@ def is_in_nurture_period(account: Account, days: int | None = None) -> bool:
     return account.created_at + timedelta(days=threshold) > datetime.utcnow()
 
 
-def check_rate_limit(session: Session, account_id: int) -> RateCheckResult:
+def check_rate_limit(
+    session: Session,
+    account_id: int,
+    *,
+    exclude_job_id: int | None = None,
+) -> RateCheckResult:
     """发布前限流校验：养号期 + 最小间隔 + 单日上限。
 
     返回 RateCheckResult，allowed=False 时附带 reason 写入 job.error。
@@ -162,16 +171,19 @@ def check_rate_limit(session: Session, account_id: int) -> RateCheckResult:
     if account is None:
         return RateCheckResult(False, f"account {account_id} 不存在")
 
+    now = datetime.utcnow()
+
     # 1. 养号期
     if is_in_nurture_period(account):
+        eligible_at = account.created_at + timedelta(days=settings.nurture_days)
         days_left = (
-            account.created_at + timedelta(days=settings.nurture_days) - datetime.utcnow()
+            eligible_at - now
         ).days + 1
         return RateCheckResult(
-            False, f"养号期未结束（剩余 ~{days_left} 天，配置 nurture_days={settings.nurture_days}）"
+            False,
+            f"养号期未结束（剩余 ~{days_left} 天，配置 nurture_days={settings.nurture_days}）",
+            retry_at=eligible_at,
         )
-
-    now = datetime.utcnow()
 
     # 2. 最小间隔
     if account.last_publish_at:
@@ -179,20 +191,31 @@ def check_rate_limit(session: Session, account_id: int) -> RateCheckResult:
         if elapsed < settings.publish_min_interval_seconds:
             wait = settings.publish_min_interval_seconds - int(elapsed)
             return RateCheckResult(
-                False, f"距上次发布仅 {int(elapsed)}s，最小间隔 {settings.publish_min_interval_seconds}s（还需等 {wait}s）"
+                False,
+                f"距上次发布仅 {int(elapsed)}s，最小间隔 {settings.publish_min_interval_seconds}s（还需等 {wait}s）",
+                retry_at=account.last_publish_at
+                + timedelta(seconds=settings.publish_min_interval_seconds),
             )
 
-    # 3. 单日上限（按当天成功 + 进行中的 job 计数）
+    # 3. 单日上限（按当天成功 + 正在外呼的 job 计数）。RETRYING 代表上次外呼
+    # 已明确失败，不应继续占额度；否则同账号多个 retry job 会互相占坑到次日。
     today_start = datetime(now.year, now.month, now.day)
     cap = min(account.daily_quota or settings.publish_max_per_day, settings.publish_max_per_day)
-    today_count = session.query(func.count(PublishJob.id)).filter(
+    count_query = session.query(func.count(PublishJob.id)).filter(
         PublishJob.account_id == account_id,
         PublishJob.started_at >= today_start,
-        PublishJob.status.in_([JobStatus.SUCCESS, JobStatus.RUNNING, JobStatus.RETRYING]),
-    ).scalar() or 0
+        PublishJob.status.in_([JobStatus.SUCCESS, JobStatus.RUNNING]),
+    )
+    # execute_job 先 CAS 成 RUNNING 再做门禁；当前 job 不能把自己占用的
+    # 名额重复计入，否则 cap=1 时第一条永远被拒绝。
+    if exclude_job_id is not None:
+        count_query = count_query.filter(PublishJob.id != exclude_job_id)
+    today_count = count_query.scalar() or 0
     if today_count >= cap:
         return RateCheckResult(
-            False, f"今日发布数 {today_count} 已达上限 {cap}（min(daily_quota, publish_max_per_day)）"
+            False,
+            f"今日发布数 {today_count} 已达上限 {cap}（min(daily_quota, publish_max_per_day)）",
+            retry_at=today_start + timedelta(days=1),
         )
 
     return RateCheckResult(True, "ok")
@@ -230,16 +253,28 @@ def get_account_fingerprint(account: Account) -> dict:
 
 
 def _to_out(a: Account) -> AccountOut:
+    from .health_monitor import get_ban_probe_at
+
+    profile = dict(a.profile or {})
+    # Legacy databases may contain secrets in profile. Keep runtime compatibility
+    # internally, but never project common credential fields back through the API.
+    sensitive_fragments = ("password", "passwd", "secret", "token", "cookie", "credential", "api_key")
+    profile = {
+        key: value
+        for key, value in profile.items()
+        if not any(fragment in key.lower() for fragment in sensitive_fragments)
+    }
     return AccountOut(
         id=a.id,
         platform=a.platform,
         nickname=a.nickname,
-        profile=a.profile,
+        profile=profile,
         topic_id=a.topic_id,
         health=a.health,
         risk_level=a.risk_level,
         daily_quota=a.daily_quota,
         last_publish_at=a.last_publish_at,
         last_health_check_at=a.last_health_check_at,
+        health_recheck_at=get_ban_probe_at(a),
         created_at=a.created_at,
     )

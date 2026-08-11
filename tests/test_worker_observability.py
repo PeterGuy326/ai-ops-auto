@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import create_engine
@@ -173,7 +172,7 @@ def db_engine_with_worker(monkeypatch):
     monkeypatch.setattr(
         worker_mod,
         "check_rate_limit",
-        lambda s, aid: RateCheckResult(allowed=True, reason=""),
+        lambda s, aid, **kwargs: RateCheckResult(allowed=True, reason=""),
     )
     # mark_published 在本路径会触发——简单 noop 掉避免触碰 Account 计数细节
     monkeypatch.setattr(worker_mod, "mark_published", lambda s, aid: None)

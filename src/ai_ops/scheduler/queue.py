@@ -1,12 +1,13 @@
 """任务调度后端。第一版 APScheduler，可平滑切 Celery。"""
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime
-from typing import Callable, Coroutine
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from ..config import settings
 from ..observability import get_logger
 from ..observability.sentry import capture_exception
 from .jitter import jitter_publish_time
@@ -18,7 +19,10 @@ class TaskQueue:
     """对调度后端的薄壳，业务代码不直接依赖 APScheduler。"""
 
     def __init__(self) -> None:
-        self._scheduler = AsyncIOScheduler()
+        # Cron expressions are operational local time; pinning the zone avoids
+        # host/container defaults silently shifting daily reports and checks.
+        scheduler_timezone = getattr(settings, "scheduler_timezone", "Asia/Shanghai")
+        self._scheduler = AsyncIOScheduler(timezone=ZoneInfo(scheduler_timezone))
 
     def start(self) -> None:
         if not self._scheduler.running:
@@ -28,16 +32,31 @@ class TaskQueue:
         if self._scheduler.running:
             self._scheduler.shutdown(wait=False)
 
+    @staticmethod
+    async def _run_coro_factory(coro_factory: Callable[[], Awaitable[object]]) -> None:
+        """Run callbacks as a native coroutine on AsyncIOScheduler's event loop.
+
+        A synchronous lambda that calls ``asyncio.create_task`` is dispatched to
+        APScheduler's thread pool, where no running event loop exists. Registering
+        this async function makes AsyncIOExecutor await it in the scheduler loop.
+        """
+        await coro_factory()
+
     def schedule_once(
         self,
         when: datetime,
-        coro_factory: Callable[[], Coroutine],
+        coro_factory: Callable[[], Awaitable[object]],
         job_id: str | None = None,
     ) -> str:
+        # Project datetimes are persisted as naive UTC. APScheduler otherwise
+        # interprets a naive date in the scheduler's local timezone, which can
+        # turn a future metrics callback into an immediate misfire.
+        run_date = when if when.tzinfo is not None else when.replace(tzinfo=timezone.utc)
         job = self._scheduler.add_job(
-            lambda: asyncio.create_task(coro_factory()),
+            self._run_coro_factory,
+            args=(coro_factory,),
             trigger="date",
-            run_date=when,
+            run_date=run_date,
             id=job_id,
             replace_existing=True,
         )
@@ -90,7 +109,7 @@ class TaskQueue:
     def schedule_cron(
         self,
         cron: str,
-        coro_factory: Callable[[], Coroutine],
+        coro_factory: Callable[[], Awaitable[object]],
         job_id: str | None = None,
     ) -> str:
         """注册 Linux cron 表达式。
@@ -112,7 +131,8 @@ class TaskQueue:
             "day_of_week": self._translate_linux_dow(dow),
         }
         job = self._scheduler.add_job(
-            lambda: asyncio.create_task(coro_factory()),
+            self._run_coro_factory,
+            args=(coro_factory,),
             trigger="cron",
             id=job_id,
             replace_existing=True,
@@ -135,7 +155,7 @@ class TaskQueue:
     def schedule_publish(
         self,
         planned: datetime,
-        coro_factory: Callable[[], Coroutine],
+        coro_factory: Callable[[], Awaitable[object]],
         job_id: str | None = None,
         *,
         avoid_night: bool = True,

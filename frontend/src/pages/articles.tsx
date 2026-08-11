@@ -21,6 +21,7 @@ import {
 import { CategoryBadge } from "@/components/topics/category-badge"
 import { Label } from "@/components/ui/label"
 import { categoryLabel } from "@/lib/topic-utils"
+import { QueryError } from "@/components/query-error"
 
 const STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
   draft: "outline",
@@ -36,7 +37,7 @@ const ALL = "__all__"
 
 export default function Articles() {
   const { topicId, setTopicId } = useTopicFilter()
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["articles", { topic_id: topicId ?? null }],
     queryFn: () => api.articles(topicId),
   })
@@ -78,7 +79,9 @@ export default function Articles() {
           <CardTitle>文章列表（{data?.length ?? 0}）</CardTitle>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
+          {error ? (
+            <QueryError error={error} />
+          ) : isLoading ? (
             <p className="text-sm text-muted-foreground">加载中...</p>
           ) : data && data.length > 0 ? (
             <Table>

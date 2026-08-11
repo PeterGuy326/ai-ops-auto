@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from ..accounts.manager import get_credential
 from ..core.db import session_scope
 from ..core.enums import Platform
-from ..core.models import Article, Metrics, PublishJob
+from ..core.models import Metrics, PublishJob
 from ..publishers.registry import default_registry
 from ..observability import get_logger
 from ..observability.sentry import capture_exception
@@ -29,6 +29,28 @@ DEFAULT_INTERVALS_SECONDS = (3600, 86400, 604800)  # 1h / 24h / 7d
 #   - 改飞轮档位时，记得同时更新这两个常量（test_health_eval_interval_index_constant_exists 守护）
 #   - DEFAULT_INTERVALS_SECONDS[HEALTH_EVAL_INTERVAL_INDEX] 必须语义上等于 24h（86400）
 HEALTH_EVAL_INTERVAL_INDEX = 1
+
+
+def _collection_skip_reason(data: object) -> str | None:
+    """Recognize an unavailable collection without converting it to zeroes."""
+    if not isinstance(data, dict):
+        return "collector 返回了无效结果"
+    if data.get("skipped"):
+        return str(data.get("reason") or "collector 跳过采集")
+
+    raw = data.get("raw")
+    if isinstance(raw, dict):
+        if raw.get("error"):
+            return "collector 报告采集错误"
+        if raw.get("not_found"):
+            return "collector 未找到目标内容"
+        if raw.get("http_status") not in (None, 200):
+            return f"collector HTTP 状态 {raw['http_status']}"
+
+    required_counts = {"likes", "comments", "shares", "views"}
+    if not required_counts.issubset(data):
+        return "collector 缺少标准指标字段"
+    return None
 
 
 async def collect_one(
@@ -62,22 +84,67 @@ async def collect_one(
         if job is None or not job.platform_post_id:
             return {"skipped": True, "reason": "job 不存在或没有 platform_post_id"}
 
+        platform = Platform(job.platform)
+        publisher_kind = (job.publisher_kind or "").strip()
+        publisher = default_registry.resolve_collector(platform, publisher_kind)
+        if publisher is None:
+            if publisher_kind:
+                reason = f"publisher {publisher_kind} 不支持 metrics 采集"
+            else:
+                reason = f"无 {platform.value} 明确支持 metrics 的 publisher"
+            return {
+                "skipped": True,
+                "reason": reason,
+                "publisher_kind": publisher_kind,
+            }
+
         try:
             credential = get_credential(s, job.account_id)
         except ValueError:
             return {"skipped": True, "reason": "凭证缺失"}
 
-        platform = Platform(job.platform)
-        publishers = default_registry.resolve(platform)
-        if not publishers:
-            return {"skipped": True, "reason": f"无 {platform} publisher"}
-        publisher = publishers[0]
         post_id = job.platform_post_id
         post_url = job.platform_url
         article_id = job.article_id
 
     # 跳出事务调外部接口
-    data = await publisher.collect_metrics(post_id, post_url, credential)
+    try:
+        data = await publisher.collect_metrics(post_id, post_url, credential)
+    except Exception as exc:
+        # A collector exception is missing evidence, not evidence of zero
+        # engagement. Keep it out of Metrics and account-health evaluation.
+        logger.warning(
+            "metrics collector failed; snapshot skipped",
+            extra={
+                "job_id": job_id,
+                "publisher_kind": publisher_kind,
+                "exception_type": type(exc).__name__,
+            },
+        )
+        try:
+            capture_exception(
+                exc,
+                scope="metrics.collect_one",
+                job_id=job_id,
+                publisher_kind=publisher_kind,
+            )
+        except Exception:
+            logger.exception(
+                "metrics collector failure could not be reported",
+                extra={"job_id": job_id, "publisher_kind": publisher_kind},
+            )
+        return {
+            "skipped": True,
+            "reason": f"collector 执行失败（{type(exc).__name__}）",
+            "publisher_kind": publisher_kind,
+        }
+    collection_skip_reason = _collection_skip_reason(data)
+    if collection_skip_reason is not None:
+        return {
+            "skipped": True,
+            "reason": collection_skip_reason,
+            "publisher_kind": publisher_kind,
+        }
 
     with session_scope() as s:
         m = Metrics(
@@ -202,14 +269,12 @@ def schedule_after_publish(
     闭包陷阱注意：for 内 lambda 必须用默认参数 early-binding 捕获 jid + i，
     否则 Python late-binding 会让 3 个 lambda 全部捕获最后一次的 (job_id, idx)。
     """
-    import asyncio
-
     ids = []
     for idx, delay in enumerate(intervals):
         when = datetime.utcnow() + timedelta(seconds=delay)
         sid = queue.schedule_once(
             when,
-            (lambda jid=job_id, i=idx: asyncio.create_task(collect_one(jid, interval_index=i))),
+            (lambda jid=job_id, i=idx: collect_one(jid, interval_index=i)),
             job_id=f"metrics-{job_id}-{delay}",
         )
         ids.append(sid)

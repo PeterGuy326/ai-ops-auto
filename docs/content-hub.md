@@ -1,7 +1,9 @@
 # 素材管理中台 · 使用说明
 
 > 一句话：**AI 生成 / 历史回填 → 统一素材库 → 先审后发 → 按个人账号分发并留痕**。
-> 内网免费、无封控、本地零算力；先审核再分发，不直怼平台。
+> 开源默认不配置任何内网/云服务或通知目标；先审核再分发。
+> 当前 `approve` 是共享管理 `API_KEY` 下的状态迁移，不会验证调用者一定是人；强制人工审批需由
+> 外部权限/工作流保证。
 
 ## 1. 底层逻辑（一张图）
 
@@ -16,7 +18,8 @@ AI 生成（短剧 / 播客 / 博客 / 图文）┐
 
 - **素材** = `Article`（含文章/视频/博客/播客，content_type=IMAGE_TEXT/VIDEO/LONG_ARTICLE/AUDIO）+ `Asset`（视频/图片/音频文件）。
 - **分发记录** = `PublishJob`（挂 `account_id` + platform + status + platform_url）——天然按**个人账号**留痕。
-- **不直发**：所有内容先落 DRAFT，人工 `approve` 后才能 `distribute`。
+- **状态门槛**：所有内容先落 DRAFT，调用 `approve` 进入 READY 后才能 `distribute`；当前 API
+  只校验管理 key，不校验审批者身份。
 
 ## 2. 核心模块
 
@@ -25,7 +28,7 @@ AI 生成（短剧 / 播客 / 博客 / 图文）┐
 | `content/distributor.py` | 入库 / 审核 / 分发 / 留痕 / 历史回填 |
 | `content/collector.py` | 平台导出文件（CSV/JSON）→ 历史回填 |
 | `pipeline/{script_to_drama,topic_to_podcast,topic_to_blog}.py` | 三场景生成 |
-| `video/happyhorse.py` | 内网 HappyHorse 文生视频（短剧主力） |
+| `video/happyhorse.py` | 可选 HappyHorse 兼容协议文生视频适配器 |
 | `scheduler/worker.py` | 消费 PublishJob 真发布（含风控闭环） |
 | `api/main.py` `/ui/accounts/{id}` | 账号详情页（历史+新发记录可视化） |
 
@@ -81,23 +84,19 @@ recs = distributor.list_account_jobs(session, account_id)      # 历史 + 新发
 
 ## 5. 视频引擎（短剧）配置
 
-内网 HappyHorse（`.env`，gitignore，零算力无封控）：
-```
-WUKONG_API_KEY=<悟空开放平台 aiopsauto 子AK>
+HappyHorse 是可选的兼容协议适配器。开源配置不附带端点或凭证；使用者必须填写自己有权访问的服务：
+
+```dotenv
+WUKONG_API_KEY=
+WUKONG_VIDEO_JOBS_URL=
 WUKONG_VIDEO_MODEL=happyhorse-1.0-t2v
-# 端点 https://idealab.alibaba-inc.com/api/openai/v1/video/generations/jobs（默认值）
 ```
-脚本生成走内网 IdeaLab LLM（免费）：
-```
-OPENAI_BASE_URL=https://idealab.alibaba-inc.com/api/openai/v1
-OPENAI_API_KEY=<IdeaLab key>
-OPENAI_MODEL=qwen3.7-max
-```
-`build_default_video_engine()`：配了 WUKONG_API_KEY 自动用 HappyHorse，否则回退可灵/MPT。
+
+LLM 默认使用公开 OpenAI 端点；也可配置你自己有权使用的 OpenAI 兼容网关。不要把 key 或私有端点提交到仓库。
 
 ## 6. 现状与边界
 
-- ✅ 已闭环：生成 / 历史回填 / 审核 / 按账号分发 / 留痕 / 后台可视化（385 测试通过）。
+- 已有生成 / 历史回填 / 审核 / 按账号分发 / 留痕 / 后台可视化的代码与自动化测试。
 - ⚠️ **真上传平台**（抖音等）需在能装 `social-auto-upload` + 账号 cookie 的机器上跑 worker；
-  本机不可上传，但 `distribute` 已建好分发记录，worker 接上环境即真发。
+  它们不是当前可用承诺；以 [平台能力矩阵](platform-capabilities.md) 为准。
 - ⚠️ 播客 ListenHub 需自备 Free key（`LISTENHUB_API_KEY`）。

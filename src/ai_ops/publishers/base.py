@@ -13,6 +13,9 @@ class PublisherBase(ABC):
 
     platform: Platform
     kind: PublisherKind
+    # Metrics routing is opt-in. A synthetic zero from an unsupported adapter
+    # is indistinguishable from a real zero-view post and can poison health.
+    supports_metrics: bool = False
 
     @abstractmethod
     async def login(self, account_id: int, credential: dict) -> bool:
@@ -39,7 +42,7 @@ class PublisherBase(ABC):
     ) -> dict:
         """采集已发布内容的互动数据。
 
-        默认实现返回空（不强求每个 publisher 都做数据采集，按需 override）。
-        返回 dict 字段：{likes, comments, shares, views, raw}
+        Adapters must override this method and set ``supports_metrics=True``.
+        Unsupported collection is a routing decision, never a synthetic zero.
         """
-        return {"likes": 0, "comments": 0, "shares": 0, "views": 0, "raw": {}}
+        raise NotImplementedError(f"{type(self).__name__} does not support metrics collection")

@@ -24,11 +24,9 @@ P7-X 上轮把 worker.py 3 处黑洞补上 capture_exception，本套件覆盖 s
 from __future__ import annotations
 
 import asyncio
-import sys
 from contextlib import contextmanager
 from unittest.mock import MagicMock
 
-import pytest
 from sqlalchemy import create_engine
 
 from ai_ops.core.db import SessionLocal as _ProdSessionLocal
@@ -176,6 +174,40 @@ class TestHealthObservabilityHooks:
         assert cap["account_id"] == account_id
         assert "platform" in cap
 
+    def test_unknown_health_uses_next_read_only_adapter(self, monkeypatch):
+        """CLI unavailable (UNKNOWN) must not hide a healthy browser session."""
+        from ai_ops.scheduler import health as health_mod
+
+        SessionLocal = _build_engine_and_session()
+        account_id = _mk_account(SessionLocal)
+        _install_session_scope(monkeypatch, health_mod, SessionLocal)
+        monkeypatch.setattr(health_mod, "get_credential", lambda s, aid: {})
+
+        calls: list[str] = []
+
+        async def unknown(aid, cred):
+            calls.append("cli")
+            return AccountHealth.UNKNOWN
+
+        async def healthy(aid, cred):
+            calls.append("browser")
+            return AccountHealth.HEALTHY
+
+        cli_pub = MagicMock()
+        cli_pub.health_check = unknown
+        browser_pub = MagicMock()
+        browser_pub.health_check = healthy
+        monkeypatch.setattr(
+            health_mod.default_registry,
+            "resolve",
+            lambda platform: [cli_pub, browser_pub],
+        )
+
+        result = asyncio.run(health_mod.check_all_accounts())
+
+        assert calls == ["cli", "browser"]
+        assert result["results"][account_id] == AccountHealth.HEALTHY.value
+
     def test_health_notify_failure_captured(self, monkeypatch):
         """account_expired 抛 → capture(scope='scheduler.health.notify') + account_id。
 
@@ -312,6 +344,8 @@ class TestMetricsObservabilityHooks:
             return {"likes": 1, "comments": 0, "shares": 0, "views": 10, "raw": {}}
 
         fake_pub = MagicMock()
+        fake_pub.kind = "test"
+        fake_pub.supports_metrics = True
         fake_pub.collect_metrics = fake_collect
         monkeypatch.setattr(
             metrics_mod.default_registry, "resolve", lambda platform: [fake_pub]
@@ -354,6 +388,8 @@ class TestMetricsObservabilityHooks:
             return {"likes": 1, "comments": 0, "shares": 0, "views": 10, "raw": {}}
 
         fake_pub = MagicMock()
+        fake_pub.kind = "test"
+        fake_pub.supports_metrics = True
         fake_pub.collect_metrics = fake_collect
         monkeypatch.setattr(
             metrics_mod.default_registry, "resolve", lambda platform: [fake_pub]

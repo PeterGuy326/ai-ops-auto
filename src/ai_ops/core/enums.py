@@ -69,6 +69,8 @@ class AccountHealth(str, Enum):
 class PublisherKind(str, Enum):
     """发布器实现类型，决定底层调用哪个外部工具。"""
     SOCIAL_AUTO_UPLOAD = "social_auto_upload"
+    ZHIHU_CLI = "zhihu_cli"
+    YOUTUBE_UPLOADER = "youtube_uploader"
     XHS_TOOLKIT = "xhs_toolkit"
     XHS_AI_PUBLISHER = "xhs_ai_publisher"
     SHORT_VIDEO_AUTO = "short_video_auto"

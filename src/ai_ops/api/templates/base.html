@@ -67,6 +67,12 @@
       <a href="/ui/jobs">任务</a>
       <a href="/docs">API 文档</a>
     </nav>
+    {% if request.state.ui_auth_enabled %}
+    <form method="post" action="/ui/logout" style="margin-left:auto">
+      <input type="hidden" name="csrf_token" value="{{ request.state.ui_csrf_token }}">
+      <button type="submit" style="background:transparent;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:6px 10px;cursor:pointer">退出</button>
+    </form>
+    {% endif %}
   </header>
   <main>
     {% block body %}{% endblock %}

@@ -37,7 +37,11 @@ config = context.config
 
 # 日志：alembic.ini 的 [loggers] 配置直接生效（默认 WARN，不刷屏）
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # ``command.upgrade`` can run inside the API/worker process in explicit
+    # dev auto-upgrade mode.  logging.config.fileConfig defaults to disabling
+    # every pre-existing non-root logger, which would silently kill notify /
+    # observability logs after a successful migration.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

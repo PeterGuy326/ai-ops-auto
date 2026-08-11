@@ -11,11 +11,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
-from ai_ops.content.asset_processor import process_image, process_images
+from ai_ops.content.asset_processor import diversify_video, process_image, process_images
 
 
 def _make_test_jpg(tmp_path: Path, name: str = "src.jpg", size=(800, 600), color="red") -> Path:
@@ -156,3 +157,105 @@ def test_process_image_explicit_publish_time(tmp_path):
     dt = exif.get(0x9003) or ""  # DateTimeOriginal
     # 应该是 2026:01:01 附近（offset ±3600s 内）
     assert dt.startswith("2026:01:01") or dt.startswith("2025:12:31") or dt.startswith("2026:01:02")
+
+
+def test_diversify_video_requires_successful_ffmpeg_probe_before_atomic_replace(
+    tmp_path,
+    monkeypatch,
+):
+    from ai_ops.content import asset_processor as mod
+
+    src = tmp_path / "source.mp4"
+    src.write_bytes(b"source-video")
+    out = tmp_path / "out"
+    calls: list[list[str]] = []
+    replaces: list[tuple[Path, Path]] = []
+
+    monkeypatch.setattr(mod.shutil, "which", lambda name: f"/tools/{name}")
+    monkeypatch.setattr(mod.settings, "browser_engine", "patchright")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/browser-sitecustomize")
+    monkeypatch.setenv("API_KEY", "control-secret")
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        assert "PYTHONPATH" not in kwargs["env"]
+        assert "AI_OPS_STEALTH" not in kwargs["env"]
+        assert "API_KEY" not in kwargs["env"]
+        if argv[0] == "/tools/ffmpeg":
+            Path(argv[-1]).write_bytes(b"complete-transcode")
+            return SimpleNamespace(returncode=0, stdout=None)
+        return SimpleNamespace(returncode=0, stdout=b"video\n")
+
+    real_replace = mod.os.replace
+
+    def record_replace(source, destination):
+        replaces.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(mod.os, "replace", record_replace)
+
+    result = diversify_video(src, out, seed=7)
+
+    assert result != src
+    assert result.read_bytes() == b"complete-transcode"
+    assert [call[0] for call in calls] == ["/tools/ffmpeg", "/tools/ffprobe"]
+    assert len(replaces) == 1
+    assert replaces[0][0].name.endswith(".tmp.mp4")
+    assert replaces[0][1] == result
+    assert not list(out.glob("*.tmp.mp4"))
+
+
+def test_diversify_video_nonzero_ffmpeg_cleans_partial_and_returns_source(
+    tmp_path,
+    monkeypatch,
+):
+    from ai_ops.content import asset_processor as mod
+
+    src = tmp_path / "source.mp4"
+    src.write_bytes(b"source-video")
+    out = tmp_path / "out"
+    monkeypatch.setattr(mod.shutil, "which", lambda name: f"/tools/{name}")
+
+    def fake_run(argv, **kwargs):
+        assert argv[0] == "/tools/ffmpeg", "ffprobe must not run after ffmpeg failure"
+        Path(argv[-1]).write_bytes(b"partial")
+        return SimpleNamespace(returncode=9, stdout=None)
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        mod.os,
+        "replace",
+        lambda *args: pytest.fail("partial output must never replace destination"),
+    )
+
+    assert diversify_video(src, out, seed=8) == src
+    assert list(out.iterdir()) == []
+
+
+def test_diversify_video_failed_probe_cleans_output_and_returns_source(
+    tmp_path,
+    monkeypatch,
+):
+    from ai_ops.content import asset_processor as mod
+
+    src = tmp_path / "source.mp4"
+    src.write_bytes(b"source-video")
+    out = tmp_path / "out"
+    monkeypatch.setattr(mod.shutil, "which", lambda name: f"/tools/{name}")
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "/tools/ffmpeg":
+            Path(argv[-1]).write_bytes(b"not-a-real-video")
+            return SimpleNamespace(returncode=0, stdout=None)
+        return SimpleNamespace(returncode=1, stdout=b"")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        mod.os,
+        "replace",
+        lambda *args: pytest.fail("unprobed output must never replace destination"),
+    )
+
+    assert diversify_video(src, out, seed=9) == src
+    assert list(out.iterdir()) == []

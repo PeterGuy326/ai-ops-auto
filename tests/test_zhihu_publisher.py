@@ -133,6 +133,9 @@ def test_do_publish_returns_failure_when_url_is_draft():
     result: PublishResult = asyncio.run(pub._do_publish(page, _content()))
 
     assert result.success is False, "草稿 URL 不应被判 success——这是 publishing-sop §九 TODO 第 6 项核心修复"
+    assert result.effect_applied is True
+    assert result.outcome_uncertain is False
+    assert result.retryable is False
     assert "草稿" in (result.error or "")
     assert result.platform_url == draft_url  # 草稿 URL 保留供运营人工排查
     assert result.raw_response["is_published"] is False
@@ -172,7 +175,60 @@ def test_do_publish_returns_failure_when_url_pattern_unknown():
     result = asyncio.run(pub._do_publish(page, _content()))
 
     assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
     assert "草稿" in (result.error or "") or "URL 异常" in (result.error or "")
+
+
+def test_do_publish_click_exception_is_unknown_external_effect():
+    """发布按钮调用本身抛错也可能已送达平台，绝不能安全重试。"""
+    pub = ZhihuPublisher()
+    page = _build_publish_page("https://zhuanlan.zhihu.com/p/98765")
+    page.wait_for_selector.return_value.click = AsyncMock(
+        side_effect=RuntimeError("navigation destroyed the execution context")
+    )
+
+    result = asyncio.run(pub._do_publish(page, _content()))
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert result.raw_response["write_started"] is True
+
+
+def test_publish_preserves_confirmed_receipt_when_browser_close_fails(monkeypatch):
+    """本地 browser.close 失败不能覆盖已经取得的知乎公开 URL/ID。"""
+    pub = ZhihuPublisher()
+    page = _build_publish_page("https://zhuanlan.zhihu.com/p/98765")
+    context = MagicMock()
+    context.add_cookies = AsyncMock()
+    context.new_page = AsyncMock(return_value=page)
+    browser = MagicMock()
+    browser.new_context = AsyncMock(return_value=context)
+    browser.close = AsyncMock(side_effect=RuntimeError("close failed"))
+    playwright = MagicMock()
+    playwright.chromium.launch = AsyncMock(return_value=browser)
+
+    class _PlaywrightContext:
+        async def __aenter__(self):
+            return playwright
+
+        async def __aexit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(zh, "get_async_playwright", lambda: lambda: _PlaywrightContext())
+
+    result = asyncio.run(
+        pub.publish(1, {"cookies": [{"name": "z_c0", "value": "redacted"}]}, _content())
+    )
+
+    assert result.success is True
+    assert result.effect_applied is True
+    assert result.platform_post_id == "98765"
+    assert result.platform_url == "https://zhuanlan.zhihu.com/p/98765"
+    assert result.raw_response["teardown_error"] == "RuntimeError"
 
 
 # ============== metadata 兜底 ==============

@@ -16,11 +16,13 @@
 <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
   {% if article.status == 'draft' %}
     <form method="post" action="/ui/articles/{{ article.id }}/approve">
+      <input type="hidden" name="csrf_token" value="{{ request.state.ui_csrf_token }}">
       <button type="submit" style="background:#238636;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:14px;cursor:pointer">✓ 审核通过 → READY</button>
     </form>
     <span style="color:#8b949e;align-self:center">待审核。通过后才能分发，不会直发平台。</span>
   {% elif article.status == 'ready' %}
     <form method="post" action="/ui/articles/{{ article.id }}/distribute" class="meta-card" style="display:block">
+      <input type="hidden" name="csrf_token" value="{{ request.state.ui_csrf_token }}">
       <div class="label" style="margin-bottom:8px">选择分发账号（不选=按目标平台全选）</div>
       {% for acc in candidate_accounts %}
         <label style="display:block;margin:4px 0;font-size:13px">

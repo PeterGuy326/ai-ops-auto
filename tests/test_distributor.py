@@ -11,12 +11,16 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from ai_ops.content import distributor as dist
+from ai_ops.content import manager as content_manager
 from ai_ops.core.enums import (
+    AccountHealth,
     ArticleStatus,
     AssetType,
     ContentType,
@@ -24,6 +28,7 @@ from ai_ops.core.enums import (
     Platform,
 )
 from ai_ops.core.models import Account, Article, Asset, Base, PublishJob, Topic
+from ai_ops.core.schemas import ArticleIn
 
 
 @pytest.fixture()
@@ -111,6 +116,98 @@ def test_distribute_auto_pick_by_platform(session, topic):
     jobs = dist.distribute(session, art.id)          # 不传账号 → 按 target_platforms 自动选
     assert {j.account_id for j in jobs} == {dy.id, xhs.id}
     assert {j.platform for j in jobs} == {Platform.DOUYIN, Platform.XIAOHONGSHU}
+
+
+def test_distribute_does_not_select_unhealthy_accounts(session, topic):
+    art = dist.stage_to_library(
+        session,
+        topic_id=topic.id,
+        title="健康门禁",
+        content_type=ContentType.VIDEO,
+        target_platforms=[Platform.DOUYIN],
+    )
+    healthy = _acc(session, Platform.DOUYIN, "健康账号")
+    banned = _acc(session, Platform.DOUYIN, "封禁账号")
+    banned.health = AccountHealth.BANNED
+    dist.approve(session, art.id)
+
+    jobs = dist.distribute(session, art.id)
+
+    assert [job.account_id for job in jobs] == [healthy.id]
+
+
+def test_explicit_unhealthy_account_is_rejected(session, topic):
+    art = dist.stage_to_library(
+        session,
+        topic_id=topic.id,
+        title="显式健康门禁",
+        content_type=ContentType.VIDEO,
+        target_platforms=[Platform.DOUYIN],
+    )
+    expired = _acc(session, Platform.DOUYIN, "过期账号")
+    expired.health = AccountHealth.EXPIRED
+    dist.approve(session, art.id)
+
+    with pytest.raises(ValueError, match=r"健康状态不可分发.*expired"):
+        dist.distribute(session, art.id, account_ids=[expired.id])
+
+
+def test_distributed_jobs_inherit_future_article_schedule(session, topic):
+    planned = datetime.utcnow() + timedelta(days=1)
+    art = dist.stage_to_library(
+        session,
+        topic_id=topic.id,
+        title="明天再发",
+        content_type=ContentType.VIDEO,
+        video_paths=["/v.mp4"],
+        target_platforms=[Platform.DOUYIN],
+    )
+    art.scheduled_at = planned
+    account = _acc(session, Platform.DOUYIN, "排期账号")
+    dist.approve(session, art.id)
+
+    jobs = dist.distribute(session, art.id, account_ids=[account.id])
+
+    assert len(jobs) == 1
+    assert jobs[0].scheduled_at == planned
+
+
+def test_aware_article_schedule_round_trips_as_utc_naive_job(session, topic):
+    local_plan = datetime(
+        2026,
+        8,
+        10,
+        10,
+        0,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+    article_out = content_manager.create_article(
+        session,
+        ArticleIn(
+            topic_id=topic.id,
+            title="带时区排期",
+            content_type=ContentType.VIDEO,
+            target_platforms=[Platform.DOUYIN],
+            scheduled_at=local_plan,
+        ),
+    )
+    account = _acc(session, Platform.DOUYIN, "时区账号")
+    article_id = article_out.id
+    account_id = account.id
+    # Emulate separate create and distribute API requests: force a DB round trip
+    # before the second operation so SQLite cannot hide timezone loss in memory.
+    session.commit()
+    session.expunge_all()
+    assert session.get(Article, article_id).scheduled_at == datetime(2026, 8, 10, 2, 0)
+
+    dist.approve(session, article_id)
+    jobs = dist.distribute(session, article_id, account_ids=[account_id])
+    job_id = jobs[0].id
+    session.commit()
+    session.expunge_all()
+
+    reloaded = session.get(PublishJob, job_id)
+    assert reloaded.scheduled_at == datetime(2026, 8, 10, 2, 0)
 
 
 def test_list_account_jobs_records(session, topic):

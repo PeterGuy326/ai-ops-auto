@@ -13,7 +13,7 @@
   2. 指纹按 account_id 派生（accounts.manager.get_account_fingerprint）—— 同账号每次 launch 同指纹
   3. proxy 优先取账号 profile.proxy，settings.browser_proxy 仅兜底
   4. humanize=True —— Camoufox 内置的真人化鼠标轨迹
-  5. 发布前/后各刷一次推荐流 ——模拟真人发布场景
+  5. 发布前浏览推荐流；提交后不再导航，避免覆盖发布回执
   6. 文案在生成层经 content.humanize 处理，规避 AI 检测
 
 不做：
@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..accounts.manager import get_account_fingerprint, get_account_proxy
 from ..config import settings
@@ -91,6 +93,29 @@ _URL_HOME = "https://www.xiaohongshu.com/explore"
 _URL_CREATOR_HOME = "https://creator.xiaohongshu.com"
 _URL_PUBLISH = "https://creator.xiaohongshu.com/publish/publish"
 _URL_USER = "https://www.xiaohongshu.com/user/profile"
+_PUBLIC_NOTE_PATH = re.compile(r"^/explore/([0-9a-f]{24})/?$")
+
+
+def _parse_public_note_url(value: str) -> tuple[str, str] | None:
+    """Return a receipt only for a strict public Xiaohongshu note URL."""
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "www.xiaohongshu.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        return None
+    match = _PUBLIC_NOTE_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    note_id = match.group(1)
+    return note_id, f"https://www.xiaohongshu.com/explore/{note_id}"
 
 
 def _try_selectors(selectors: list[str]) -> str:
@@ -311,41 +336,52 @@ class XhsCamoufoxPublisher(PublisherBase):
 
             # —— 9. 点发布 ——
             try:
-                await page.locator(_try_selectors(_XhsSelectors.PUBLISH_BTN)).first.click(timeout=8000)
+                await page.locator(_try_selectors(_XhsSelectors.PUBLISH_BTN)).first.click(
+                    timeout=8000
+                )
             except Exception as e:
-                return PublishResult(success=False, error=f"点击发布失败: {e}")
+                return PublishResult(
+                    success=False,
+                    retryable=False,
+                    outcome_uncertain=True,
+                    error=f"小红书发布点击状态未知: {type(e).__name__}",
+                    raw_response={"write_started": True, "receipt": "missing"},
+                )
 
             # —— 10. 等结果 ——
-            ok = False
-            url = None
+            ui_confirmation_seen = False
+            receipt: tuple[str, str] | None = None
             for _ in range(30):
                 await asyncio.sleep(1)
                 if await page.locator(_try_selectors(_XhsSelectors.SUCCESS_TOAST)).count() > 0:
-                    ok = True
+                    ui_confirmation_seen = True
+                receipt = _parse_public_note_url(page.url or "")
+                if receipt is not None:
                     break
-                # 跳转到笔记详情/创作中心首页一般也表示成功
-                if "/explore" in page.url or page.url.startswith(_URL_CREATOR_HOME) and "publish" not in page.url:
-                    ok = True
-                    url = page.url
-                    break
+                # Creator-home redirect is evidence that the form was accepted,
+                # not a public post identity. Keep waiting for a strict receipt.
+                if page.url.startswith(_URL_CREATOR_HOME) and "publish" not in page.url:
+                    ui_confirmation_seen = True
 
-            # —— 11. 真人化后置：刷一会儿推荐流再退 ——
-            try:
-                await page.goto(_URL_HOME, wait_until="domcontentloaded", timeout=20000)
-                await self._human_browse(page, dwell_seconds=random.uniform(15, 30))
-            except Exception:
-                pass
-
-            if not ok:
+            if receipt is not None:
+                note_id, note_url = receipt
                 return PublishResult(
-                    success=False,
-                    error="发布后未检测到成功标志（toast 未出现 / 未跳转）",
-                    raw_response={"final_url": page.url},
+                    success=True,
+                    platform_post_id=note_id,
+                    platform_url=note_url,
+                    raw_response={"receipt": "strict_public_note_url"},
                 )
             return PublishResult(
-                success=True,
-                platform_url=url,
-                raw_response={"final_url": page.url},
+                success=False,
+                effect_applied=True if ui_confirmation_seen else False,
+                retryable=False,
+                outcome_uncertain=True,
+                error="小红书写入已发出但未取得严格公开笔记 ID/URL；请到平台核验",
+                raw_response={
+                    "write_started": True,
+                    "ui_confirmation_seen": ui_confirmation_seen,
+                    "receipt": "missing",
+                },
             )
 
     async def health_check(self, account_id: int, credential: dict) -> AccountHealth:

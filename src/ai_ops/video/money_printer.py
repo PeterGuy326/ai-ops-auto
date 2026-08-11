@@ -1,4 +1,4 @@
-"""harry0703/MoneyPrinterTurbo 集成 wrapper（57k⭐，主力视频引擎）。
+"""harry0703/MoneyPrinterTurbo 集成 wrapper（可选视频引擎）。
 
 技术栈：ImageMagick + MoviePy + FFmpeg + LLM。
 集成方式：
@@ -10,16 +10,60 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
+import tempfile
 
 from ..config import settings
 from ..core.enums import VideoEngineKind
 from ..core.schemas import VideoArtifact, VideoBrief
+from ..runtime.browser_engine import build_subprocess_env
+from ..runtime.subprocess import communicate_bounded, stop_process_group
 from .base import VideoEngineBase
 
 
 class MoneyPrinterEngine(VideoEngineBase):
     kind = VideoEngineKind.MONEY_PRINTER_TURBO
+
+    def _mpt_root(self) -> Path:
+        return Path(os.path.abspath(settings.external_mpt_path))
+
+    def _cli_boundary(self) -> tuple[Path, Path, Path, Path]:
+        """Validate the local MPT repository, entrypoint and isolated Python.
+
+        The interpreter path is checked lexically rather than resolved because
+        a normal venv ``bin/python`` is itself a symlink.  It must still be
+        configured beneath the MPT repository so a typo cannot execute an
+        arbitrary PATH/control-plane interpreter.
+        """
+        root = self._mpt_root()
+        if not root.is_dir():
+            raise RuntimeError(f"MPT 路径不存在或不是目录: {root}")
+
+        entry = root / "main.py"
+        if not entry.is_file() or entry.is_symlink():
+            raise RuntimeError(f"MPT CLI 入口无效: {entry}")
+
+        configured_python = settings.mpt_python.strip()
+        if not configured_python:
+            raise RuntimeError(
+                "MPT_PYTHON 未配置；CLI 模式必须使用 MPT 仓库内的独立 venv 解释器"
+            )
+        python = Path(os.path.abspath(os.path.expanduser(configured_python)))
+        try:
+            python.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"MPT_PYTHON 必须位于 EXTERNAL_MPT_PATH 内: {python}"
+            ) from exc
+        if not python.is_file() or not os.access(python, os.X_OK):
+            raise RuntimeError(f"MPT_PYTHON 不存在或不可执行: {python}")
+        venv_root = python.parent.parent
+        if not (venv_root / "pyvenv.cfg").is_file():
+            raise RuntimeError(
+                f"MPT_PYTHON 必须来自独立 venv（缺少 {venv_root / 'pyvenv.cfg'}）"
+            )
+        return root, python, entry, venv_root
 
     async def render(self, brief: VideoBrief) -> VideoArtifact:
         if settings.external_mpt_url:
@@ -35,11 +79,37 @@ class MoneyPrinterEngine(VideoEngineBase):
                 return r.status_code == 200
             except Exception:
                 return False
-        return settings.external_mpt_path.exists()
+        try:
+            self._cli_boundary()
+        except RuntimeError:
+            return False
+        return True
 
     def _headers(self) -> dict:
         """MPT 可能要求 x-api-key（若 config.toml 配置了 app.api_key）。"""
         return {"x-api-key": settings.mpt_api_key} if settings.mpt_api_key else {}
+
+    @staticmethod
+    def _run_videos(run_dir: Path) -> list[Path]:
+        """Return only non-empty, regular mp4 files contained by one run dir."""
+        resolved_root = run_dir.resolve(strict=True)
+        videos: list[Path] = []
+        for candidate in run_dir.rglob("*.mp4"):
+            # A tool-controlled symlink could otherwise make an old artifact
+            # outside this run look like fresh output.  The run directory itself
+            # is unique and starts empty, so contained regular files can only
+            # have appeared during this invocation.
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(resolved_root)
+                if resolved.stat().st_size <= 0:
+                    continue
+            except (OSError, ValueError):
+                continue
+            videos.append(resolved)
+        return videos
 
     async def _render_via_http(self, brief: VideoBrief) -> VideoArtifact:
         """调 MPT 的 REST API。校对自上游 app/controllers/v1/video.py + v1/base.py。
@@ -87,36 +157,74 @@ class MoneyPrinterEngine(VideoEngineBase):
 
     async def _render_via_cli(self, brief: VideoBrief) -> VideoArtifact:
         """subprocess 模式（MPT 作为本地项目）。"""
-        if not settings.external_mpt_path.exists():
-            raise RuntimeError(f"MPT 路径不存在: {settings.external_mpt_path}")
+        root, python, entry, venv_root = self._cli_boundary()
 
         # MPT 提供 webui.py + main.py，CLI 接口能力受限——HTTP 模式优先
         # 这里给一个 fallback：调用其 task module
-        out_dir: Path = settings.data_dir / "outputs" / "mpt-cli"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # The child runs with cwd=MPT root, so the output path passed in argv
+        # must be absolute even when DATA_DIR is configured relatively.
+        output_root = Path(
+            os.path.abspath(settings.data_dir / "outputs" / "mpt-cli")
+        )
+        output_root.mkdir(parents=True, exist_ok=True)
+        # Never share an output directory across runs.  A shared glob can return
+        # a stale or concurrent task's mp4 when the current command exits 0
+        # without producing anything.  mkdtemp creates an unpredictable 0700
+        # directory atomically beneath the configured output root.
+        run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=output_root))
         cmd = [
-            "python",
-            "main.py",
+            str(python),
+            str(entry),
             "--subject",
             brief.theme,
             "--output",
-            str(out_dir),
+            str(run_dir),
         ]
+        child_env = build_subprocess_env(
+            include_configured_proxy=False,
+            inject_browser_runtime=False,
+        )
+        # Prevent the parent control-plane venv from leaking into MPT.  The
+        # explicit MPT venv also leads PATH for any tools MPT itself spawns.
+        child_env["VIRTUAL_ENV"] = str(venv_root)
+        child_env["PATH"] = os.pathsep.join(
+            part
+            for part in (str(python.parent), child_env.get("PATH", ""))
+            if part
+        )
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            cwd=str(settings.external_mpt_path),
+            cwd=str(root),
+            env=child_env,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(
+                communicate_bounded(proc),
+                timeout=float(settings.mpt_cli_timeout_seconds),
+            )
+        except asyncio.CancelledError:
+            await stop_process_group(proc)
+            raise
+        except TimeoutError as exc:
+            await stop_process_group(proc)
+            raise TimeoutError(
+                f"MPT CLI 超时（>{settings.mpt_cli_timeout_seconds}s）"
+            ) from exc
         if proc.returncode != 0:
             raise RuntimeError(f"MPT CLI 失败: {stderr.decode('utf-8', 'ignore')[:500]}")
 
-        videos = sorted(out_dir.glob("*.mp4"))
+        videos = sorted(
+            self._run_videos(run_dir),
+            key=lambda path: (path.stat().st_mtime_ns, str(path)),
+        )
         if not videos:
-            raise RuntimeError("MPT CLI 未产出 mp4")
+            raise RuntimeError("MPT CLI 本轮未产出非空 mp4")
         return VideoArtifact(
             video_path=str(videos[-1]),
             duration_seconds=float(brief.duration_seconds),
-            meta={"engine": "mpt-cli"},
+            meta={"engine": "mpt-cli", "run_dir": str(run_dir)},
         )

@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Play, RefreshCw } from "lucide-react"
 import { CategoryBadge } from "@/components/topics/category-badge"
+import { QueryError } from "@/components/query-error"
 
 const STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
   pending: "outline",
@@ -27,7 +28,7 @@ const STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | "dest
 export default function Jobs() {
   const qc = useQueryClient()
   const { topicId } = useTopicFilter()
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["jobs", { topic_id: topicId ?? null }],
     queryFn: () => api.jobs(topicId),
   })
@@ -59,7 +60,8 @@ export default function Jobs() {
           <CardTitle>发布任务（{data?.length ?? 0}）</CardTitle>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
+          <QueryError error={error ?? runMut.error ?? collectMut.error} />
+          {error ? null : isLoading ? (
             <p className="text-sm text-muted-foreground">加载中...</p>
           ) : data && data.length > 0 ? (
             <Table>

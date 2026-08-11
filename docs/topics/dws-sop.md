@@ -1,8 +1,9 @@
 # dws 运营 SOP
 
 > 钉钉企业能力（AI 表格 / 审批 / 听记 / IM 机器人 / 日历 / 待办 / 钉钉文档）专题。
-> 本文件是 dws 专题的"业务事实底座"——给 LLM 当上下文，给 Topic Owner 当操作手册。
-> 技术对抗（频率/指纹/养号）见 `docs/anti-risk.md`；平台改写风格见 `prompts/platform_style/*.md`。本文件不重复其内容。
+> 本文件是历史内容策划模板，不是平台算法、曝光率或产品事实的当前证据。数字和发布频率均为
+> 待验证假设；使用前由 Topic Owner 核对来源、产品版本与平台条款。
+> 发布安全见 `docs/anti-risk.md`；平台改写风格见 `prompts/platform_style/*.md`。
 
 ## 1. 专题定位与边界
 

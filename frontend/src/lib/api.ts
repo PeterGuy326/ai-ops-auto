@@ -9,11 +9,8 @@
 //   GET    /articles?topic_id=X    -> Article[]
 //   POST   /accounts (body 含 topic_id)
 //
-// 兼容策略：后端如果还没补齐扩展字段（category / target_platforms / account_count
-// / article_count）或 topic_id 过滤，请求会回落到 mock 数据。所有 fallback 都
-// 标了 `TODO[P7-A-WIRE]`，等后端就绪后一把删掉即可。
-
-import { MOCK_TOPICS, mockTopicById } from "./mock-topics"
+// 失败必须显式抛给 React Query / 表单。控制台绝不能用 mock 数据伪造一次成功写入，
+// 否则运营人员会误以为任务已经落库或发布。
 
 const BASE = import.meta.env.VITE_API_BASE ?? "/api"
 
@@ -102,33 +99,10 @@ export type Job = {
   topic_id?: number | null;
 };
 
-// 把后端可能返回的"瘦"Topic 合并到 mock 的扩展字段上，保证 UI 视觉一致。
-function mergeWithMock(t: Topic): Topic {
-  const m = mockTopicById(t.id)
-  return {
-    ...t,
-    category: t.category ?? m?.category ?? null,
-    target_platforms: t.target_platforms ?? m?.target_platforms ?? [],
-    account_count: t.account_count ?? m?.account_count ?? 0,
-    article_count: t.article_count ?? m?.article_count ?? 0,
-  }
-}
-
 // ---------- Topics ----------
 
 async function listTopics(): Promise<Topic[]> {
-  try {
-    const real = await request<Topic[]>("/topics")
-    if (Array.isArray(real) && real.length > 0) {
-      // TODO[P7-A-WIRE]: 后端 schema 补齐后删除 mergeWithMock 调用
-      return real.map(mergeWithMock)
-    }
-    // 后端有路由但库里是空的 → 演示态走 mock
-    return MOCK_TOPICS
-  } catch {
-    // TODO[P7-A-WIRE]: 后端 /topics 不通时的兜底
-    return MOCK_TOPICS
-  }
+  return request<Topic[]>("/topics")
 }
 
 async function getTopic(id: number): Promise<Topic> {
@@ -141,57 +115,24 @@ async function getTopic(id: number): Promise<Topic> {
 }
 
 async function createTopic(data: TopicCreate): Promise<Topic> {
-  try {
-    return await request<Topic>("/topics", {
-      method: "POST",
-      body: JSON.stringify(data),
-    })
-  } catch (e) {
-    // TODO[P7-A-WIRE]: 删除 mock-create 兜底
-    console.warn("createTopic fallback to mock:", e)
-    const fake: Topic = {
-      id: Date.now(),
-      name: data.name,
-      category: data.category,
-      keywords: data.keywords,
-      target_platforms: data.target_platforms,
-      heat_score: 0,
-      account_count: 0,
-      article_count: 0,
-      created_at: new Date().toISOString(),
-    }
-    return fake
-  }
+  return request<Topic>("/topics", {
+    method: "POST",
+    body: JSON.stringify(data),
+  })
 }
 
 async function updateTopic(id: number, data: TopicUpdate): Promise<Topic> {
-  try {
-    return await request<Topic>(`/topics/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify(data),
-    })
-  } catch (e) {
-    // TODO[P7-A-WIRE]: 删除 mock-update 兜底
-    console.warn("updateTopic fallback to mock:", e)
-    const cur = await getTopic(id)
-    return { ...cur, ...data }
-  }
+  return request<Topic>(`/topics/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(data),
+  })
 }
 
 // ---------- Accounts ----------
 
 async function listAccounts(topicId?: number | null): Promise<Account[]> {
   const qs = topicId ? `?topic_id=${topicId}` : ""
-  try {
-    const arr = await request<Account[]>(`/accounts${qs}`)
-    // 后端不支持 topic_id 过滤的话会返回全量，前端再过滤一道做兜底
-    if (topicId != null) {
-      return arr.filter((a) => a.topic_id == null || a.topic_id === topicId)
-    }
-    return arr
-  } catch {
-    return []
-  }
+  return request<Account[]>(`/accounts${qs}`)
 }
 
 async function createAccount(data: AccountCreate): Promise<Account> {
@@ -205,31 +146,21 @@ async function createAccount(data: AccountCreate): Promise<Account> {
 
 async function listArticles(topicId?: number | null): Promise<Article[]> {
   const qs = topicId ? `?topic_id=${topicId}` : ""
-  try {
-    const arr = await request<Article[]>(`/articles${qs}`)
-    if (topicId != null) {
-      return arr.filter((a) => a.topic_id === topicId)
-    }
-    return arr
-  } catch {
-    return []
+  const arr = await request<Article[]>(`/articles${qs}`)
+  if (topicId != null) {
+    return arr.filter((a) => a.topic_id === topicId)
   }
+  return arr
 }
 
 // ---------- Jobs ----------
 
 async function listJobs(topicId?: number | null): Promise<Job[]> {
-  try {
-    const arr = await request<Job[]>("/jobs")
-    // 后端 /jobs 现在还没有 topic_id 字段；前端先按 article→topic 反查太重，
-    // 这里 P7-D 闭环之前简单略过过滤，topic_id 实在为空就回全量
-    if (topicId != null) {
-      return arr.filter((j) => j.topic_id == null || j.topic_id === topicId)
-    }
-    return arr
-  } catch {
-    return []
+  const arr = await request<Job[]>("/jobs")
+  if (topicId != null) {
+    return arr.filter((j) => j.topic_id === topicId)
   }
+  return arr
 }
 
 export const api = {

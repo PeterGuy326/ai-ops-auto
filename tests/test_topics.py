@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -86,6 +87,43 @@ def test_create_account_bound_to_topic(session):
     assert a.topic_id == t.id
 
 
+def test_account_proxy_rejects_plaintext_userinfo():
+    with pytest.raises(ValidationError, match="不得包含用户名或密码"):
+        AccountIn(
+            platform=Platform.XIAOHONGSHU,
+            nickname="unsafe-proxy",
+            proxy="http://user:password@127.0.0.1:8080",
+        )
+
+
+def test_account_profile_cannot_bypass_proxy_validation(session):
+    account = account_mgr.create_account(
+        session,
+        AccountIn(
+            platform=Platform.XIAOHONGSHU,
+            nickname="profile-proxy",
+            profile={"proxy": "http://user:password@127.0.0.1:8080"},
+            proxy="http://127.0.0.1:8080",
+        ),
+    )
+
+    assert account.profile["proxy"] == "http://127.0.0.1:8080"
+
+
+def test_account_output_redacts_legacy_profile_secrets(session):
+    account = account_mgr.create_account(
+        session,
+        AccountIn(
+            platform=Platform.ZHIHU,
+            nickname="legacy-profile",
+            profile={"access_token": "private", "notes": "public"},
+        ),
+    )
+
+    assert "access_token" not in account.profile
+    assert account.profile["notes"] == "public"
+
+
 def test_create_account_invalid_topic(session):
     with pytest.raises(ValueError, match="topic 999 不存在"):
         account_mgr.create_account(
@@ -144,7 +182,7 @@ def test_update_account_topic_rebind(session):
 
 def test_topic_stats(session):
     t1 = content_mgr.create_topic(session, TopicIn(name="dws", category="tech"))
-    t2 = content_mgr.create_topic(session, TopicIn(name="软考", category="exam"))
+    content_mgr.create_topic(session, TopicIn(name="软考", category="exam"))
 
     account_mgr.create_account(
         session, AccountIn(platform=Platform.XIAOHONGSHU, nickname="a1", topic_id=t1.id)

@@ -79,8 +79,12 @@ async def test_complete_builds_cmd_and_parses(monkeypatch):
 
     async def fake_exec(*cmd, **kw):
         captured["cmd"] = cmd
+        captured["env"] = kw["env"]
         return _FakeProc(SUCCESS_ENVELOPE)
 
+    monkeypatch.setenv("API_KEY", "management-secret")
+    monkeypatch.setenv("FERNET_KEY", "encryption-secret")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:secret@example/db")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(settings, "claude_cli_model", "sonnet")
 
@@ -95,6 +99,9 @@ async def test_complete_builds_cmd_and_parses(monkeypatch):
     assert "我是系统提示" in cmd
     # model 透传
     assert "--model" in cmd and "sonnet" in cmd
+    assert "API_KEY" not in captured["env"]
+    assert "FERNET_KEY" not in captured["env"]
+    assert "DATABASE_URL" not in captured["env"]
 
 
 async def test_complete_passes_user_via_stdin(monkeypatch):
