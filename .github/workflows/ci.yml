@@ -123,6 +123,7 @@ jobs:
           from ai_ops.api.main import app
           from ai_ops.content.generator import _load_topic_prompt
           from ai_ops.core.db import get_code_alembic_head, get_db_alembic_head
+          from typer.main import get_command
 
           assert _load_topic_prompt("dws").strip(), "wheel topic prompt is not readable"
           code_head = get_code_alembic_head()
@@ -213,9 +214,18 @@ jobs:
           help_text = Path("agent-help.txt").read_text(encoding="utf-8")
           for command in expected_agent_commands:
               assert command in help_text
-          download_help = Path("download-help.txt").read_text(encoding="utf-8")
-          for required in {"approval_id", "asset_id", "--output"}:
-              assert required in download_help
+          assert Path("download-help.txt").stat().st_size > 0
+          download_command = get_command(agent_app).commands[
+              "download-approval-asset"
+          ]
+          download_params = {
+              parameter.name: parameter for parameter in download_command.params
+          }
+          assert {"approval_id", "asset_id", "output"} <= set(download_params)
+          assert download_params["approval_id"].required is True
+          assert download_params["asset_id"].required is True
+          assert download_params["output"].required is True
+          assert "--output" in download_params["output"].opts
           PY
 
   postgres:
