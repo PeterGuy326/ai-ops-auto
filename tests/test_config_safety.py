@@ -98,6 +98,44 @@ def test_uncalibrated_browser_stubs_are_off_by_default():
     assert config.sohuhao_publisher_enabled is False
 
 
+def test_publisher_plugins_are_deny_by_default():
+    config = Settings(_env_file=None)
+
+    assert config.publisher_plugin_allowlist == ()
+
+
+def test_publisher_plugin_allowlist_is_canonical_and_sorted():
+    config = Settings(
+        _env_file=None,
+        publisher_plugin_allowlist=(
+            "Zed_Plugin:zed.publisher",
+            "acme.plugin:acme.publisher",
+        ),
+    )
+
+    assert config.publisher_plugin_allowlist == (
+        "acme-plugin:acme.publisher",
+        "zed-plugin:zed.publisher",
+    )
+
+
+@pytest.mark.parametrize(
+    "allowlist",
+    [
+        ("*",),
+        ("bare-entry-point",),
+        ("bad path:plugin",),
+        ("dist:",),
+        ("dist:UPPER",),
+        ("dist:plugin", "DIST:plugin"),
+        tuple(f"dist-{index}:plugin-{index}" for index in range(33)),
+    ],
+)
+def test_publisher_plugin_allowlist_rejects_unsafe_selection(allowlist):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, publisher_plugin_allowlist=allowlist)
+
+
 def test_enabled_youtube_timeout_must_leave_worker_cleanup_window():
     with pytest.raises(ValidationError, match="YOUTUBE_UPLOADER_TIMEOUT_SECONDS"):
         Settings(

@@ -115,6 +115,18 @@ class TestCaptureExceptionSoftDep:
         result = sentry_mod.capture_exception(ValueError("x"))
         assert result is False  # 内部异常被吞
 
+    def test_external_exception_surrogate_contains_only_sanitized_type(self):
+        from ai_ops.observability import sentry as sentry_mod
+
+        secret = "cookie=must-not-leak"
+        injected_error = type(f"RuntimeError\n{secret}\x1b[2J", (Exception,), {})
+
+        surrogate = sentry_mod.redacted_external_exception(injected_error(secret))
+
+        assert type(surrogate) is RuntimeError
+        assert str(surrogate) == "external_adapter_failure:Exception"
+        assert secret not in repr(surrogate)
+
 
 # ---------------------------------------------------------------------------
 # Part 2: worker 3 处黑洞 capture 接通验证（最小化场景，不跑全链路）

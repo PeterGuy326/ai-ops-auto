@@ -21,6 +21,7 @@ from ai_ops.doctor import (
     _migration_bundle,
     _migration_heads,
     _publication_safety_check,
+    _publisher_plugin_selection_check,
     _resource_check,
     _runtime_check,
     _scheduler_check,
@@ -41,6 +42,7 @@ def _config(tmp_path: Path, **overrides):
         "youtube_uploader_bin": "youtubeuploader",
         "baijiahao_publisher_enabled": False,
         "sohuhao_publisher_enabled": False,
+        "publisher_plugin_allowlist": (),
         "fernet_key": Fernet.generate_key().decode(),
         "api_host": "127.0.0.1",
         "api_key": "test-api-key",
@@ -870,4 +872,40 @@ def test_check_order_is_stable(tmp_path):
         "adapter.xhs_skills",
         "adapter.money_printer_turbo",
         "adapter.funclip",
+        "plugins.selection",
     ]
+
+
+def test_top_level_doctor_plugin_check_never_loads_entry_point(tmp_path):
+    class EntryPoint:
+        group = "ai_ops.publishers.v1"
+        name = "fixture.zhihu"
+        dist = SimpleNamespace(metadata={"Name": "fixture-ai-ops"}, version="1.0.0")
+
+        def load(self):
+            raise AssertionError("top-level doctor must not import plugin code")
+
+    check = _publisher_plugin_selection_check(
+        _config(
+            tmp_path,
+            publisher_plugin_allowlist=("fixture-ai-ops:fixture.zhihu",),
+        ),
+        entry_points=[EntryPoint()],
+    )
+
+    assert check.outcome == CheckOutcome.WARN
+    assert check.details["code_loaded"] is False
+    assert check.details["enabled_selectors"] == ["fixture-ai-ops:fixture.zhihu"]
+
+
+def test_top_level_doctor_fails_for_missing_enabled_plugin(tmp_path):
+    check = _publisher_plugin_selection_check(
+        _config(
+            tmp_path,
+            publisher_plugin_allowlist=("missing-ai-ops:missing.plugin",),
+        ),
+        entry_points=[],
+    )
+
+    assert check.outcome == CheckOutcome.FAIL
+    assert check.details["missing_enabled"] == ["missing-ai-ops:missing.plugin"]

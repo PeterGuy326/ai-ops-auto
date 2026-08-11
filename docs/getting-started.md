@@ -63,8 +63,13 @@ Agent 和自动化可使用纯 JSON 契约：
 
 ```bash
 ai-ops doctor --json
+ai-ops plugins list --json
 ai-ops demo --json
 ```
+
+`plugins list` 只读已安装 distribution/entry-point metadata，不 import 插件代码。默认
+`PUBLISHER_PLUGIN_ALLOWLIST=[]`；如果机器上碰巧安装了第三方插件，它也只会显示为 disabled。
+启用插件属于生产部署动作，见 [Publisher Plugin SDK v1](publisher-plugins.md)，不属于离线演示。
 
 演示通过时，`review.passed` 为 `true`，同时可验证 `synthetic=true`、`offline=true`、
 `credentials_used=false` 和 `external_calls=0`。这些只能证明控制面闭环，不是任何真实
@@ -86,6 +91,7 @@ DATABASE_URL=sqlite:///./data/ai_ops.db
 API_HOST=127.0.0.1
 AUTO_PUBLISH_ENABLED=false
 GITHUB_PAGES_DRY_RUN=true
+PUBLISHER_PLUGIN_ALLOWLIST=[]
 ```
 
 `AUTO_PUBLISH_ENABLED=false` 只会禁止后台扫描器自动真发布。显式的运行端点仍是有副作用的管理操作，

@@ -44,15 +44,26 @@ from ..accounts.health_monitor import (
 from ..accounts.manager import check_rate_limit, get_credential, mark_published, update_health
 from ..core.db import session_scope
 from ..core.dedup import is_too_similar
-from ..core.enums import AccountHealth, ArticleStatus, AssetType, ContentType, JobStatus, Platform
+from ..core.enums import (
+    AccountHealth,
+    ArticleStatus,
+    AssetType,
+    ContentType,
+    JobStatus,
+    Platform,
+)
 from ..core.external_identity import normalize_zhihu_external_account_id
 from ..core.models import Account, Article, Metrics, PublicationPlan, PublishJob
 from ..core.schemas import ApprovedAssetExecution, PublishContent, PublishResult
 from ..core.time import as_utc_naive
 from ..config import settings
 from ..observability import get_logger
-from ..observability.sentry import capture_exception
+from ..observability.sentry import capture_exception, safe_exception_type
 from ..publishers.registry import PublisherRegistry, default_registry
+from ..publishers.plugin_sdk import (
+    PublisherPluginResolutionError,
+    is_publisher_plugin_instance,
+)
 from ..runtime.receipts import (
     new_operation_id,
     read_publish_receipt,
@@ -862,6 +873,18 @@ async def _execute_job_once(
             error="账号 profile 正被其他操作占用，稍后重试",
             raw_response={"write_started": False, "account_operation_busy": True},
         )
+    except PublisherPluginResolutionError as exc:
+        result = PublishResult(
+            success=False,
+            effect_applied=False,
+            retryable=False,
+            outcome_uncertain=False,
+            error="Publisher plugin configuration is invalid",
+            raw_response={
+                "write_started": False,
+                "publisher_plugin_error": exc.code,
+            },
+        )
     except TimeoutError:
         execution_uncertain = True
         result = PublishResult(
@@ -1469,10 +1492,14 @@ async def _try_publishers(
                 retryable=False,
                 error="Approved Agent renderer is unavailable or ambiguous",
             )
+        selected_publisher = publishers[0]
+        third_party = is_publisher_plugin_instance(selected_publisher)
         try:
-            material = publishers[0].agent_contract_digest_material(content)
+            material = selected_publisher.agent_contract_digest_material(content)
             current_payload_digest = canonical_sha256(material)
-        except Exception:
+        except (Exception, SystemExit) as exc:
+            if isinstance(exc, SystemExit) and not third_party:
+                raise
             return PublishResult(
                 success=False,
                 retryable=False,
@@ -1487,27 +1514,50 @@ async def _try_publishers(
 
     last: PublishResult | None = None
     for pub in publishers:
+        publisher_kind = getattr(pub.kind, "value", str(pub.kind))
+        third_party = is_publisher_plugin_instance(pub)
         try:
             result = await pub.publish(account_id, credential, content)
+            if third_party:
+                # A trusted in-process plugin may need upstream response data to
+                # make its decision, but arbitrary response bodies are not safe
+                # durable evidence: they commonly echo cookies or auth headers.
+                result = result.model_copy(
+                    update={
+                        "error": ("Publisher plugin reported a failure" if result.error else None),
+                        "raw_response": {},
+                    }
+                )
         except NotImplementedError as e:
-            result = PublishResult(success=False, error=f"{pub.kind} 未实现: {e}")
-        except Exception as e:
+            exception_type = safe_exception_type(e)
+            result = PublishResult(
+                success=False,
+                error=f"{publisher_kind} 未实现 publish（{exception_type}）",
+                raw_response={
+                    "adapter": publisher_kind,
+                    "error_code": "publish_not_implemented",
+                    "exception_type": exception_type,
+                },
+            )
+        except (Exception, SystemExit) as e:
+            if isinstance(e, SystemExit) and not third_party:
+                raise
             # An adapter exception does not prove that its external write never
             # started.  Treat the boundary as unknown; otherwise the next
             # Publisher or durable retry could create a duplicate post.
+            exception_type = safe_exception_type(e)
             result = PublishResult(
                 success=False,
                 retryable=False,
                 outcome_uncertain=True,
-                error=f"{pub.kind} 异常后写入状态未知（{type(e).__name__}）",
+                error=f"{publisher_kind} 异常后写入状态未知（{exception_type}）",
                 raw_response={
-                    "adapter": str(pub.kind),
-                    "exception_type": type(e).__name__,
+                    "adapter": publisher_kind,
+                    "exception_type": exception_type,
                     "outcome": "unknown",
                 },
             )
         raw_response = dict(result.raw_response or {})
-        publisher_kind = getattr(pub.kind, "value", str(pub.kind))
         raw_response["publisher_kind"] = publisher_kind
         result = result.model_copy(update={"raw_response": raw_response})
         active_receipt_writer = write_publish_receipt if receipt_writer is None else receipt_writer
@@ -1653,7 +1703,7 @@ def _build_verified_contract_content(
     ):
         raise ValueError("contract approval is not independent")
     content = publish_content_from_snapshot(snapshot)
-    content.approved_publisher_kind = target.execution.renderer.publisher_kind.value
+    content.approved_publisher_kind = target.execution.renderer.publisher_kind
     content.approved_renderer_payload_digest = target.execution.payload_digest
     content.approved_external_account_id = target.approved_external_account_id
     content.approved_assets = [

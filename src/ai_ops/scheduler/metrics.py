@@ -19,9 +19,17 @@ from ..core.db_clock import database_utc_now
 from ..core.enums import JobStatus, MetricsTaskStatus, Platform
 from ..core.models import AgentOperation, Metrics, MetricsCollectionTask, PublishJob
 from ..core.time import as_utc_naive
+from ..publishers.plugin_sdk import (
+    PublisherPluginResolutionError,
+    is_publisher_plugin_instance,
+)
 from ..publishers.registry import default_registry
 from ..observability import get_logger
-from ..observability.sentry import capture_exception
+from ..observability.sentry import (
+    capture_exception,
+    redacted_external_exception,
+    safe_exception_type,
+)
 
 logger = get_logger(__name__)
 
@@ -643,6 +651,22 @@ def _collection_skip_reason(data: object) -> str | None:
     return None
 
 
+def _project_plugin_metrics(data: object) -> object:
+    """Keep only normalized counters from an in-process third-party adapter."""
+
+    # Require an exact dict so a hostile mapping subclass cannot run custom
+    # accessors while this trust-boundary projection reads the four fields.
+    if type(data) is not dict:
+        return None
+    return {
+        "likes": data.get("likes"),
+        "comments": data.get("comments"),
+        "shares": data.get("shares"),
+        "views": data.get("views"),
+        "raw": {},
+    }
+
+
 async def collect_one(
     job_id: int,
     *,
@@ -776,7 +800,16 @@ async def collect_one(
 
         platform = Platform(job.platform)
         publisher_kind = (job.publisher_kind or "").strip()
-        publisher = default_registry.resolve_collector(platform, publisher_kind)
+        try:
+            publisher = default_registry.resolve_collector(platform, publisher_kind)
+        except PublisherPluginResolutionError:
+            return {
+                "skipped": True,
+                "reason": "Publisher plugin configuration is invalid",
+                "error_code": "publisher_plugin_configuration_invalid",
+                "publisher_kind": publisher_kind,
+                "retryable": False,
+            }
         if publisher is None:
             if publisher_kind:
                 reason = f"publisher {publisher_kind} 不支持 metrics 采集"
@@ -788,6 +821,7 @@ async def collect_one(
                 "publisher_kind": publisher_kind,
                 "retryable": False,
             }
+        plugin_publisher = is_publisher_plugin_instance(publisher)
 
         try:
             credential = get_credential(s, job.account_id)
@@ -854,23 +888,27 @@ async def collect_one(
             "reason": "metrics collector timed out",
             "publisher_kind": publisher_kind,
         }
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
+        if isinstance(exc, SystemExit) and not plugin_publisher:
+            raise
         # A collector exception is missing evidence, not evidence of zero
         # engagement. Keep it out of Metrics and account-health evaluation.
+        exception_type = safe_exception_type(exc)
         logger.warning(
             "metrics collector failed; snapshot skipped",
             extra={
                 "job_id": job_id,
                 "publisher_kind": publisher_kind,
-                "exception_type": type(exc).__name__,
+                "exception_type": exception_type,
             },
         )
         try:
             capture_exception(
-                exc,
+                redacted_external_exception(exc),
                 scope="metrics.collect_one",
                 job_id=job_id,
                 publisher_kind=publisher_kind,
+                exception_type=exception_type,
             )
         except Exception:
             logger.exception(
@@ -879,9 +917,14 @@ async def collect_one(
             )
         return {
             "skipped": True,
-            "reason": f"collector 执行失败（{type(exc).__name__}）",
+            "reason": f"collector 执行失败（{exception_type}）",
             "publisher_kind": publisher_kind,
         }
+    if plugin_publisher:
+        # Freeze plugin identity before the await and project before reading any
+        # adapter-provided skip/raw metadata. The plugin may mutate its own
+        # marker during collection; that cannot reopen the durable data path.
+        data = _project_plugin_metrics(data)
     collection_skip_reason = _collection_skip_reason(data)
     if collection_skip_reason is not None:
         contract_errors = {

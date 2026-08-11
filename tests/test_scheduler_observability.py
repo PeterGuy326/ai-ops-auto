@@ -21,6 +21,7 @@ P7-X 上轮把 worker.py 3 处黑洞补上 capture_exception，本套件覆盖 s
   - mock 各模块顶部 from-import 的 capture_exception 名字，验调用 + scope + ctx
   - 不跑真实 APScheduler / publisher / DB 全链路，每个用例最小化构造
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -129,9 +130,7 @@ class TestHealthObservabilityHooks:
 
         # 让后续 publisher 路径也不抛——只关注 credential_load 黑洞
         # publisher.resolve 返回 [] 让 check 走 continue，避免别的 capture 污染
-        monkeypatch.setattr(
-            health_mod.default_registry, "resolve", lambda platform: []
-        )
+        monkeypatch.setattr(health_mod.default_registry, "resolve", lambda platform: [])
 
         asyncio.run(health_mod.check_all_accounts())
 
@@ -154,13 +153,11 @@ class TestHealthObservabilityHooks:
 
         # 构造一个 publisher 让 health_check 抛
         async def boom_health_check(aid, cred):
-            raise RuntimeError("api 500")
+            raise RuntimeError("token=must-not-leak")
 
         fake_pub = MagicMock()
         fake_pub.health_check = boom_health_check
-        monkeypatch.setattr(
-            health_mod.default_registry, "resolve", lambda platform: [fake_pub]
-        )
+        monkeypatch.setattr(health_mod.default_registry, "resolve", lambda platform: [fake_pub])
         # update_health 不要真改 DB（避免 fake account 字段不全炸）
         monkeypatch.setattr(health_mod, "update_health", lambda s, aid, h: None)
 
@@ -170,9 +167,72 @@ class TestHealthObservabilityHooks:
         assert len(checks) == 1, f"expected 1 check capture, got {capture_calls}"
         cap = checks[0]
         assert cap["exc_type"] == "RuntimeError"
-        assert "api 500" in cap["exc_msg"]
+        assert cap["exc_msg"] == "external_adapter_failure:RuntimeError"
+        assert cap["exception_type"] == "RuntimeError"
+        assert "must-not-leak" not in repr(cap)
         assert cap["account_id"] == account_id
         assert "platform" in cap
+
+    def test_invalid_health_result_is_coerced_fail_closed(self, monkeypatch):
+        from ai_ops.scheduler import health as health_mod
+
+        SessionLocal = _build_engine_and_session()
+        account_id = _mk_account(SessionLocal)
+        _install_session_scope(monkeypatch, health_mod, SessionLocal)
+        monkeypatch.setattr(health_mod, "get_credential", lambda s, aid: {})
+        capture_calls = _install_capture(monkeypatch, health_mod)
+
+        async def invalid_health_check(aid, cred):
+            return "attacker-controlled-health"
+
+        fake_pub = MagicMock()
+        fake_pub.health_check = invalid_health_check
+        monkeypatch.setattr(
+            health_mod.default_registry,
+            "resolve",
+            lambda platform: [fake_pub],
+        )
+
+        result = asyncio.run(health_mod.check_all_accounts())
+
+        assert result["results"][account_id] == AccountHealth.UNKNOWN.value
+        assert "attacker-controlled-health" not in repr(result)
+        with SessionLocal() as session:
+            account = session.get(Account, account_id)
+            assert account.health == AccountHealth.UNKNOWN.value
+        checks = [c for c in capture_calls if c.get("scope") == "scheduler.health.check"]
+        assert len(checks) == 1
+        assert checks[0]["exc_msg"] == "external_adapter_failure:ValueError"
+
+    def test_plugin_health_system_exit_is_redacted_and_does_not_stop_scan(self, monkeypatch):
+        from ai_ops.scheduler import health as health_mod
+
+        SessionLocal = _build_engine_and_session()
+        account_id = _mk_account(SessionLocal)
+        _install_session_scope(monkeypatch, health_mod, SessionLocal)
+        monkeypatch.setattr(health_mod, "get_credential", lambda s, aid: {})
+        capture_calls = _install_capture(monkeypatch, health_mod)
+
+        async def exiting_health_check(aid, cred):
+            raise SystemExit("token=must-not-leak")
+
+        fake_pub = MagicMock()
+        fake_pub.health_check = exiting_health_check
+        fake_pub._ai_ops_publisher_plugin_selector = "fixture-ai-ops:fixture.health"
+        monkeypatch.setattr(
+            health_mod.default_registry,
+            "resolve",
+            lambda platform: [fake_pub],
+        )
+
+        result = asyncio.run(health_mod.check_all_accounts())
+
+        assert result["results"][account_id] == AccountHealth.UNKNOWN.value
+        assert "must-not-leak" not in repr(result)
+        checks = [c for c in capture_calls if c.get("scope") == "scheduler.health.check"]
+        assert len(checks) == 1
+        assert checks[0]["exc_msg"] == "external_adapter_failure:SystemExit"
+        assert "must-not-leak" not in repr(checks)
 
     def test_unknown_health_uses_next_read_only_adapter(self, monkeypatch):
         """CLI unavailable (UNKNOWN) must not hide a healthy browser session."""
@@ -227,9 +287,7 @@ class TestHealthObservabilityHooks:
 
         fake_pub = MagicMock()
         fake_pub.health_check = expired_health_check
-        monkeypatch.setattr(
-            health_mod.default_registry, "resolve", lambda platform: [fake_pub]
-        )
+        monkeypatch.setattr(health_mod.default_registry, "resolve", lambda platform: [fake_pub])
         monkeypatch.setattr(health_mod, "update_health", lambda s, aid, h: None)
 
         # 让 from ..notify import account_expired 拿到的 account_expired 抛
@@ -313,21 +371,22 @@ def _mk_metrics_job(SessionLocal):
         s.flush()
         # 已经跑过 1 次飞轮采集（collected_at 在 cutoff 之后，模拟 1h 飞轮已落库）；
         # 本次 collect_one 跑完后 count 应为 2，触发 health_eval。
-        s.add(Metrics(
-            job_id=job.id,
-            likes=0,
-            comments=0,
-            shares=0,
-            views=0,
-            collected_at=finished_at + timedelta(hours=1),
-            raw={},
-        ))
+        s.add(
+            Metrics(
+                job_id=job.id,
+                likes=0,
+                comments=0,
+                shares=0,
+                views=0,
+                collected_at=finished_at + timedelta(hours=1),
+                raw={},
+            )
+        )
         s.commit()
         return job.id, article.id
 
 
 class TestMetricsObservabilityHooks:
-
     def test_metrics_health_eval_failure_captured(self, monkeypatch):
         """24h 节点 evaluate_after_metrics 抛 → capture(scope='scheduler.metrics.health_eval')。"""
         from ai_ops.scheduler import metrics as metrics_mod
@@ -347,9 +406,7 @@ class TestMetricsObservabilityHooks:
         fake_pub.kind = "test"
         fake_pub.supports_metrics = True
         fake_pub.collect_metrics = fake_collect
-        monkeypatch.setattr(
-            metrics_mod.default_registry, "resolve", lambda platform: [fake_pub]
-        )
+        monkeypatch.setattr(metrics_mod.default_registry, "resolve", lambda platform: [fake_pub])
 
         # 让 evaluate_after_metrics 抛 —— 它在 health_monitor 模块，from-import 在
         # except 内部局部 import，所以 mock 源头位置
@@ -391,9 +448,7 @@ class TestMetricsObservabilityHooks:
         fake_pub.kind = "test"
         fake_pub.supports_metrics = True
         fake_pub.collect_metrics = fake_collect
-        monkeypatch.setattr(
-            metrics_mod.default_registry, "resolve", lambda platform: [fake_pub]
-        )
+        monkeypatch.setattr(metrics_mod.default_registry, "resolve", lambda platform: [fake_pub])
 
         # health_eval 路径通过，免污染
         import ai_ops.accounts.health_monitor as hm_mod
@@ -429,7 +484,6 @@ class TestMetricsObservabilityHooks:
 
 
 class TestQueueObservabilityHooks:
-
     def test_queue_cancel_failure_captured(self, monkeypatch):
         """APScheduler.remove_job 抛 → capture(scope='scheduler.queue.cancel') + job_id。"""
         from ai_ops.scheduler import queue as queue_mod
@@ -462,7 +516,6 @@ class TestQueueObservabilityHooks:
 
 
 class TestWorkerSimhashObservabilityHook:
-
     def test_worker_simhash_check_failure_captured(self, monkeypatch):
         """similarity_checker 抛 → capture(scope='worker.simhash_check') 且仍返回 (True, None)。
 

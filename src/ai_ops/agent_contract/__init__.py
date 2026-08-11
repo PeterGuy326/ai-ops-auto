@@ -57,6 +57,7 @@ from .schemas import (
     ScheduleState,
     StageContentRequest,
     StageContentResponse,
+    validate_renderer_contract,
 )
 from .client import AgentClient, AgentContractClient, ClientError
 from .snapshot import approval_content_digest
@@ -124,6 +125,7 @@ __all__ = [
     "ScheduleState",
     "StageContentRequest",
     "StageContentResponse",
+    "validate_renderer_contract",
     "canonical_asset",
     "approval_content_digest",
     "canonical_json",

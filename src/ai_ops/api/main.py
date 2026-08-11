@@ -402,6 +402,7 @@ async def api_login_account(account_id: int):
     from ..core.models import Account
     from ..core.enums import Platform
     from ..publishers.registry import default_registry
+    from ..publishers.plugin_sdk import is_publisher_plugin_instance
     from ..runtime.account_lease import AccountOperationLease, AccountOperationLeaseTimeout
 
     with session_scope() as s:
@@ -416,6 +417,8 @@ async def api_login_account(account_id: int):
         raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
     if not pubs:
         raise HTTPException(503, "登录服务暂时不可用，请稍后重试")
+    login_publisher = pubs[0]
+    plugin_publisher = is_publisher_plugin_instance(login_publisher)
 
     try:
         async with AccountOperationLease(
@@ -433,10 +436,12 @@ async def api_login_account(account_id: int):
                     raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
 
             try:
-                ok = await asyncio.wait_for(pubs[0].login(account_id, cred), timeout=300)
+                ok = await asyncio.wait_for(login_publisher.login(account_id, cred), timeout=300)
             except TimeoutError:
                 raise HTTPException(408, "登录超时（5 分钟内未完成扫码）") from None
-            except Exception:
+            except (Exception, SystemExit) as exc:
+                if isinstance(exc, SystemExit) and not plugin_publisher:
+                    raise
                 raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
 
             # publisher.login 会把凭证写回 cred dict（cookies-based / profile_dir-based

@@ -48,7 +48,10 @@ class AgentContractRendererDescriptor:
     contract_version: str
     adapter_version: str
     platform: Platform
-    publisher_kind: PublisherKind
+    # Core adapters normally use PublisherKind. Third-party plugins may use a
+    # namespaced string because the persisted job column is intentionally a
+    # bounded string rather than a database enum.
+    publisher_kind: PublisherKind | str
     accepted_extra_keys: tuple[str, ...] = ()
     accepts_tags: bool = False
     requires_external_account_id: bool = False
@@ -71,7 +74,11 @@ class AgentContractRendererDescriptor:
             "contract_version": self.contract_version,
             "adapter_version": self.adapter_version,
             "platform": self.platform.value,
-            "publisher_kind": self.publisher_kind.value,
+            "publisher_kind": (
+                self.publisher_kind.value
+                if isinstance(self.publisher_kind, PublisherKind)
+                else str(self.publisher_kind)
+            ),
             "accepted_extra_keys": list(self.accepted_extra_keys),
             "accepts_tags": self.accepts_tags,
             "requires_external_account_id": self.requires_external_account_id,
@@ -87,7 +94,7 @@ class PublisherBase(ABC):
     """
 
     platform: Platform
-    kind: PublisherKind
+    kind: PublisherKind | str
     # Metrics routing is opt-in. A synthetic zero from an unsupported adapter
     # is indistinguishable from a real zero-view post and can poison health.
     supports_metrics: bool = False

@@ -22,6 +22,13 @@ from ai_ops.publishers.base import (
     AgentContractRendererUnavailable,
     PublisherBase,
 )
+from ai_ops.publishers.plugin_sdk import (
+    PUBLISHER_PLUGIN_API_VERSION,
+    PublisherPlugin,
+    PublisherPluginCapability,
+    PublisherPluginManifest,
+    instantiate_validated_publisher,
+)
 from ai_ops.publishers.registry import PublisherRegistry
 from ai_ops.scheduler import worker as worker_mod
 
@@ -85,6 +92,54 @@ class _KnownPartialEffect(_Uncertain):
 class _RaisesUnexpectedly(_Uncertain):
     async def publish(self, account_id, credential, content):
         raise RuntimeError("exception text may contain a secret")
+
+
+class _ThirdPartyLeaksRaw(_Uncertain):
+    kind = "fixture_third_party"
+
+    async def publish(self, account_id, credential, content):
+        return PublishResult(
+            success=False,
+            error="token=must-not-leak",
+            raw_response={"token": "must-not-leak", "response": "private"},
+        )
+
+
+class _ThirdPartyNotImplemented(_Uncertain):
+    kind = "fixture_third_party"
+
+    async def publish(self, account_id, credential, content):
+        raise NotImplementedError("cookie=must-not-leak")
+
+
+class _ThirdPartySystemExit(_Uncertain):
+    kind = "fixture_third_party"
+
+    async def publish(self, account_id, credential, content):
+        raise SystemExit("token=must-not-leak")
+
+
+def _third_party_factory(publisher_type):
+    plugin = PublisherPlugin(
+        manifest=PublisherPluginManifest(
+            plugin_id="fixture.publisher",
+            plugin_version="1.0.0",
+            api_version=PUBLISHER_PLUGIN_API_VERSION,
+            platform=Platform.XIAOHONGSHU,
+            publisher_kind="fixture_third_party",
+            adapter_version="1",
+            capabilities=(
+                PublisherPluginCapability.HEALTH_CHECK,
+                PublisherPluginCapability.LOGIN,
+                PublisherPluginCapability.PUBLISH,
+            ),
+        ),
+        factory=publisher_type,
+    )
+    return lambda: instantiate_validated_publisher(
+        "fixture-ai-ops:fixture.publisher",
+        plugin,
+    )
 
 
 class _ExactAssetReader(PublisherBase):
@@ -271,6 +326,68 @@ def test_worker_unexpected_exception_is_unknown_and_stops_fallback(monkeypatch):
     assert result.retryable is False
     assert result.raw_response["exception_type"] == "RuntimeError"
     assert "secret" not in result.model_dump_json()
+
+
+def test_third_party_publish_result_drops_arbitrary_raw_and_error_text():
+    reg = PublisherRegistry()
+    reg.register(Platform.XIAOHONGSHU, _third_party_factory(_ThirdPartyLeaksRaw))
+
+    result = asyncio.run(
+        worker_mod._try_publishers(
+            Platform.XIAOHONGSHU,
+            1,
+            {"token": "credential"},
+            PublishContent(title="t", body="b", content_type="image_text"),
+            registry=reg,
+            receipt_writer=lambda **_: None,
+        )
+    )
+
+    assert result.error == "Publisher plugin reported a failure"
+    assert result.raw_response == {"publisher_kind": "fixture_third_party"}
+    assert "must-not-leak" not in result.model_dump_json()
+
+
+def test_third_party_not_implemented_exception_text_is_redacted():
+    reg = PublisherRegistry()
+    reg.register(Platform.XIAOHONGSHU, _third_party_factory(_ThirdPartyNotImplemented))
+
+    result = asyncio.run(
+        worker_mod._try_publishers(
+            Platform.XIAOHONGSHU,
+            1,
+            {"cookie": "credential"},
+            PublishContent(title="t", body="b", content_type="image_text"),
+            registry=reg,
+            receipt_writer=lambda **_: None,
+        )
+    )
+
+    assert result.raw_response["error_code"] == "publish_not_implemented"
+    assert result.raw_response["exception_type"] == "NotImplementedError"
+    assert "must-not-leak" not in result.model_dump_json()
+
+
+def test_third_party_system_exit_is_uncertain_and_does_not_stop_worker():
+    reg = PublisherRegistry()
+    reg.register(Platform.XIAOHONGSHU, _third_party_factory(_ThirdPartySystemExit))
+
+    result = asyncio.run(
+        worker_mod._try_publishers(
+            Platform.XIAOHONGSHU,
+            1,
+            {"token": "credential"},
+            PublishContent(title="t", body="b", content_type="image_text"),
+            registry=reg,
+            receipt_writer=lambda **_: None,
+        )
+    )
+
+    assert result.success is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert result.raw_response["exception_type"] == "SystemExit"
+    assert "must-not-leak" not in result.model_dump_json()
 
 
 def test_custom_receipt_writer_failure_does_not_erase_confirmed_result():

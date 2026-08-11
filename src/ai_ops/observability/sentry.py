@@ -12,13 +12,32 @@
 实现细节：用 ``importlib.util.find_spec`` 探测，而不是 module-level try-import——
 后者在测试 ImportError 路径时不好 mock，前者每次调用都新鲜探测。
 """
+
 from __future__ import annotations
 
 import importlib
 import importlib.util
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+_SAFE_EXCEPTION_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def safe_exception_type(exc: BaseException) -> str:
+    """Return a bounded ASCII exception identity safe for tags and receipts."""
+
+    exception_type = type(exc).__name__
+    if not isinstance(exception_type, str) or not _SAFE_EXCEPTION_TYPE_RE.fullmatch(exception_type):
+        return "Exception"
+    return exception_type
+
+
+def redacted_external_exception(exc: BaseException) -> RuntimeError:
+    """Return a type-only surrogate with no external traceback or message."""
+
+    return RuntimeError(f"external_adapter_failure:{safe_exception_type(exc)}")
 
 
 def _sentry_sdk_available() -> bool:
@@ -60,6 +79,8 @@ def init_sentry(*, dsn: str, environment: str = "dev", release: str = "") -> boo
             release=release or None,
             # 默认采样：error 全收，trace 不收（避免 quota 爆炸）
             traces_sample_rate=0.0,
+            send_default_pii=False,
+            include_local_variables=False,
         )
         logger.info("sentry: initialized (env=%s release=%s)", environment, release or "n/a")
         return True

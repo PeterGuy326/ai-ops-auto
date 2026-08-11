@@ -62,7 +62,21 @@ from ai_ops.core.models import (
     PublishJob,
     Topic,
 )
-from ai_ops.scheduler.worker import _build_verified_contract_content
+from ai_ops.core.schemas import PublishContent, PublishResult
+from ai_ops.publishers.base import (
+    AgentContractAssetRule,
+    AgentContractRendererDescriptor,
+    PublisherBase,
+)
+from ai_ops.publishers.plugin_sdk import (
+    PUBLISHER_PLUGIN_API_VERSION,
+    PublisherPlugin,
+    PublisherPluginCapability,
+    PublisherPluginManifest,
+    instantiate_validated_publisher,
+)
+from ai_ops.publishers.registry import PublisherRegistry
+from ai_ops.scheduler.worker import _build_verified_contract_content, _try_publishers
 from tests.agent_contract_fakes import (
     EXACT_RENDERER_REGISTRY,
     NO_EXACT_RENDERER_REGISTRY,
@@ -71,6 +85,76 @@ from tests.agent_contract_fakes import (
 
 
 PLANNED_FOR = datetime(2031, 5, 6, 7, 8, 9, tzinfo=UTC)
+
+
+class _NamespacedExactPublisher(PublisherBase):
+    platform = Platform.ZHIHU
+    kind = "tests_zhihu_plugin"
+    agent_contract_renderer_descriptor = AgentContractRendererDescriptor(
+        renderer_id="tests.zhihu.plugin-exact",
+        contract_version="1",
+        adapter_version="plugin-test-1",
+        platform=platform,
+        publisher_kind=kind,
+        accepted_extra_keys=("campaign", "language"),
+        requires_external_account_id=True,
+        asset_rules=(AgentContractAssetRule(asset_type=AssetType.IMAGE, min_count=0, max_count=9),),
+    )
+
+    def render_agent_contract_payload(self, content: PublishContent) -> dict[str, object]:
+        return {
+            "body": content.body,
+            "extra": content.extra,
+            "image_count": len(content.images),
+            "title": content.title,
+        }
+
+    async def login(self, account_id, credential):
+        return True
+
+    async def publish(self, account_id, credential, content):
+        return PublishResult(success=True, platform_post_id="plugin-exact-post")
+
+    async def health_check(self, account_id, credential):
+        return AccountHealth.HEALTHY
+
+
+class _SystemExitExactPublisher(_NamespacedExactPublisher):
+    publish_called = False
+
+    def agent_contract_digest_material(self, content):
+        del content
+        raise SystemExit("token=must-not-leak")
+
+    async def publish(self, account_id, credential, content):
+        type(self).publish_called = True
+        return await super().publish(account_id, credential, content)
+
+
+def _namespaced_exact_plugin_factory(publisher_type=_NamespacedExactPublisher):
+    plugin = PublisherPlugin(
+        manifest=PublisherPluginManifest(
+            plugin_id="tests.zhihu.plugin",
+            plugin_version="1.0.0",
+            api_version=PUBLISHER_PLUGIN_API_VERSION,
+            platform=Platform.ZHIHU,
+            publisher_kind="tests_zhihu_plugin",
+            adapter_version="plugin-test-1",
+            capabilities=(
+                PublisherPluginCapability.AGENT_CONTRACT_RENDERER,
+                PublisherPluginCapability.HEALTH_CHECK,
+                PublisherPluginCapability.LOGIN,
+                PublisherPluginCapability.PUBLISH,
+            ),
+            renderer_id="tests.zhihu.plugin-exact",
+            contract_version="1",
+        ),
+        factory=publisher_type,
+    )
+    return lambda: instantiate_validated_publisher(
+        "tests-ai-ops:tests.zhihu.plugin",
+        plugin,
+    )
 
 
 @dataclass(frozen=True)
@@ -473,7 +557,7 @@ async def test_full_agent_control_plane_workflow_is_durable_and_redacted(control
     assert plan.targets[0].approved_external_account_id == ("zhihu:id:service-test-account")
     execution = plan.targets[0].execution
     assert execution.renderer.renderer_id == "tests.zhihu.exact-payload"
-    assert execution.renderer.publisher_kind.value == "zhihu_cli"
+    assert execution.renderer.publisher_kind == "zhihu_cli"
     assert execution.renderer.contract_version == "1"
     assert execution.renderer.adapter_version == "test-1"
     assert execution.payload["image_slots"] == [{"asset_type": "image", "index": 0}]
@@ -952,6 +1036,35 @@ def test_plan_rejects_a_renderer_whose_runtime_identity_drifts(control_plane):
     assert raised.value.status_code == 503
 
 
+def test_plan_contains_plugin_renderer_system_exit(control_plane):
+    registry = PublisherRegistry()
+    registry.register(
+        Platform.ZHIHU,
+        _namespaced_exact_plugin_factory(_SystemExitExactPublisher),
+        priority=1,
+        registration_id="plugin:tests-ai-ops:tests.zhihu.plugin",
+    )
+    control_plane.service._publisher_registry = registry
+    staged = _stage(control_plane, key_prefix="renderer-system-exit")
+
+    with pytest.raises(AgentContractError) as raised:
+        control_plane.service.plan_publication(
+            control_plane.agent,
+            PlanPublicationRequest(
+                content_id=staged.content_id,
+                account_ids=[control_plane.account_id],
+                planned_for=PLANNED_FOR,
+            ),
+            idempotency_key="renderer-system-exit-plan-0001",
+        )
+
+    assert raised.value.code == "renderer_contract_invalid"
+    assert raised.value.status_code == 503
+    assert "must-not-leak" not in str(raised.value)
+    with control_plane.session_factory() as session:
+        assert session.scalar(select(func.count(PublicationPlan.id))) == 0
+
+
 def test_human_can_resolve_the_exact_asset_bytes_in_the_review_bundle(control_plane):
     staged = _stage(control_plane, key_prefix="review-asset")
     plan = control_plane.service.plan_publication(
@@ -1182,6 +1295,88 @@ def test_worker_uses_scheduled_snapshot_and_rechecks_account_binding(
         session.flush()
         with pytest.raises(ValueError, match="target binding changed"):
             _build_verified_contract_content(session, job, account)
+
+
+@pytest.mark.asyncio
+async def test_namespaced_plugin_kind_survives_plan_snapshot_and_worker_execution(
+    control_plane,
+    monkeypatch,
+):
+    registry = PublisherRegistry()
+    registry.register(
+        Platform.ZHIHU,
+        _namespaced_exact_plugin_factory(),
+        priority=1,
+        registration_id="plugin:tests-ai-ops:tests.zhihu.plugin",
+    )
+    control_plane.service._publisher_registry = registry
+    _staged, plan, _approval, _decision = _approved_plan(
+        control_plane,
+        key_prefix="namespaced-plugin",
+    )
+    assert plan.targets[0].execution.renderer.publisher_kind == "tests_zhihu_plugin"
+    scheduled = control_plane.service.schedule(
+        control_plane.agent,
+        ScheduleRequest(plan_id=plan.plan_id),
+        idempotency_key="namespaced-plugin-schedule-0001",
+    )
+
+    from ai_ops.scheduler import worker
+
+    monkeypatch.setattr(worker.settings, "agent_asset_vault_root", control_plane.vault_root)
+    monkeypatch.setattr(worker.settings, "agent_asset_max_bytes", 1024)
+    with control_plane.session_factory() as session:
+        job = session.get(PublishJob, scheduled.job_ids[0])
+        account = session.get(Account, control_plane.account_id)
+        assert job is not None and account is not None
+        content = _build_verified_contract_content(session, job, account)
+
+    assert content.approved_publisher_kind == "tests_zhihu_plugin"
+    result = await _try_publishers(
+        Platform.ZHIHU,
+        control_plane.account_id,
+        {},
+        content,
+        registry=registry,
+        receipt_writer=lambda **_kwargs: None,
+    )
+    assert result.success is True
+    assert result.platform_post_id == "plugin-exact-post"
+
+
+@pytest.mark.asyncio
+async def test_worker_contains_plugin_renderer_system_exit_before_publish():
+    _SystemExitExactPublisher.publish_called = False
+    registry = PublisherRegistry()
+    registry.register(
+        Platform.ZHIHU,
+        _namespaced_exact_plugin_factory(_SystemExitExactPublisher),
+        priority=1,
+        registration_id="plugin:tests-ai-ops:tests.zhihu.plugin",
+    )
+    content = PublishContent(
+        title="approved title",
+        body="approved body",
+        content_type=ContentType.LONG_ARTICLE,
+        exact_approval=True,
+        approved_publisher_kind="tests_zhihu_plugin",
+        approved_renderer_payload_digest="0" * 64,
+    )
+
+    result = await _try_publishers(
+        Platform.ZHIHU,
+        1,
+        {"token": "credential"},
+        content,
+        registry=registry,
+        receipt_writer=lambda **_kwargs: None,
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.error == "Approved Agent renderer failed payload verification"
+    assert _SystemExitExactPublisher.publish_called is False
+    assert "must-not-leak" not in result.model_dump_json()
 
 
 def test_worker_defers_asset_byte_verification_to_final_materialization(

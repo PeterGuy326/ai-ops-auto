@@ -22,6 +22,10 @@
 此外，仓库包含若干自建 Playwright Publisher（头条、知乎、公众号、百家号、搜狐号）。
 它们不是上表外部工具，但同样受平台 UI 和浏览器版本变化影响。
 
+第三方 Python Publisher 可通过 [Plugin SDK v1](publisher-plugins.md) 接入。它只适合已经完成
+供应链审阅的受信任包；allowlist 不会隔离进程环境或账号数据。社区 CLI/MCP 若不满足同进程信任
+要求，必须继续使用固定 argv 的 subprocess/localhost RPC 边界，不能为了“插件化”直接 import。
+
 ### 知乎 CLI 的隔离安装
 
 ```bash
@@ -113,7 +117,8 @@ git -C external/social-auto-upload checkout --detach FETCH_HEAD
 - **HTTP API**：适合外置视频服务。需要超时、身份验证、网络出站控制与日志脱敏。当前 SAU
   HTTP 集成自身没有认证，只能绑定 loopback 或可信私网，不得直接暴露公网；该路径仅映射
   小红书、视频号、抖音和快手。
-- **Python import**：只用于依赖可控、许可证清晰的轻量库。
+- **Python import**：只用于依赖可控、许可证清晰且显式 allowlist 的受信任轻量库；不可信工具
+  等待未来独立 plugin host。
 
 API 与外部工具之间不应传递本项目的管理 `API_KEY`。为每个外部服务使用单独、最小权限凭证。
 现有 SAU/XhsSkills 子进程使用环境 allowlist，不继承 LLM key、`FERNET_KEY`

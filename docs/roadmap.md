@@ -111,9 +111,18 @@ metric 精确取数，不让手动采集或较晚的 7d 快照替代本次证据
 
 成功指标：Agent 调用成功率、审批绕过事故数、任务状态可解释率。
 
-## Phase 3 — Evidence and feedback moat（未来能力，不是当前事实）
+## Phase 3 — Evidence and feedback moat（进行中）
 
-- Publisher Plugin SDK 和适配器兼容性 manifest。
+已交付的 SDK tranche：
+
+- Publisher Plugin SDK v1、版本化 entry-point group 与适配器兼容性 manifest。
+- 精确 distribution/entry-point allowlist、metadata-only inventory 和显式插件 doctor。
+- 插件 namespaced kind 已贯通 legacy/metrics/Agent exact renderer；每次 factory 构造重新校验，
+  冲突或错误 fail closed。
+- installed-wheel fixture 证明未启用插件不 import、显式 doctor 才加载授权代码。
+
+待交付：
+
 - 平台 canary、最后验证日期、上游版本与失效报警。
 - 跨平台 Metrics 归一化、数据来源和质量标记。
 - 独立的健康反馈 outbox 与经 canary 校准的冻结基线，避免评估器故障重复读取平台，

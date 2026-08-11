@@ -97,10 +97,35 @@ smoke_installed_wheel() {
   local agent_help="$smoke_cwd/agent-help.txt"
   local download_help="$smoke_cwd/download-help.txt"
   local principal_json="$smoke_cwd/principal.json"
+  local plugin_list_json="$smoke_cwd/plugins-list.json"
+  local plugin_doctor_json="$smoke_cwd/plugins-doctor.json"
+  local plugin_sentinel="$smoke_cwd/plugin-imported.sentinel"
+  local fixture_root="$PROJECT_ROOT/tests/fixtures/publisher_plugin"
+  local fixture_build_root="$VERIFY_BUILD_CWD/plugin-fixture"
+  local fixture_dist="$VERIFY_BUILD_CWD/plugin-dist"
+  local fixture_wheels
   local smoke_output
 
   if [[ ! -f "$wheel" ]]; then
     echo "未找到本轮临时目录生成的 wheel"
+    return 1
+  fi
+
+  mkdir -p "$fixture_dist" "$fixture_build_root"
+  cp -R "$fixture_root"/. "$fixture_build_root"/ || return 1
+  if has_python_module build && has_python_module setuptools.build_meta && has_python_module wheel; then
+    (cd "$VERIFY_BUILD_CWD" && "$PYTHON_BIN" -m build --no-isolation --wheel \
+      --outdir "$fixture_dist" "$fixture_build_root") >/dev/null || return 1
+  elif command -v uv >/dev/null 2>&1; then
+    (cd "$VERIFY_BUILD_CWD" && uv build --wheel --out-dir "$fixture_dist" \
+      "$fixture_build_root") >/dev/null || return 1
+  else
+    echo "无法构建 Publisher plugin wheel fixture"
+    return 1
+  fi
+  fixture_wheels=("$fixture_dist"/*.whl)
+  if [[ ! -f "${fixture_wheels[0]}" ]]; then
+    echo "Publisher plugin wheel fixture 缺失"
     return 1
   fi
 
@@ -112,6 +137,8 @@ smoke_installed_wheel() {
   "$PYTHON_BIN" -m venv "$smoke_venv" || return 1
   "$smoke_venv/bin/python" -m pip install \
     --disable-pip-version-check --no-deps --no-index "$wheel" >/dev/null || return 1
+  "$smoke_venv/bin/python" -m pip install \
+    --disable-pip-version-check --no-deps --no-index "${fixture_wheels[0]}" >/dev/null || return 1
   smoke_site="$(
     "$smoke_venv/bin/python" -c 'import site; print(site.getsitepackages()[0])'
   )" || return 1
@@ -153,6 +180,41 @@ print(os.pathsep.join(path for path in paths if path))
     return 1
   }
   printf '%s\n' "$smoke_output" >"$doctor_json"
+
+  smoke_output="$({
+    cd "$smoke_cwd" && env \
+      AI_OPS_PLUGIN_SENTINEL="$plugin_sentinel" \
+      DATABASE_URL="sqlite:///$smoke_db" \
+      DATA_DIR="$smoke_cwd/data" \
+      PYTHONPATH="$runtime_pythonpath" \
+      "$smoke_venv/bin/ai-ops" plugins list --json
+  } 2>&1)" || {
+    echo "$smoke_output"
+    return 1
+  }
+  printf '%s\n' "$smoke_output" >"$plugin_list_json"
+  if [[ -e "$plugin_sentinel" ]]; then
+    echo "plugins list imported disabled third-party code"
+    return 1
+  fi
+
+  smoke_output="$({
+    cd "$smoke_cwd" && env \
+      AI_OPS_PLUGIN_SENTINEL="$plugin_sentinel" \
+      PUBLISHER_PLUGIN_ALLOWLIST='["ai-ops-auto-fixture-plugin:fixture.zhihu"]' \
+      DATABASE_URL="sqlite:///$smoke_db" \
+      DATA_DIR="$smoke_cwd/data" \
+      PYTHONPATH="$runtime_pythonpath" \
+      "$smoke_venv/bin/ai-ops" plugins doctor --json
+  } 2>&1)" || {
+    echo "$smoke_output"
+    return 1
+  }
+  printf '%s\n' "$smoke_output" >"$plugin_doctor_json"
+  if [[ ! -f "$plugin_sentinel" ]]; then
+    echo "plugins doctor did not load the selected fixture"
+    return 1
+  fi
 
   smoke_output="$({
     cd "$smoke_cwd" && env \
@@ -215,6 +277,11 @@ from pathlib import Path
 import sys
 
 import ai_ops
+from ai_ops.publishers import PublisherPluginManifest
+
+assert PublisherPluginManifest
+assert "ai_ops.publishers.registry" not in sys.modules
+
 from sqlalchemy import create_engine, inspect
 from ai_ops.agent_contract.cli_commands import agent_app
 from ai_ops.api.main import app
@@ -275,6 +342,17 @@ assert all((templates / name).is_file() for name in required_templates)
 doctor = json.loads(Path("doctor.json").read_text(encoding="utf-8"))
 assert doctor["schema_version"] == 1
 assert doctor["ok"] is True
+
+plugin_list = json.loads(Path("plugins-list.json").read_text(encoding="utf-8"))
+assert plugin_list["ok"] is True
+assert plugin_list["code_loaded"] is False
+plugins_by_selector = {item["selector"]: item for item in plugin_list["plugins"]}
+assert plugins_by_selector["ai-ops-auto-fixture-plugin:fixture.zhihu"]["status"] == "disabled"
+
+plugin_doctor = json.loads(Path("plugins-doctor.json").read_text(encoding="utf-8"))
+assert plugin_doctor["ok"] is True
+assert plugin_doctor["code_loaded"] is True
+assert plugin_doctor["summary"] == {"enabled": 1, "invalid": 0, "valid": 1}
 
 demo = json.loads(Path("demo.json").read_text(encoding="utf-8"))
 assert demo["ok"] is True

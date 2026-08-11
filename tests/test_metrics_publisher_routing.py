@@ -21,6 +21,13 @@ from ai_ops.core.enums import (
 from ai_ops.core.models import Account, Article, Base, Metrics, PublishJob, Topic
 from ai_ops.core.schemas import PublishResult
 from ai_ops.publishers.base import PublisherBase
+from ai_ops.publishers.plugin_sdk import (
+    PUBLISHER_PLUGIN_API_VERSION,
+    PublisherPlugin,
+    PublisherPluginCapability,
+    PublisherPluginManifest,
+    instantiate_validated_publisher,
+)
 from ai_ops.publishers.registry import PublisherRegistry, build_default_registry
 
 
@@ -84,6 +91,35 @@ def _seed_job(SessionLocal, *, publisher_kind: str, status: JobStatus) -> int:
         session.add(job)
         session.commit()
         return job.id
+
+
+def _plugin_metrics_registry(publisher_type: type[PublisherBase]) -> PublisherRegistry:
+    plugin = PublisherPlugin(
+        manifest=PublisherPluginManifest(
+            plugin_id="fixture.metrics",
+            plugin_version="1.0.0",
+            api_version=PUBLISHER_PLUGIN_API_VERSION,
+            platform=Platform.ZHIHU,
+            publisher_kind="plugin_metrics",
+            adapter_version="1",
+            capabilities=(
+                PublisherPluginCapability.HEALTH_CHECK,
+                PublisherPluginCapability.LOGIN,
+                PublisherPluginCapability.METRICS,
+                PublisherPluginCapability.PUBLISH,
+            ),
+        ),
+        factory=publisher_type,
+    )
+    registry = PublisherRegistry()
+    registry.register(
+        Platform.ZHIHU,
+        lambda: instantiate_validated_publisher(
+            "fixture-ai-ops:fixture.metrics",
+            plugin,
+        ),
+    )
+    return registry
 
 
 class _CliWithoutMetrics(PublisherBase):
@@ -366,7 +402,12 @@ def test_supported_collector_exception_is_skipped_without_fake_zero(
     monkeypatch.setattr(browser, "collect_metrics", explode)
     monkeypatch.setattr(metrics_mod, "default_registry", registry)
     monkeypatch.setattr(metrics_mod, "get_credential", lambda *args: {})
-    monkeypatch.setattr(metrics_mod, "capture_exception", lambda *args, **kwargs: None)
+    captures: list[tuple[BaseException, dict]] = []
+    monkeypatch.setattr(
+        metrics_mod,
+        "capture_exception",
+        lambda exc, **context: captures.append((exc, context)),
+    )
 
     result = asyncio.run(metrics_mod.collect_one(job_id, interval_index=0))
 
@@ -376,6 +417,193 @@ def test_supported_collector_exception_is_skipped_without_fake_zero(
         "publisher_kind": PublisherKind.SOCIAL_AUTO_UPLOAD.value,
     }
     assert "credential-bearing" not in repr(result)
+    assert len(captures) == 1
+    assert str(captures[0][0]) == "external_adapter_failure:RuntimeError"
+    assert captures[0][1]["exception_type"] == "RuntimeError"
+    assert "credential-bearing" not in repr(captures)
+    with SessionLocal() as session:
+        assert session.query(Metrics).filter(Metrics.job_id == job_id).count() == 0
+
+
+def test_third_party_metrics_raw_is_not_returned_or_persisted(
+    production_session_in_memory,
+    monkeypatch,
+):
+    from ai_ops.scheduler import metrics as metrics_mod
+
+    SessionLocal = production_session_in_memory
+    job_id = _seed_job(SessionLocal, publisher_kind="plugin_metrics", status=JobStatus.SUCCESS)
+
+    class PluginMetricsPublisher(PublisherBase):
+        platform = Platform.ZHIHU
+        kind = "plugin_metrics"
+        supports_metrics = True
+
+        async def login(self, account_id, credential):
+            return True
+
+        async def publish(self, account_id, credential, content):
+            return PublishResult(success=True, platform_post_id="7788")
+
+        async def health_check(self, account_id, credential):
+            return AccountHealth.HEALTHY
+
+        async def collect_metrics(self, post_id, post_url, credential):
+            return {
+                "likes": 8,
+                "comments": 2,
+                "shares": 0,
+                "views": 80,
+                "raw": {
+                    "http_status": "Bearer must-not-leak",
+                    "token": "must-not-leak",
+                },
+            }
+
+    registry = _plugin_metrics_registry(PluginMetricsPublisher)
+    monkeypatch.setattr(metrics_mod, "default_registry", registry)
+    monkeypatch.setattr(metrics_mod, "get_credential", lambda *args: {"token": "credential"})
+    import ai_ops.content.heat_engine as heat_mod
+
+    monkeypatch.setattr(heat_mod, "recompute_topic_heat_for_article", lambda *args: None)
+
+    result = asyncio.run(metrics_mod.collect_one(job_id, interval_index=0))
+
+    assert result["raw"] == {}
+    assert "must-not-leak" not in repr(result)
+    with SessionLocal() as session:
+        metric = session.query(Metrics).filter(Metrics.job_id == job_id).one()
+        assert metric.raw == {}
+
+
+def test_third_party_metrics_cannot_remove_marker_to_reopen_raw_path(
+    production_session_in_memory,
+    monkeypatch,
+):
+    from ai_ops.scheduler import metrics as metrics_mod
+
+    SessionLocal = production_session_in_memory
+    job_id = _seed_job(SessionLocal, publisher_kind="plugin_metrics", status=JobStatus.SUCCESS)
+
+    class MarkerDeletingPublisher(PublisherBase):
+        platform = Platform.ZHIHU
+        kind = "plugin_metrics"
+        supports_metrics = True
+
+        async def login(self, account_id, credential):
+            return True
+
+        async def publish(self, account_id, credential, content):
+            return PublishResult(success=True, platform_post_id="7788")
+
+        async def health_check(self, account_id, credential):
+            return AccountHealth.HEALTHY
+
+        async def collect_metrics(self, post_id, post_url, credential):
+            object.__delattr__(self, "_ai_ops_publisher_plugin_selector")
+            return {
+                "likes": 8,
+                "comments": 2,
+                "shares": 0,
+                "views": 80,
+                "raw": {"authorization": "Bearer must-not-leak"},
+            }
+
+    monkeypatch.setattr(
+        metrics_mod,
+        "default_registry",
+        _plugin_metrics_registry(MarkerDeletingPublisher),
+    )
+    monkeypatch.setattr(metrics_mod, "get_credential", lambda *args: {})
+    import ai_ops.content.heat_engine as heat_mod
+
+    monkeypatch.setattr(heat_mod, "recompute_topic_heat_for_article", lambda *args: None)
+
+    result = asyncio.run(metrics_mod.collect_one(job_id, interval_index=0))
+
+    assert result["raw"] == {}
+    assert "must-not-leak" not in repr(result)
+    with SessionLocal() as session:
+        metric = session.query(Metrics).filter(Metrics.job_id == job_id).one()
+        assert metric.raw == {}
+
+
+def test_third_party_metrics_system_exit_is_a_redacted_collection_failure(
+    production_session_in_memory,
+    monkeypatch,
+):
+    from ai_ops.scheduler import metrics as metrics_mod
+
+    SessionLocal = production_session_in_memory
+    job_id = _seed_job(SessionLocal, publisher_kind="plugin_metrics", status=JobStatus.SUCCESS)
+
+    class ExitingPublisher(PublisherBase):
+        platform = Platform.ZHIHU
+        kind = "plugin_metrics"
+        supports_metrics = True
+
+        async def login(self, account_id, credential):
+            return True
+
+        async def publish(self, account_id, credential, content):
+            return PublishResult(success=True, platform_post_id="7788")
+
+        async def health_check(self, account_id, credential):
+            return AccountHealth.HEALTHY
+
+        async def collect_metrics(self, post_id, post_url, credential):
+            raise SystemExit("token=must-not-leak")
+
+    monkeypatch.setattr(
+        metrics_mod,
+        "default_registry",
+        _plugin_metrics_registry(ExitingPublisher),
+    )
+    monkeypatch.setattr(metrics_mod, "get_credential", lambda *args: {})
+    monkeypatch.setattr(metrics_mod, "capture_exception", lambda *args, **kwargs: None)
+
+    result = asyncio.run(metrics_mod.collect_one(job_id, interval_index=0))
+
+    assert result == {
+        "skipped": True,
+        "reason": "collector 执行失败（SystemExit）",
+        "publisher_kind": "plugin_metrics",
+    }
+    assert "must-not-leak" not in repr(result)
+    with SessionLocal() as session:
+        assert session.query(Metrics).filter(Metrics.job_id == job_id).count() == 0
+
+
+def test_invalid_plugin_registry_makes_metrics_terminal_without_credentials(
+    production_session_in_memory,
+    monkeypatch,
+):
+    from ai_ops.publishers.plugin_sdk import PublisherPluginResolutionError
+    from ai_ops.scheduler import metrics as metrics_mod
+
+    SessionLocal = production_session_in_memory
+    job_id = _seed_job(SessionLocal, publisher_kind="plugin_metrics", status=JobStatus.SUCCESS)
+
+    class InvalidRegistry:
+        def resolve_collector(self, platform, publisher_kind):
+            raise PublisherPluginResolutionError("factory_failed")
+
+    monkeypatch.setattr(metrics_mod, "default_registry", InvalidRegistry())
+    monkeypatch.setattr(
+        metrics_mod,
+        "get_credential",
+        lambda *args: pytest.fail("invalid plugin routing must fail before credential load"),
+    )
+
+    result = asyncio.run(metrics_mod.collect_one(job_id, interval_index=0))
+
+    assert result == {
+        "skipped": True,
+        "reason": "Publisher plugin configuration is invalid",
+        "error_code": "publisher_plugin_configuration_invalid",
+        "publisher_kind": "plugin_metrics",
+        "retryable": False,
+    }
     with SessionLocal() as session:
         assert session.query(Metrics).filter(Metrics.job_id == job_id).count() == 0
 
