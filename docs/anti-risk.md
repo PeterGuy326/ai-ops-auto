@@ -30,15 +30,17 @@ Playwright、Chrome channel、Patchright 或 Camoufox 在本项目中是浏览�
 
 ## 默认控制
 
-| 配置 | 默认 | 含义 |
-|---|---|---|
-| `AUTO_PUBLISH_ENABLED` | `false` | worker 不自动扫描/执行真发布 |
-| `GITHUB_PAGES_DRY_RUN` | `true` | 只预览，不写站点、构建或 push |
-| `PUBLISH_MAX_PER_DAY` | `2` | 每账号单日上限；应按平台政策调低 |
-| `PUBLISH_MIN_INTERVAL_SECONDS` | `14400` | 同账号发布间隔下限 |
-| `NURTURE_DAYS` | `7` | 业务侧新账号冻结窗口；不代表平台规则或成功保证 |
+| 配置 | 默认 | 接受范围 | 含义 |
+|---|---:|---:|---|
+| `AUTO_PUBLISH_ENABLED` | `false` | 布尔值 | worker 不自动扫描/执行真发布 |
+| `GITHUB_PAGES_DRY_RUN` | `true` | 布尔值 | 只预览，不写站点、构建或 push |
+| `PUBLISH_MAX_PER_DAY` | `2` | `1..50` | 每账号单日上限；应按平台政策调低 |
+| `PUBLISH_MIN_INTERVAL_SECONDS` | `14400` | `60..604800` | 同账号发布间隔下限（秒） |
+| `NURTURE_DAYS` | `7` | `0..365` | 业务侧新账号冻结窗口；不代表平台规则或成功保证 |
+| `PUBLISH_JITTER_SECONDS` | `600` | `0..86400` | 排程抖动窗口（秒），用于分散同时到期任务 |
 
 这些参数是事故半径限制，不是平台风控规避方法。
+越过表中范围会在配置加载时直接失败；范围只是控制面安全护栏，不代表平台允许对应频率。
 `AUTO_PUBLISH_ENABLED=false` 不禁用 `/jobs/{id}/run` 等显式管理操作；不要把它当作全局 kill switch。
 
 ## 真平台 canary

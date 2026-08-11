@@ -33,6 +33,9 @@ dependencies = [
     "rich>=13.7",
     "typer>=0.12",
     "tenacity>=8.2",
+    # Windows Python does not ship an IANA timezone database; scheduler doctor
+    # must still be able to resolve the default Asia/Shanghai zone.
+    "tzdata>=2024.1; platform_system == 'Windows'",
     # 浏览器自动化（主流，微软官方维护）
     # 默认走 playwright + 本地 Chrome channel，足以覆盖知乎/头条/公众号
     "playwright>=1.45",

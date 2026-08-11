@@ -76,6 +76,11 @@ jobs:
 
           required_suffixes = {
               "ai_ops/api/templates/base.html",
+              "ai_ops/api/templates/dashboard.html",
+              "ai_ops/api/templates/login.html",
+              "ai_ops/api/templates/list.html",
+              "ai_ops/api/templates/article_detail.html",
+              "ai_ops/api/templates/account_detail.html",
               "share/ai-ops-auto/prompts/accounts/_template.md",
               "share/ai-ops-auto/alembic.ini",
               "share/ai-ops-auto/alembic/env.py",
@@ -99,7 +104,13 @@ jobs:
           export DATA_DIR="$smoke_dir/data"
           "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" --help
           "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" init-db
+          "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" doctor --json > doctor.json
+          "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" demo --json > demo.json
           "$GITHUB_WORKSPACE/.package-venv/bin/python" - <<'PY'
+          import json
+          from pathlib import Path
+
+          import ai_ops
           from ai_ops.content.generator import _load_topic_prompt
           from ai_ops.core.db import get_code_alembic_head, get_db_alembic_head
 
@@ -107,6 +118,31 @@ jobs:
           code_head = get_code_alembic_head()
           assert code_head, "wheel Alembic migrations are not discoverable"
           assert get_db_alembic_head() == code_head, "installed wheel did not migrate to head"
+          templates = Path(ai_ops.__file__).resolve().parent / "api" / "templates"
+          required_templates = {
+              "base.html",
+              "dashboard.html",
+              "login.html",
+              "list.html",
+              "article_detail.html",
+              "account_detail.html",
+          }
+          assert all((templates / name).is_file() for name in required_templates)
+
+          with open("doctor.json", encoding="utf-8") as stream:
+              doctor = json.load(stream)
+          assert doctor["schema_version"] == 1
+          assert doctor["ok"] is True
+
+          with open("demo.json", encoding="utf-8") as stream:
+              demo = json.load(stream)
+          assert demo["ok"] is True
+          assert demo["exit_code"] == 0
+          assert demo["synthetic"] is True
+          assert demo["offline"] is True
+          assert demo["credentials_used"] is False
+          assert demo["external_calls"] == 0
+          assert demo["review"]["passed"] is True
           PY
 
   postgres:
@@ -140,12 +176,22 @@ jobs:
       - name: Migrate an empty PostgreSQL database to head
         run: |
           ai-ops init-db
+          ai-ops doctor --json > postgres-doctor.json
           python - <<'PY'
+          import json
+
           from ai_ops.core.db import get_code_alembic_head, get_db_alembic_head
 
           code_head = get_code_alembic_head()
           assert code_head
           assert get_db_alembic_head() == code_head
+
+          with open("postgres-doctor.json", encoding="utf-8") as stream:
+              doctor = json.load(stream)
+          checks = {item["id"]: item for item in doctor["checks"]}
+          assert doctor["ok"] is True
+          assert checks["database.connectivity"]["outcome"] == "pass"
+          assert checks["database.schema"]["outcome"] == "pass"
           PY
 
   docker:

@@ -47,6 +47,15 @@ once release automation is established.
   restored only after an explicit read-only health check returns HEALTHY.
 - Installed-wheel/Alembic, PostgreSQL migration, and Docker runtime smoke gates in local/CI
   release verification.
+- A read-only `ai-ops doctor` command with human/JSON diagnostics for the database, packaged
+  resources, scheduler safety, browser runtimes, and optional external adapters.
+- A deterministic `ai-ops demo` command that exercises ingest, review, dry-run planning, a durable
+  job, Fake Publisher, Fake Metrics, and final review in isolated SQLite storage. It is explicitly
+  synthetic/offline, consumes no credentials, performs zero external calls, and cleans temporary
+  data by default.
+- Installed-wheel contract smoke for `doctor --json` and `demo --json`, including JSON parsing and
+  assertions that the synthetic final review passed without external calls.
+- Stable top-level `ok` and `exit_code` fields for successful and failed-review offline demo JSON.
 
 ### Changed
 
@@ -75,6 +84,12 @@ once release automation is established.
   neither falls back to the control-plane or PATH Python interpreter.
 - MoneyPrinterTurbo and FunClip runs use private, unique output directories and accept only the
   current invocation's contained, non-symlink, non-empty artifacts.
+- `scripts/seed_demo.sh` is now documented as a legacy UI seed; the supported five-minute value
+  path is `ai-ops doctor` followed by `ai-ops demo`.
+- Worker execution dependencies now have an explicit injection boundary for isolated demos and
+  tests, including rate policy, timeouts, receipts, account leases, notifications, and exception
+  reporting, while the production default path remains unchanged.
+- Phase 0 was accepted on 2026-08-11 after all six CI jobs passed on merged `main@16eccb5`.
 
 ### Security
 
@@ -94,6 +109,12 @@ once release automation is established.
   OAuth/cookie files, and browser profiles remain filesystem-protected deployment secrets.
 - Video diversification now accepts an ffmpeg result only after a zero exit, non-empty temporary
   output and ffprobe video-stream check, then atomically replaces the destination.
+- Doctor refuses mutable SQLite recovery state and probes existing databases through an immutable
+  read-only handle; PostgreSQL catalog checks run in a server-enforced read-only transaction.
+- Doctor verifies every server-rendered UI template and all eleven tables represented by the
+  current migration head instead of accepting a partially damaged installation or schema.
+- Explicit demo databases are built in a private sibling directory and promoted without following
+  symlinks or overwriting databases and SQLite sidecars supplied by the caller.
 
 ### Known limitations
 

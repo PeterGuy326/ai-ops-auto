@@ -134,13 +134,17 @@ class Settings(BaseSettings):
     # 形如 "http://127.0.0.1:9333"；留空则由项目启动独立浏览器。
     browser_cdp_url: str = ""
     # 发布间隔下限（秒）— 限制操作频率和事故半径。
-    publish_min_interval_seconds: int = 14400  # 默认 4 小时
+    publish_min_interval_seconds: int = Field(
+        default=14400,
+        ge=60,
+        le=7 * 24 * 60 * 60,
+    )  # 默认 4 小时
     # 单账号每日发布上限；真实值应按平台条款和运营政策收紧。
-    publish_max_per_day: int = 2
+    publish_max_per_day: int = Field(default=2, ge=1, le=50)
     # 新账号进入自动发布前的人工观察期。
-    nurture_days: int = 7
+    nurture_days: int = Field(default=7, ge=0, le=365)
     # 排程抖动窗口（秒）— 分散同时到期任务，降低瞬时资源峰值。
-    publish_jitter_seconds: int = 600
+    publish_jitter_seconds: int = Field(default=600, ge=0, le=24 * 60 * 60)
     # 是否执行可读性/风格整理（默认开；调试时可关）。
     xhs_humanize_enabled: bool = True
 

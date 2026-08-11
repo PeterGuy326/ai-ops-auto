@@ -92,6 +92,8 @@ smoke_installed_wheel() {
   local runtime_pythonpath
   local smoke_cwd="$VERIFY_BUILD_CWD/wheel-run"
   local smoke_db="$VERIFY_BUILD_CWD/wheel-smoke.db"
+  local doctor_json="$smoke_cwd/doctor.json"
+  local demo_json="$smoke_cwd/demo.json"
   local smoke_output
 
   if [[ ! -f "$wheel" ]]; then
@@ -137,12 +139,37 @@ print(os.pathsep.join(path for path in paths if path))
     return 1
   fi
 
+  smoke_output="$({
+    cd "$smoke_cwd" && env \
+      DATABASE_URL="sqlite:///$smoke_db" \
+      DATA_DIR="$smoke_cwd/data" \
+      PYTHONPATH="$runtime_pythonpath" \
+      "$smoke_venv/bin/ai-ops" doctor --json
+  } 2>&1)" || {
+    echo "$smoke_output"
+    return 1
+  }
+  printf '%s\n' "$smoke_output" >"$doctor_json"
+
+  smoke_output="$({
+    cd "$smoke_cwd" && env \
+      DATABASE_URL="sqlite:///$smoke_db" \
+      DATA_DIR="$smoke_cwd/data" \
+      PYTHONPATH="$runtime_pythonpath" \
+      "$smoke_venv/bin/ai-ops" demo --json
+  } 2>&1)" || {
+    echo "$smoke_output"
+    return 1
+  }
+  printf '%s\n' "$smoke_output" >"$demo_json"
+
   (
     cd "$smoke_cwd" && env \
       DATABASE_URL="sqlite:///$smoke_db" \
       DATA_DIR="$smoke_cwd/data" \
       PYTHONPATH="$runtime_pythonpath" \
       "$smoke_venv/bin/python" -c '
+import json
 from pathlib import Path
 import sys
 
@@ -152,6 +179,29 @@ from ai_ops.core.db import get_code_alembic_head, get_db_alembic_head
 package_path = Path(ai_ops.__file__).resolve()
 assert package_path.is_relative_to(Path(sys.prefix).resolve()), package_path
 assert get_code_alembic_head() == get_db_alembic_head()
+templates = package_path.parent / "api" / "templates"
+required_templates = {
+    "base.html",
+    "dashboard.html",
+    "login.html",
+    "list.html",
+    "article_detail.html",
+    "account_detail.html",
+}
+assert all((templates / name).is_file() for name in required_templates)
+
+doctor = json.loads(Path("doctor.json").read_text(encoding="utf-8"))
+assert doctor["schema_version"] == 1
+assert doctor["ok"] is True
+
+demo = json.loads(Path("demo.json").read_text(encoding="utf-8"))
+assert demo["ok"] is True
+assert demo["exit_code"] == 0
+assert demo["synthetic"] is True
+assert demo["offline"] is True
+assert demo["credentials_used"] is False
+assert demo["external_calls"] == 0
+assert demo["review"]["passed"] is True
 '
   )
 }
@@ -234,7 +284,7 @@ else
   skip "wheel + sdist" "build/setuptools 与 uv 均不可用"
 fi
 if [[ "$package_built" == true ]]; then
-  check "installed wheel + Alembic smoke" smoke_installed_wheel
+  check "installed wheel + Alembic/doctor/demo smoke" smoke_installed_wheel
 fi
 
 echo

@@ -38,9 +38,9 @@ Codex 是大脑，不应该同时充当你的长期任务数据库、发布审�
 
 目前还不是：分布式队列、无人值守 SaaS、官方平台 API 聚合层，或已经完成的 Agent MCP 产品。
 
-## 五分钟本地启动（不是完整价值演示）
+## 五分钟离线价值演示
 
-下面的路径只使用本地 SQLite 和本机 HTTP，不需要 LLM key、平台 cookie 或外部工具。
+先做只读环境诊断，再跑一条完整的合成链路：
 
 ```bash
 python3.11 -m venv .venv
@@ -48,17 +48,31 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 
 cp .env.example .env
+ai-ops init-db
+ai-ops doctor
+ai-ops demo
+```
+
+如果在 `init-db` 前先运行 `doctor`，它会以只读 FAIL 报告未初始化的 SQLite，但不会
+替你创建文件或修改数据。执行 `init-db` 后复检即可。
+
+“SYNTHETIC — NO EXTERNAL ACTION” 是这条链路的强制边界。`ai-ops demo` 使用隔离的
+SQLite、Fake Publisher 和 Fake Metrics，按顺序验证入库、审核、dry-run 计划、持久任务、
+合成发布、合成指标和最终复核。它不需要、不使用、也不会发送平台凭证，不访问真实平台，外部调用数为 0；
+默认的临时数据会在结束后清理。可用 `--json` 获取 Agent 可验证的结果。
+
+若要继续运行 API/UI 和 worker，再补齐用于持久保存账号凭证的本地密钥：
+
+```bash
 ai-ops gen-fernet-key
 # 将输出手工填入 .env 的 FERNET_KEY；保持 AUTO_PUBLISH_ENABLED=false
 
-ai-ops init-db
 ai-ops serve
 ```
 
 在第二个终端启动唯一调度 worker（默认不真发布）：
 
 ```bash
-source .venv/bin/activate
 ai-ops worker
 ```
 
@@ -69,11 +83,9 @@ curl -fsS http://127.0.0.1:8000/health
 bash scripts/seed_demo.sh
 ```
 
-打开 <http://127.0.0.1:8000/ui>。种子数据只写本地数据库；
+打开 <http://127.0.0.1:8000/ui>。`seed_demo.sh` 只是旧的 UI 占位数据脚本，不是价值链路或
+发布成功证据。种子数据只写本地数据库；
 `AUTO_PUBLISH_ENABLED=false` 会阻止后台扫描器自动真发布。
-
-这条路径验证安装、控制面和持久任务基础设施，不包含 Fake Publisher/Fake Metrics 的完整闭环；
-后者是 Roadmap Phase 1 的 `ai-ops demo` 交付。
 
 完整步骤、前端开发和真平台启用前检查见 [Getting Started](docs/getting-started.md)。
 
@@ -114,8 +126,10 @@ Codex / Claude / OpenClaw / custom agent
 
 ## 项目方向
 
-1. **Trustworthy alpha**：原子 claim、持久恢复、失败关闭、安全鉴权与开源治理已有代码，合并后仍需 CI/容器/PostgreSQL 验收。
-2. **Five-minute value**：提供 `doctor` / `demo` / Fake Publisher，让新用户无凭证看到完整状态流；同时优先打通第一个 Stable 中国平台。
+1. **Trustworthy alpha**：原子 claim、持久恢复、失败关闭、安全鉴权与开源治理已在
+   2026-08-11 的 `main@16eccb5` 通过六个 CI jobs 验收。
+2. **Five-minute value**：`doctor` / `demo` / Fake Publisher/Fake Metrics 的离线 tranche 已交付；
+   独立身份与 RBAC、第一个 Stable 中国平台、`accepted/deployed/verified` 结果分层仍在进行中。
 3. **Agent-native contract**：稳定 CLI/API/MCP 的入库、审批、排程、状态和复盘契约；平台侧
    优先复用能返回 post identity 的版本化 CLI/API，浏览器自动化作为受控 fallback。
 4. **Evidence moat**：版本化 Adapter、平台 canary、跨平台指标归一化和实验追踪。

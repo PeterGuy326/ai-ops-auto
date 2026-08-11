@@ -26,12 +26,19 @@ class AccountOperationLease:
     kernel lock itself is released automatically if a process dies.
     """
 
-    def __init__(self, account_id: int, *, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        account_id: int,
+        *,
+        timeout_seconds: float,
+        data_dir: str | Path | None = None,
+    ) -> None:
         if account_id <= 0:
             raise ValueError("account_id must be positive")
         self.account_id = account_id
         self.timeout_seconds = max(0.0, float(timeout_seconds))
-        root = Path(os.path.abspath(Path(settings.data_dir) / "locks" / "accounts"))
+        effective_data_dir = settings.data_dir if data_dir is None else data_dir
+        root = Path(os.path.abspath(Path(effective_data_dir) / "locks" / "accounts"))
         self.path = root / f"account_{account_id}.lock"
         self._fd: int | None = None
         self._locked = False

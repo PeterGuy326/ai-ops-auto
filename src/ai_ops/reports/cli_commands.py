@@ -6,10 +6,6 @@ from pathlib import Path
 
 import typer
 
-from .daily import write_daily_report
-from ..notify import report_ready
-from .weekly import parse_iso_week, write_weekly_report
-
 report_app = typer.Typer(help="数据回流自动出报（日报 / 周报）")
 
 
@@ -29,6 +25,9 @@ def cmd_daily(
     ),
 ):
     """生成日报到 ./reports/daily-YYYY-MM-DD.md。"""
+    from ..notify import report_ready
+    from .daily import write_daily_report
+
     if date:
         try:
             d = date_cls.fromisoformat(date)
@@ -57,6 +56,9 @@ def cmd_weekly(
     notify: bool = typer.Option(True, "--notify/--no-notify"),
 ):
     """生成周报到 ./reports/weekly-YYYY-Www.md。"""
+    from ..notify import report_ready
+    from .weekly import parse_iso_week, write_weekly_report
+
     if week:
         try:
             year, w = parse_iso_week(week)

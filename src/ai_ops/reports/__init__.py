@@ -11,10 +11,6 @@
 - cli_commands.py：typer 子组（被 cli.py 一行挂载）
 """
 
-from .daily import build_daily_report, write_daily_report, run_daily_report_job
-from .weekly import build_weekly_report, write_weekly_report, run_weekly_report_job
-from ..notify import report_ready  # TD-A3：切真实 notify，stub 仅作兜底保留
-
 __all__ = [
     "build_daily_report",
     "write_daily_report",
@@ -24,3 +20,24 @@ __all__ = [
     "run_weekly_report_job",
     "report_ready",
 ]
+
+
+def __getattr__(name: str):
+    """Load DB/config-bound report code only when a report is actually used.
+
+    Keeping package import side-effect free lets ``ai-ops doctor`` render a
+    structured configuration error even when application settings are invalid.
+    """
+    if name in {"build_daily_report", "write_daily_report", "run_daily_report_job"}:
+        from . import daily
+
+        return getattr(daily, name)
+    if name in {"build_weekly_report", "write_weekly_report", "run_weekly_report_job"}:
+        from . import weekly
+
+        return getattr(weekly, name)
+    if name == "report_ready":
+        from ..notify import report_ready
+
+        return report_ready
+    raise AttributeError(name)

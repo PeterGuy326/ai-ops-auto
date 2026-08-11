@@ -169,3 +169,25 @@ def test_worker_unexpected_exception_is_unknown_and_stops_fallback(monkeypatch):
     assert result.retryable is False
     assert result.raw_response["exception_type"] == "RuntimeError"
     assert "secret" not in result.model_dump_json()
+
+
+def test_custom_receipt_writer_failure_does_not_erase_confirmed_result():
+    reg = PublisherRegistry()
+    reg.register(Platform.XIAOHONGSHU, _AlwaysOk)
+
+    def broken_receipt_writer(**kwargs):
+        raise OSError("isolated receipt store unavailable")
+
+    result = asyncio.run(
+        worker_mod._try_publishers(
+            Platform.XIAOHONGSHU,
+            1,
+            {},
+            PublishContent(title="t", body="b", content_type="image_text"),
+            registry=reg,
+            receipt_writer=broken_receipt_writer,
+        )
+    )
+
+    assert result.success is True
+    assert result.platform_post_id == "x1"
