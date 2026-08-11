@@ -185,14 +185,14 @@ async def check_all_accounts() -> dict:
                 for pub in pubs:
                     plugin_publisher = is_publisher_plugin_instance(pub)
                     try:
-                        candidate = AccountHealth(
-                            await asyncio.wait_for(
-                                pub.health_check(account_id, plan.credential),
-                                timeout=float(
-                                    getattr(settings, "health_probe_timeout_seconds", 60)
-                                ),
+                        # Keep plugin code in this Task so Python 3.11 cannot
+                        # leak SystemExit through a wait_for child Task.
+                        async with asyncio.timeout(
+                            float(getattr(settings, "health_probe_timeout_seconds", 60))
+                        ):
+                            candidate = AccountHealth(
+                                await pub.health_check(account_id, plan.credential)
                             )
-                        )
                     except (Exception, SystemExit) as e:
                         if isinstance(e, SystemExit) and not plugin_publisher:
                             raise

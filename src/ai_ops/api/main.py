@@ -436,7 +436,10 @@ async def api_login_account(account_id: int):
                     raise HTTPException(503, "登录服务暂时不可用，请稍后重试") from None
 
             try:
-                ok = await asyncio.wait_for(login_publisher.login(account_id, cred), timeout=300)
+                # Keep plugin code in this Task: on Python 3.11, wait_for's
+                # child Task can leak SystemExit before this boundary catches it.
+                async with asyncio.timeout(300):
+                    ok = await login_publisher.login(account_id, cred)
             except TimeoutError:
                 raise HTTPException(408, "登录超时（5 分钟内未完成扫码）") from None
             except (Exception, SystemExit) as exc:

@@ -854,10 +854,10 @@ async def collect_one(
             if collection_task_id is not None
             else "agent_metrics_collection_timeout_seconds"
         )
-        return await asyncio.wait_for(
-            collection,
-            timeout=float(getattr(settings, timeout_setting, 120)),
-        )
+        # Keep plugin code in this Task so Python 3.11 cannot leak SystemExit
+        # through the child Task that asyncio.wait_for would create.
+        async with asyncio.timeout(float(getattr(settings, timeout_setting, 120))):
+            return await collection
 
     # 跳出事务调外部接口；所有会共享 cookie/profile 的入口使用同一账号锁。
     try:
