@@ -19,6 +19,13 @@ def test_running_timeout_must_exceed_execution_timeout():
         ("scheduler_poll_seconds", 0),
         ("scheduler_max_concurrency", 0),
         ("scheduler_max_concurrency", 101),
+        ("metrics_task_collection_timeout_seconds", 0),
+        ("metrics_task_lease_seconds", 1),
+        ("metrics_task_max_attempts", 0),
+        ("metrics_task_max_attempts", 21),
+        ("metrics_task_max_concurrency", 0),
+        ("metrics_task_account_lock_timeout_seconds", -1),
+        ("metrics_task_account_lock_timeout_seconds", 61),
         ("job_execution_timeout_seconds", 0),
         ("sau_cli_timeout_seconds", 0),
         ("sau_cli_timeout_seconds", 7201),
@@ -35,6 +42,33 @@ def test_zhihu_cli_is_canary_off_by_default():
     assert config.zhihu_cli_enabled is False
     assert config.zhihu_cli_bin == "zhihu"
     assert config.zhihu_cli_max_content_bytes == 60_000
+
+
+def test_metrics_task_lease_must_cover_collection_and_finalize_margin():
+    with pytest.raises(ValidationError, match="METRICS_TASK_LEASE_SECONDS"):
+        Settings(
+            _env_file=None,
+            metrics_task_collection_timeout_seconds=300,
+            metrics_task_lease_seconds=300,
+        )
+
+    with pytest.raises(ValidationError, match="finalization margin"):
+        Settings(
+            _env_file=None,
+            metrics_task_collection_timeout_seconds=120,
+            metrics_task_lease_seconds=150,
+        )
+
+
+def test_metrics_task_recovery_has_bounded_defaults():
+    config = Settings(_env_file=None)
+
+    assert config.metrics_task_collection_timeout_seconds == 120
+    assert config.metrics_task_lease_seconds == 300
+    assert config.metrics_task_max_attempts == 5
+    assert config.metrics_task_retry_base_seconds == 300
+    assert config.metrics_task_max_concurrency == 4
+    assert config.metrics_task_account_lock_timeout_seconds == 1
 
 
 @pytest.mark.parametrize(

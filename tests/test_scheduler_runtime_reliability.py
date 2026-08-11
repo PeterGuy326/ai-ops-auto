@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 
 from ai_ops.core import db as db_mod
 from ai_ops.core.enums import (
@@ -22,7 +22,15 @@ from ai_ops.core.enums import (
     JobStatus,
     Platform,
 )
-from ai_ops.core.models import Account, Article, Base, PublishJob, Topic
+from ai_ops.core.models import (
+    Account,
+    Article,
+    Base,
+    Metrics,
+    MetricsCollectionTask,
+    PublishJob,
+    Topic,
+)
 from ai_ops.core.schemas import PublishResult
 from ai_ops.scheduler import runtime as runtime_mod
 from ai_ops.scheduler import worker as worker_mod
@@ -537,6 +545,35 @@ def test_due_scanner_recovers_pending_jobs_but_not_future_jobs(runtime_db, monke
         assert session.get(PublishJob, future_id).status == JobStatus.PENDING
 
 
+def test_publish_success_commits_exact_metrics_windows_with_the_job(runtime_db, monkeypatch):
+    _, (job_id,) = _create_article_and_jobs(runtime_db)
+
+    async def succeed(*args, **kwargs):
+        return PublishResult(success=True, platform_post_id="durable-feedback")
+
+    monkeypatch.setattr(worker_mod, "_try_publishers", succeed)
+
+    result = asyncio.run(worker_mod.execute_job(job_id))
+
+    assert result.success is True
+    with runtime_db() as session:
+        job = session.get(PublishJob, job_id)
+        tasks = list(
+            session.scalars(
+                select(MetricsCollectionTask)
+                .where(MetricsCollectionTask.job_id == job_id)
+                .order_by(MetricsCollectionTask.interval_index.asc())
+            )
+        )
+        assert job.status == JobStatus.SUCCESS
+        assert len(tasks) == 3
+        assert [task.window_seconds for task in tasks] == [3600, 86400, 604800]
+        assert [task.due_at for task in tasks] == [
+            job.finished_at + timedelta(seconds=window) for window in (3600, 86400, 604800)
+        ]
+        assert all(task.status == "queued" for task in tasks)
+
+
 def test_disk_state_publisher_can_run_without_database_credential(runtime_db, monkeypatch):
     """Account-name/profile based publishers must reach the registry with an empty dict."""
     _, (job_id,) = _create_article_and_jobs(runtime_db)
@@ -846,8 +883,57 @@ def test_busy_account_operation_lease_retries_without_entering_publisher(runtime
     with runtime_db() as session:
         job = session.get(PublishJob, job_id)
         assert job.status == JobStatus.RETRYING
+        assert job.attempts == 0
         assert job.raw_response["account_operation_busy"] is True
         assert job.raw_response.get("outcome_uncertain") is not True
+
+
+def test_initial_metrics_flush_failure_isolated_by_savepoint(runtime_db, monkeypatch):
+    """A swallowed SQL flush error must not poison publication finalization."""
+    _, (job_id,) = _create_article_and_jobs(runtime_db)
+
+    async def published(*args, **kwargs):
+        return PublishResult(
+            success=True,
+            platform_post_id="post-with-bad-initial-metric",
+            platform_url="https://example.invalid/post",
+            raw_response={
+                "initial_metadata": {
+                    "view_count": 1,
+                    "like_count": 0,
+                    "comment_count": 0,
+                    "share_count": 0,
+                }
+            },
+        )
+
+    real_metrics = worker_mod.Metrics
+
+    def constraint_violating_metrics(**kwargs):
+        # The real ORM flush fails its owner/source check. The helper catches
+        # that database exception, reproducing a rollback-only nested tx.
+        kwargs["collection_task_id"] = 999_999
+        return real_metrics(**kwargs)
+
+    monkeypatch.setattr(worker_mod, "_try_publishers", published)
+    monkeypatch.setattr(worker_mod, "Metrics", constraint_violating_metrics)
+    monkeypatch.setattr(worker_mod, "capture_exception", lambda *args, **kwargs: None)
+
+    result = asyncio.run(worker_mod.execute_job(job_id))
+
+    assert result.success is True
+    with runtime_db() as session:
+        job = session.get(PublishJob, job_id)
+        assert job.status == JobStatus.SUCCESS
+        assert (
+            len(
+                session.scalars(
+                    select(MetricsCollectionTask).where(MetricsCollectionTask.job_id == job_id)
+                ).all()
+            )
+            == 3
+        )
+        assert session.scalar(select(Metrics.id).where(Metrics.job_id == job_id)) is None
 
 
 def test_publisher_uncertain_result_is_terminal_without_retry(runtime_db, monkeypatch):
@@ -1015,3 +1101,91 @@ def test_worker_loop_stays_alive_when_auto_publish_disabled(runtime_db, monkeypa
         await asyncio.wait_for(task, timeout=1)
 
     asyncio.run(exercise_loop())
+
+
+def test_worker_loop_scans_metrics_when_auto_publish_is_disabled(runtime_db, monkeypatch):
+    stop = asyncio.Event()
+    metrics_scans = 0
+    publish_scans = 0
+
+    async def scan_metrics(*args, **kwargs):
+        nonlocal metrics_scans
+        metrics_scans += 1
+        return {}
+
+    async def scan_publish(*args, **kwargs):
+        nonlocal publish_scans
+        publish_scans += 1
+        stop.set()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "scan_due_metrics_collection_tasks", scan_metrics)
+    monkeypatch.setattr(runtime_mod, "scan_due_jobs", scan_publish)
+    monkeypatch.setattr(
+        runtime_mod,
+        "settings",
+        SimpleNamespace(auto_publish_enabled=False, scheduler_poll_seconds=0.01),
+    )
+
+    asyncio.run(
+        runtime_mod.run_worker_loop(
+            poll_seconds=0.01,
+            stop_event=stop,
+        )
+    )
+
+    assert metrics_scans == 1
+    assert publish_scans == 1
+
+
+def test_publish_scan_has_priority_and_long_metrics_does_not_delay_next_poll(
+    runtime_db,
+    monkeypatch,
+):
+    stop = asyncio.Event()
+    metrics_started = asyncio.Event()
+    metrics_cancelled = asyncio.Event()
+    events: list[str] = []
+    publish_scans = 0
+
+    async def slow_metrics(*args, **kwargs):
+        events.append("metrics")
+        metrics_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            metrics_cancelled.set()
+            raise
+
+    async def scan_publish(*args, **kwargs):
+        nonlocal publish_scans
+        publish_scans += 1
+        events.append(f"publish-{publish_scans}")
+        if publish_scans == 1:
+            assert metrics_started.is_set() is False
+        else:
+            assert metrics_started.is_set()
+            stop.set()
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "scan_due_metrics_collection_tasks", slow_metrics)
+    monkeypatch.setattr(runtime_mod, "scan_due_jobs", scan_publish)
+    monkeypatch.setattr(
+        runtime_mod,
+        "settings",
+        SimpleNamespace(auto_publish_enabled=True, scheduler_poll_seconds=0.01),
+    )
+
+    asyncio.run(
+        asyncio.wait_for(
+            runtime_mod.run_worker_loop(
+                poll_seconds=0.01,
+                stop_event=stop,
+            ),
+            timeout=1,
+        )
+    )
+
+    assert events[:2] == ["publish-1", "metrics"]
+    assert publish_scans == 2
+    assert metrics_cancelled.is_set()

@@ -168,6 +168,7 @@ _REQUIRED_CORE_TABLES = frozenset(
         "approval_requests",
         "agent_operations",
         "publish_jobs",
+        "metrics_collection_tasks",
         "metrics",
         "resume_profiles",
         "job_postings",
@@ -219,18 +220,48 @@ _AGENT_CONTRACT_REQUIRED_COLUMNS = {
         "updated_at",
     },
     "publish_jobs": {"plan_id", "approved_planned_for"},
-    "metrics": {"agent_operation_id"},
+    "metrics_collection_tasks": {
+        "id",
+        "job_id",
+        "interval_index",
+        "window_seconds",
+        "due_at",
+        "collection_deadline_at",
+        "next_attempt_at",
+        "status",
+        "attempts",
+        "max_attempts",
+        "lease_token",
+        "lease_expires_at",
+        "last_error",
+        "started_at",
+        "finished_at",
+        "created_at",
+        "updated_at",
+    },
+    "metrics": {"agent_operation_id", "collection_task_id"},
 }
 _AGENT_CONTRACT_REQUIRED_FOREIGN_KEYS = {
     ("publication_plans", ("article_id",), "articles", ("id",)),
     ("approval_requests", ("plan_id",), "publication_plans", ("id",)),
     ("publish_jobs", ("plan_id",), "publication_plans", ("id",)),
+    ("metrics_collection_tasks", ("job_id",), "publish_jobs", ("id",)),
     ("metrics", ("agent_operation_id",), "agent_operations", ("id",)),
+    (
+        "metrics",
+        ("collection_task_id", "job_id"),
+        "metrics_collection_tasks",
+        ("id", "job_id"),
+    ),
 }
 _AGENT_CONTRACT_REQUIRED_UNIQUES = {
     ("agent_operations", ("principal_id", "operation", "idempotency_key")),
     ("publish_jobs", ("plan_id", "account_id")),
+    ("metrics_collection_tasks", ("job_id", "interval_index")),
+    ("metrics_collection_tasks", ("job_id", "window_seconds")),
+    ("metrics_collection_tasks", ("id", "job_id")),
     ("metrics", ("agent_operation_id",)),
+    ("metrics", ("collection_task_id",)),
 }
 _AGENT_CONTRACT_REQUIRED_CHECKS = {
     "ck_assets_vault_metadata_complete",
@@ -247,6 +278,34 @@ _AGENT_CONTRACT_REQUIRED_CHECKS = {
     "ck_agent_operations_lease_complete",
     "ck_agent_operations_completed_not_leased",
     "ck_publish_jobs_contract_planned_for",
+    "ck_metrics_collection_tasks_status",
+    "ck_metrics_collection_tasks_window",
+    "ck_metrics_collection_tasks_attempts",
+    "ck_metrics_collection_tasks_lifecycle",
+    "ck_metrics_single_ledger_owner",
+    "ck_metrics_collection_task_source",
+}
+_AGENT_CONTRACT_REQUIRED_INDEXES = {
+    (
+        "metrics_collection_tasks",
+        "ix_metrics_collection_tasks_due",
+        ("status", "next_attempt_at", "id"),
+    ),
+    (
+        "metrics_collection_tasks",
+        "ix_metrics_collection_tasks_expired_lease",
+        ("status", "lease_expires_at", "id"),
+    ),
+    (
+        "metrics_collection_tasks",
+        "ix_metrics_collection_tasks_deadline",
+        ("status", "collection_deadline_at", "id"),
+    ),
+    (
+        "metrics",
+        "ix_metrics_job_collected_id",
+        ("job_id", "collected_at", "id"),
+    ),
 }
 
 
@@ -599,6 +658,15 @@ def _database_checks(config: Any, code_heads: tuple[str, ...]) -> list[DoctorChe
                 for constraint in database_inspector.get_check_constraints(table_name)
                 if constraint.get("name")
             }
+            observed_indexes = {
+                (
+                    table_name,
+                    str(index.get("name") or ""),
+                    tuple(str(name) for name in index.get("column_names") or ()),
+                )
+                for table_name in inspected_agent_tables
+                for index in database_inspector.get_indexes(table_name)
+            }
         active_sidecar = _sqlite_mutable_sidecar(sqlite_path) if sqlite_path is not None else None
         if active_sidecar is not None:
             failed = _result(
@@ -641,8 +709,13 @@ def _database_checks(config: Any, code_heads: tuple[str, ...]) -> list[DoctorChe
     missing_foreign_keys = sorted(_AGENT_CONTRACT_REQUIRED_FOREIGN_KEYS - observed_foreign_keys)
     missing_uniques = sorted(_AGENT_CONTRACT_REQUIRED_UNIQUES - observed_uniques)
     missing_checks = sorted(_AGENT_CONTRACT_REQUIRED_CHECKS - observed_checks)
+    missing_indexes = sorted(_AGENT_CONTRACT_REQUIRED_INDEXES - observed_indexes)
     has_shape_drift = bool(
-        missing_columns or missing_foreign_keys or missing_uniques or missing_checks
+        missing_columns
+        or missing_foreign_keys
+        or missing_uniques
+        or missing_checks
+        or missing_indexes
     )
     if len(code_heads) != 1:
         schema = _schema_skipped("a unique code migration head is unavailable")
@@ -660,6 +733,7 @@ def _database_checks(config: Any, code_heads: tuple[str, ...]) -> list[DoctorChe
                 "missing_foreign_keys": [list(item) for item in missing_foreign_keys],
                 "missing_unique_constraints": [list(item) for item in missing_uniques],
                 "missing_check_constraints": missing_checks,
+                "missing_indexes": [list(item) for item in missing_indexes],
             },
         )
     else:

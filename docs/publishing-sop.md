@@ -56,7 +56,7 @@
 > 独立人工参与；持有该 key 的调用方也能显式执行 `/jobs/{id}/run`。Agent 编排应改用
 > [Agent contract v1](agent-contract.md)：它要求独立 human principal、绑定精确内容/目标/排期摘要，
 > 并禁止请求者自签。部署者仍须在外部托管 human token，才能让该身份真正代表人。
-> `AUTO_PUBLISH_ENABLED=false` 只关闭后台扫描；grep 只是辅助检查。“失败立刻重发覆盖”可能造成
+> `AUTO_PUBLISH_ENABLED=false` 只关闭后台发布扫描；grep 只是辅助检查。“失败立刻重发覆盖”可能造成
 > 重复公开内容，v1 exact job 因此禁止走 legacy republish，必须重新计划和审批。
 
 ## 三、外部依赖装机 + Publisher 调用契约
@@ -321,6 +321,9 @@ src/ai_ops/
 支持 headed 浏览器扫码的 Adapter 可能开窗，但不能把它概括成所有平台的统一行为。尤其是启用
 知乎 CLI canary 时，该 API 只验证独立 HOME 中的现有登录态；二维码必须在可信终端显式运行
 `ai-ops zhihu-login <account_id>`。YouTube 路径也只验证预置 OAuth 文件，不会在 API/worker 中授权。
+通用 API 登录从读取旧凭证、调用 Adapter 到加密写回新凭证，全程持有与发布、探活和指标采集相同的
+账号操作锁；支持的显式 CLI 登录也使用该锁。锁繁忙时 API 返回通用 HTTP 409，不会并发消费同一
+profile 或把内部锁路径、Adapter 错误和凭据写入响应。
 
 **已规划增量（main.py 注释已留 TODO）**：SSE 推送二维码 PNG 到 `/accounts/{id}/login/stream`，由前端展示，避免依赖 headed 窗口。在那之前，本地调试时若终端二维码糊：
 
@@ -406,7 +409,8 @@ ai-ops-auto 内部数据流（前置 `Topic`/`Article` 已在 `content/manager.p
 发布后:
   成功: PublishJob.status = SUCCESS, platform_post_id, platform_url 落库
         + Article.status 按 fan-out job 聚合（全部成功后才是 PUBLISHED）
-        + schedule_after_publish(job.id) → 1h / 24h / 7d 数据采集飞轮
+        + 同一终态事务写入固定 1h / 24h / 7d MetricsCollectionTask
+        + worker 数据库扫描按 lease / 重试 / deadline 执行数据采集飞轮
         + 尝试发送已配置的通知
   失败: PublishJob.status = RETRYING（attempts < max_attempts）或 DEAD
         + 失败联动：24h 内 3 次 DEAD → Account.health 升级到 BANNED，暂停 7 天
@@ -422,13 +426,10 @@ ai-ops-auto 内部数据流（前置 `Topic`/`Article` 已在 `content/manager.p
 | 笔记发了发现内容错 | 先停 worker 并确认平台端状态；由人决定编辑/删除/重发，并在 PublishJob 留完整审计 |
 | Cookie 过期 | `scheduler.health` 每天 02:00 全量 health_check；通知仅在 adapter/目标配置有效时投递 |
 | BANNED 永久锁死 | 7 天内 worker 始终禁止发布；到期后每日只读探活，仅明确 `HEALTHY` 恢复，`UNKNOWN` 或任何不健康结果继续保持 BANNED。API 的 `health_recheck_at` 只表示可探测时间，不表示可发布 |
-
-publish 与每日 health check 通过 `DATA_DIR/locks/accounts` 下的内核文件锁串行访问同一账号
-profile；health 不等待繁忙账号，publish 有界等待。探活写回前还会再次检查 RUNNING job、凭证和
-健康版本，避免陈旧结果覆盖。显式 login 与 metrics 尚未加入这把 lease，同账号发布期间不要登录。
+| 同账号操作并发 | publish、通用 API/支持的显式 CLI login、health check 与 metrics 通过 `DATA_DIR/locks/accounts` 下的内核文件锁串行访问同一 profile；所有进程必须共享同一个 `DATA_DIR`。publish/login 有界等待，health 跳过繁忙账号，自动 metrics 延后繁忙任务；探活写回前还会复核 RUNNING job、凭证和健康版本，避免陈旧结果覆盖 |
 | 二维码超时（5 分钟） | 登录返回 408；确认旧进程退出后，由用户显式决定是否重试 |
 | 平台改版（selector 失效） | 知乎/头条/公众号的 selector 集中在各 `*Publisher.py` 顶部常量；SAU 上游负责 xhs/抖音等 selector 维护 |
-| **误发**（自动点了发布按钮） | `AUTO_PUBLISH_ENABLED=false` 仅关闭后台扫描；审核状态流 + 外部 human gate + 单平台 canary。事故后停 worker、撤销管理端访问并人工处置 |
+| **误发**（自动点了发布按钮） | `AUTO_PUBLISH_ENABLED=false` 仅关闭后台发布扫描；审核状态流 + 外部 human gate + 单平台 canary。事故后停 worker、撤销管理端访问并人工处置 |
 | 平台拒绝自动化或页面变化 | 停止自动发布并人工核对；fallback 只能处理适配器故障，不能绕过平台限制 |
 | 通知 webhook 调用频次过高刷屏 | 使用现有滑窗去重；阈值和真实投递行为需在部署环境验证 |
 | 凭证泄露 | DB credential blob 用 Fernet；`FERNET_KEY` 走密钥管理。外部 CLI HOME/OAuth/cookie/浏览器 profile 不在该加密边界内，另用文件权限和主机隔离；任一密钥泄漏都需独立轮换 |

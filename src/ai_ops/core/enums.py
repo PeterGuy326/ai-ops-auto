@@ -43,6 +43,15 @@ class JobStatus(str, Enum):
     DEAD = "dead"
 
 
+class MetricsTaskStatus(str, Enum):
+    """Durable lifecycle for one post-publication metrics window."""
+
+    QUEUED = "queued"
+    CLAIMED = "claimed"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class AssetType(str, Enum):
     IMAGE = "image"
     VIDEO = "video"
@@ -68,6 +77,7 @@ class AccountHealth(str, Enum):
 
 class PublisherKind(str, Enum):
     """发布器实现类型，决定底层调用哪个外部工具。"""
+
     SOCIAL_AUTO_UPLOAD = "social_auto_upload"
     ZHIHU_CLI = "zhihu_cli"
     YOUTUBE_UPLOADER = "youtube_uploader"
@@ -88,6 +98,7 @@ class VideoEngineKind(str, Enum):
 
 class PodcastProviderKind(str, Enum):
     """AI 播客生成提供方类型（云 API，本地零算力）。"""
+
     LISTENHUB = "listenhub"  # ListenHub / Marswave 云播客 API
 
 
@@ -95,4 +106,5 @@ class VideoClipperKind(str, Enum):
     """视频剪辑器实现类型 —— 与 VideoEngineKind（生成）正交：
     Engine = 从 brief 造视频；Clipper = 从已有长视频切短片段。
     """
+
     FUNCLIP = "funclip"

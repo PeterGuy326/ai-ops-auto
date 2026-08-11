@@ -87,6 +87,7 @@ jobs:
               "share/ai-ops-auto/alembic/versions/b09fbf0bf0f0_initial_schema_baseline.py",
               "share/ai-ops-auto/alembic/versions/a2f7c9e4d1b6_add_agent_contract_tables.py",
               "share/ai-ops-auto/alembic/versions/d4e8a1c7b5f2_bind_contract_job_planned_time.py",
+              "share/ai-ops-auto/alembic/versions/e8b4c6d2a901_add_durable_metrics_collection_tasks.py",
           }
           missing = sorted(
               suffix for suffix in required_suffixes
@@ -129,9 +130,19 @@ jobs:
           code_head = get_code_alembic_head()
           assert code_head, "wheel Alembic migrations are not discoverable"
           assert get_db_alembic_head() == code_head, "installed wheel did not migrate to head"
-          assert code_head == "d4e8a1c7b5f2", "wheel does not contain the latest Agent contract migration"
-          tables = set(inspect(create_engine(os.environ["DATABASE_URL"])).get_table_names())
-          assert {"publication_plans", "approval_requests", "agent_operations"} <= tables
+          assert code_head == "e8b4c6d2a901", "wheel does not contain the durable metrics migration"
+          database_inspector = inspect(create_engine(os.environ["DATABASE_URL"]))
+          tables = set(database_inspector.get_table_names())
+          assert {
+              "publication_plans",
+              "approval_requests",
+              "agent_operations",
+              "metrics_collection_tasks",
+          } <= tables
+          metric_columns = {
+              column["name"] for column in database_inspector.get_columns("metrics")
+          }
+          assert "collection_task_id" in metric_columns
 
           expected_v1_routes = {
               ("POST", "/v1/contents"),

@@ -61,7 +61,11 @@ once release automation is established.
   verified asset download, durable jobs, status projection, manual metrics, and performance review.
 - Expiring, fenced idempotency leases for manual Agent metrics collection. Normalized snapshots are
   uniquely bound to their operation, so cancellation, process loss, response-finalization failure,
-  and overlapping stale owners recover with the same key without duplicate external collection.
+  and overlapping stale owners recover with the same key without duplicate persisted snapshots.
+- Durable fixed 1h/24h/7d metrics tasks created with successful publication finalization and
+  repaired by bounded database scans. Expiring fenced leases, bounded retries/concurrency, unique
+  snapshot binding, and 1h/6h/24h deadline grace prevent restart loss, duplicate persisted
+  snapshots, and very late current observations from being mislabeled as historical window evidence.
 
 ### Changed
 
@@ -100,6 +104,11 @@ once release automation is established.
 - Worker execution dependencies now have an explicit injection boundary for isolated demos and
   tests, including rate policy, timeouts, receipts, account leases, notifications, and exception
   reporting, while the production default path remains unchanged.
+- Performance review ranks metrics in the database and hydrates only the latest in-window snapshot
+  per requested job; equal timestamps use the metric ID as a deterministic tie-breaker.
+- Account profile serialization now includes the generic account-login endpoint and durable metrics
+  reads. In the supported shared-lock topology, publishing, login, health probes, and metrics
+  collection cannot concurrently mutate or consume the same profile state.
 - Phase 0 was accepted on 2026-08-11 after all six CI jobs passed on merged `main@16eccb5`.
 
 ### Security
@@ -128,7 +137,7 @@ once release automation is established.
   output and ffprobe video-stream check, then atomically replaces the destination.
 - Doctor refuses mutable SQLite recovery state and probes existing databases through an immutable
   read-only handle; PostgreSQL catalog checks run in a server-enforced read-only transaction.
-- Doctor verifies every server-rendered UI template and all eleven tables represented by the
+- Doctor verifies every server-rendered UI template and every core table represented by the
   current migration head instead of accepting a partially damaged installation or schema.
 - Explicit demo databases are built in a private sibling directory and promoted without following
   symlinks or overwriting databases and SQLite sidecars supplied by the caller.
@@ -139,12 +148,17 @@ once release automation is established.
   topology is enforced by deployment practice rather than a distributed leader lease.
 - Stale/cancelled `RUNNING` jobs are moved to an operator-reviewable failure state. A locally
   journaled structured receipt is recovered when available; otherwise the platform outcome remains
-  unknown. The project still lacks claim leases, publisher idempotency keys, and automated
+  unknown. Publish jobs still lack expiring claim leases, publisher idempotency keys, and automated
   platform-side reconciliation.
-- Follow-up metrics callbacks are not yet durable across worker restarts, and platform post identity
-  or metrics collection is absent from several adapters.
-- Login and metrics paths do not yet participate in the publish/health account-operation lease;
-  operators must avoid explicit login while the same account is publishing.
+- Durable follow-up tasks cannot create evidence when a platform adapter lacks a verified post
+  identity or real metrics collector; those capabilities remain absent from several adapters.
+- Metrics leases fence database finalization and prevent duplicate persisted snapshots, but they do
+  not provide external read exactly-once semantics: a process crash after the collector responds and
+  before the transaction commits can cause the same platform metric to be read again after recovery.
+- The 24-hour snapshot and account-health decision currently commit atomically, so a deterministic
+  evaluator failure can retry the platform read. Health thresholds also use a moving seven-day
+  median that is not yet frozen/calibrated by a long-running platform canary; a dedicated feedback
+  outbox and calibrated baseline are planned before treating automatic bans as production evidence.
 - Real platform behavior depends on unpinned external repositories and changing browser UIs. See
   `docs/platform-capabilities.md` for the evidence level of each adapter.
 - The Zhihu CLI adapter is disabled by default: 0.2.4 lacks structured write output,

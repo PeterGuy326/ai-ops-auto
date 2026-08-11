@@ -238,7 +238,7 @@ def cmd_worker(
         100,
         min=1,
         max=1000,
-        help="每轮最多扫描的 PublishJob 数。",
+        help="每轮发布任务和指标任务各自最多扫描的记录数。",
     ),
 ):
     """启动唯一的调度/恢复 worker；生产环境与 API 分进程运行。"""
@@ -248,8 +248,9 @@ def cmd_worker(
 
     if not settings.auto_publish_enabled:
         typer.echo(
-            "安全模式：AUTO_PUBLISH_ENABLED=false，worker 不会执行发布任务；"
-            "周期健康检查和报表仍会运行。"
+            "安全模式：AUTO_PUBLISH_ENABLED=false，worker 不会执行后台发布任务；"
+            "但到期指标读取与健康检查仍可能访问外部平台，报表也会运行。"
+            "如需停止全部 worker 侧平台访问，请停止 worker。"
         )
     try:
         asyncio.run(

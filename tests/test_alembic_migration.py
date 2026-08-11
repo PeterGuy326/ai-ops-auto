@@ -7,8 +7,9 @@
   4. 存量 PublishJob 升级后 plan_id=NULL，不改变历史语义
   5. 存量 Asset 升级保持可读，vault metadata 完整性约束和计划快照生效
   6. exact job 的审批时间从可变重试时间中拆出并正确回填，legacy job 保持 NULL
-  7. Agent 契约降级后移除新增 schema，同时保留旧 Asset 数据
-  8. `alembic downgrade base` 必须成功，且对称（schema 可回滚）
+  7. 持久指标任务的窗口、状态、尝试次数、租约与证据归属由 DB 失败关闭
+  8. Agent 契约与指标任务降级保留旧数据，同时移除新增 schema
+  9. `alembic downgrade base` 必须成功，且对称（schema 可回滚）
 
 为什么不走 SessionLocal.configure(bind=engine) 套路：
   alembic CLI 是子进程，本身就跑独立 engine + DATABASE_URL env，测试侧用
@@ -104,6 +105,7 @@ def test_alembic_upgrade_head_on_empty_db(tmp_db: Path) -> None:
         "publication_plans",
         "approval_requests",
         "agent_operations",
+        "metrics_collection_tasks",
         "alembic_version",
     }
     missing = expected - tables
@@ -187,6 +189,103 @@ def _unique_column_sets(conn: sqlite3.Connection, table: str) -> set[tuple[str, 
         tuple(row[2] for row in conn.execute(f"PRAGMA index_info('{name}')"))
         for name in unique_indexes
     }
+
+
+def _named_index_columns(conn: sqlite3.Connection, table: str) -> dict[str, tuple[str, ...]]:
+    """Return every reflected SQLite index with its ordered columns."""
+    index_names = [row[1] for row in conn.execute(f"PRAGMA index_list('{table}')")]
+    return {
+        name: tuple(row[2] for row in conn.execute(f"PRAGMA index_info('{name}')"))
+        for name in index_names
+    }
+
+
+def _foreign_key_signatures(
+    conn: sqlite3.Connection,
+    table: str,
+) -> set[tuple[str, tuple[str, ...], tuple[str, ...]]]:
+    """Normalize SQLite's one-row-per-column FK reflection into constraints."""
+    grouped: dict[int, tuple[str, list[tuple[int, str, str]]]] = {}
+    for row in conn.execute(f"PRAGMA foreign_key_list('{table}')"):
+        fk_id, sequence, referred_table, local_column, referred_column = row[:5]
+        target, columns = grouped.setdefault(fk_id, (referred_table, []))
+        assert target == referred_table
+        columns.append((sequence, local_column, referred_column))
+    return {
+        (
+            referred_table,
+            tuple(local for _, local, _ in sorted(columns)),
+            tuple(remote for _, _, remote in sorted(columns)),
+        )
+        for referred_table, columns in grouped.values()
+    }
+
+
+def _insert_metrics_task(
+    conn: sqlite3.Connection,
+    job_id: int,
+    **overrides,
+) -> int:
+    """Insert one complete task row, allowing tests to mutate individual invariants."""
+    values = {
+        "job_id": job_id,
+        "interval_index": 0,
+        "window_seconds": 3600,
+        "due_at": "2026-08-11 01:00:00",
+        "collection_deadline_at": "2026-08-11 02:00:00",
+        "next_attempt_at": "2026-08-11 01:00:00",
+        "status": "queued",
+        "attempts": 0,
+        "max_attempts": 5,
+        "lease_token": None,
+        "lease_expires_at": None,
+        "last_error": None,
+        "started_at": None,
+        "finished_at": None,
+        "created_at": "2026-08-11 00:00:00",
+        "updated_at": "2026-08-11 00:00:00",
+    }
+    values.update(overrides)
+    columns = tuple(values)
+    placeholders = ", ".join("?" for _ in columns)
+    task_id = conn.execute(
+        f"INSERT INTO metrics_collection_tasks ({', '.join(columns)}) VALUES ({placeholders})",
+        tuple(values[column] for column in columns),
+    ).lastrowid
+    assert task_id is not None
+    return int(task_id)
+
+
+def _insert_metric(
+    conn: sqlite3.Connection,
+    job_id: int,
+    *,
+    collection_task_id: int | None = None,
+    agent_operation_id: int | None = None,
+    source: str = "scheduled",
+) -> int:
+    metric_id = conn.execute(
+        """
+        INSERT INTO metrics
+            (job_id, agent_operation_id, collection_task_id, collected_at,
+             likes, comments, shares, views, raw, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            agent_operation_id,
+            collection_task_id,
+            "2026-08-11 01:05:00",
+            1,
+            2,
+            3,
+            4,
+            "{}",
+            source,
+        ),
+    ).lastrowid
+    assert metric_id is not None
+    return int(metric_id)
 
 
 def _insert_legacy_job(conn: sqlite3.Connection) -> tuple[int, int, int]:
@@ -373,6 +472,352 @@ def test_agent_contract_schema_and_constraints_after_migration(tmp_db: Path) -> 
             (row[3], row[2], row[4]) for row in conn.execute("PRAGMA foreign_key_list('metrics')")
         }
         assert ("agent_operation_id", "agent_operations", "id") in metric_foreign_keys
+
+
+def test_durable_metrics_task_schema_matches_runtime_contract(tmp_db: Path) -> None:
+    """The migration must ship every owner, retry, deadline, and lookup primitive."""
+    result = _run_alembic(["upgrade", "head"], tmp_db)
+    assert result.returncode == 0, f"upgrade 失败: {result.stderr}"
+
+    with sqlite3.connect(str(tmp_db)) as conn:
+        task_columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info('metrics_collection_tasks')")
+        }
+        metric_columns = {row[1]: row for row in conn.execute("PRAGMA table_info('metrics')")}
+
+        assert {
+            "id",
+            "job_id",
+            "interval_index",
+            "window_seconds",
+            "due_at",
+            "collection_deadline_at",
+            "next_attempt_at",
+            "status",
+            "attempts",
+            "max_attempts",
+            "lease_token",
+            "lease_expires_at",
+            "last_error",
+            "started_at",
+            "finished_at",
+            "created_at",
+            "updated_at",
+        } == set(task_columns)
+        assert all(
+            task_columns[column][3] == 1
+            for column in (
+                "job_id",
+                "interval_index",
+                "window_seconds",
+                "due_at",
+                "collection_deadline_at",
+                "status",
+                "attempts",
+                "max_attempts",
+                "created_at",
+                "updated_at",
+            )
+        )
+        assert str(task_columns["status"][4]).strip("'\"") == "queued"
+        assert str(task_columns["attempts"][4]).strip("'\"") == "0"
+        assert str(task_columns["max_attempts"][4]).strip("'\"") == "5"
+        assert "collection_task_id" in metric_columns
+        assert metric_columns["collection_task_id"][3] == 0
+
+        task_uniques = _unique_column_sets(conn, "metrics_collection_tasks")
+        assert {
+            ("job_id", "interval_index"),
+            ("job_id", "window_seconds"),
+            ("id", "job_id"),
+        } <= task_uniques
+        assert ("collection_task_id",) in _unique_column_sets(conn, "metrics")
+
+        assert (
+            "publish_jobs",
+            ("job_id",),
+            ("id",),
+        ) in _foreign_key_signatures(conn, "metrics_collection_tasks")
+        assert (
+            "metrics_collection_tasks",
+            ("collection_task_id", "job_id"),
+            ("id", "job_id"),
+        ) in _foreign_key_signatures(conn, "metrics")
+
+        task_indexes = _named_index_columns(conn, "metrics_collection_tasks")
+        assert task_indexes["ix_metrics_collection_tasks_due"] == (
+            "status",
+            "next_attempt_at",
+            "id",
+        )
+        assert task_indexes["ix_metrics_collection_tasks_expired_lease"] == (
+            "status",
+            "lease_expires_at",
+            "id",
+        )
+        assert task_indexes["ix_metrics_collection_tasks_deadline"] == (
+            "status",
+            "collection_deadline_at",
+            "id",
+        )
+        assert _named_index_columns(conn, "metrics")["ix_metrics_job_collected_id"] == (
+            "job_id",
+            "collected_at",
+            "id",
+        )
+
+        task_ddl = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'metrics_collection_tasks'"
+        ).fetchone()[0]
+        metrics_ddl = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'metrics'"
+        ).fetchone()[0]
+        expected_task_checks = {
+            "ck_metrics_collection_tasks_status",
+            "ck_metrics_collection_tasks_window",
+            "ck_metrics_collection_tasks_attempts",
+            "ck_metrics_collection_tasks_lifecycle",
+        }
+        assert all(name in task_ddl for name in expected_task_checks)
+        assert "ck_metrics_single_ledger_owner" in metrics_ddl
+        assert "ck_metrics_collection_task_source" in metrics_ddl
+
+
+def test_durable_metrics_migration_preserves_existing_evidence(tmp_db: Path) -> None:
+    """Upgrading d4 -> e8 is additive for every existing metric row."""
+    before = _run_alembic(["upgrade", "d4e8a1c7b5f2"], tmp_db)
+    assert before.returncode == 0, f"e8 前迁移失败: {before.stderr}"
+
+    with sqlite3.connect(str(tmp_db)) as conn:
+        _, _, job_id = _insert_legacy_job(conn)
+        legacy_metric_id = conn.execute(
+            """
+            INSERT INTO metrics
+                (job_id, agent_operation_id, collected_at, likes, comments,
+                 shares, views, raw, source)
+            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                "2026-08-11 00:05:00",
+                11,
+                12,
+                13,
+                14,
+                '{"legacy":true}',
+                "manual",
+            ),
+        ).lastrowid
+        conn.commit()
+        assert legacy_metric_id is not None
+
+    upgraded = _run_alembic(["upgrade", "head"], tmp_db)
+    assert upgraded.returncode == 0, f"e8 迁移失败: {upgraded.stderr}"
+
+    with sqlite3.connect(str(tmp_db)) as conn:
+        row = conn.execute(
+            """
+            SELECT job_id, collection_task_id, likes, comments, shares, views, raw, source
+            FROM metrics WHERE id = ?
+            """,
+            (legacy_metric_id,),
+        ).fetchone()
+        assert row == (
+            job_id,
+            None,
+            11,
+            12,
+            13,
+            14,
+            '{"legacy":true}',
+            "manual",
+        )
+        assert conn.execute("SELECT COUNT(*) FROM metrics_collection_tasks").fetchone()[0] == 0
+
+
+def test_durable_metrics_task_checks_reject_impossible_states(tmp_db: Path) -> None:
+    """Raw SQL cannot manufacture a task state the scanner could not produce."""
+    result = _run_alembic(["upgrade", "head"], tmp_db)
+    assert result.returncode == 0, f"upgrade 失败: {result.stderr}"
+
+    invalid_states = (
+        {"status": "unknown"},
+        {"interval_index": 0, "window_seconds": 86400},
+        {"interval_index": 3, "window_seconds": 3600},
+        {"collection_deadline_at": "2026-08-11 01:00:00"},
+        {"attempts": -1},
+        {"attempts": 6, "max_attempts": 5},
+        {"max_attempts": 0},
+        {"max_attempts": 21},
+        {"next_attempt_at": None},
+        {"next_attempt_at": "2026-08-11 02:00:00"},
+        {"attempts": 5, "max_attempts": 5},
+        {"lease_token": "a" * 64, "lease_expires_at": "2026-08-11 01:30:00"},
+        {
+            "status": "claimed",
+            "next_attempt_at": None,
+            "lease_token": "short",
+            "lease_expires_at": "2026-08-11 01:30:00",
+        },
+        {
+            "status": "claimed",
+            "next_attempt_at": None,
+            "lease_token": "a" * 64,
+            "lease_expires_at": "2026-08-11 01:30:00",
+            "finished_at": "2026-08-11 01:05:00",
+        },
+        {
+            "status": "succeeded",
+            "next_attempt_at": None,
+            "finished_at": "2026-08-11 01:05:00",
+        },
+        {
+            "status": "succeeded",
+            "attempts": 1,
+            "next_attempt_at": None,
+            "finished_at": None,
+        },
+        {
+            "status": "succeeded",
+            "attempts": 1,
+            "next_attempt_at": None,
+            "last_error": "stale error",
+            "finished_at": "2026-08-11 01:05:00",
+        },
+        {
+            "status": "failed",
+            "attempts": 1,
+            "next_attempt_at": None,
+            "finished_at": "2026-08-11 01:05:00",
+        },
+        {
+            "status": "failed",
+            "attempts": 1,
+            "next_attempt_at": None,
+            "last_error": "collector unavailable",
+            "finished_at": None,
+        },
+    )
+
+    with sqlite3.connect(str(tmp_db)) as conn:
+        _, _, job_id = _insert_legacy_job(conn)
+        for overrides in invalid_states:
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_metrics_task(conn, job_id, **overrides)
+            conn.rollback()
+
+        succeeded_id = _insert_metrics_task(
+            conn,
+            job_id,
+            status="succeeded",
+            attempts=1,
+            next_attempt_at=None,
+            finished_at="2026-08-11 01:05:00",
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT status, attempts FROM metrics_collection_tasks WHERE id = ?",
+            (succeeded_id,),
+        ).fetchone() == ("succeeded", 1)
+
+
+def test_metrics_evidence_owner_source_and_cross_job_constraints(tmp_db: Path) -> None:
+    """A snapshot has one ledger owner and cannot be attached to another job's task."""
+    result = _run_alembic(["upgrade", "head"], tmp_db)
+    assert result.returncode == 0, f"upgrade 失败: {result.stderr}"
+
+    with sqlite3.connect(str(tmp_db)) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        _, _, first_job_id = _insert_legacy_job(conn)
+        second_job_id = conn.execute(
+            """
+            INSERT INTO publish_jobs
+                (article_id, account_id, platform, status, publisher_kind, attempts,
+                 max_attempts, raw_response, created_at)
+            SELECT article_id, account_id, platform, status, publisher_kind, attempts,
+                   max_attempts, raw_response, created_at
+            FROM publish_jobs WHERE id = ?
+            """,
+            (first_job_id,),
+        ).lastrowid
+        assert second_job_id is not None
+
+        task_1h = _insert_metrics_task(conn, first_job_id)
+        task_24h = _insert_metrics_task(
+            conn,
+            first_job_id,
+            interval_index=1,
+            window_seconds=86400,
+            due_at="2026-08-12 00:00:00",
+            collection_deadline_at="2026-08-12 06:00:00",
+            next_attempt_at="2026-08-12 00:00:00",
+        )
+        task_7d = _insert_metrics_task(
+            conn,
+            first_job_id,
+            interval_index=2,
+            window_seconds=604800,
+            due_at="2026-08-18 00:00:00",
+            collection_deadline_at="2026-08-19 00:00:00",
+            next_attempt_at="2026-08-18 00:00:00",
+        )
+        operation_id = conn.execute(
+            """
+            INSERT INTO agent_operations
+                (principal_id, principal_type, operation, idempotency_key,
+                 request_digest, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "agent-a",
+                "agent",
+                "collect_metrics",
+                "ownership-test",
+                "a" * 64,
+                "2026-08-11 00:00:00",
+                "2026-08-11 00:00:00",
+            ),
+        ).lastrowid
+        assert operation_id is not None
+        conn.commit()
+
+        metric_id = _insert_metric(conn, first_job_id, collection_task_id=task_1h)
+        conn.commit()
+        assert metric_id > 0
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_metric(conn, first_job_id, collection_task_id=task_1h)
+        conn.rollback()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_metric(
+                conn,
+                first_job_id,
+                collection_task_id=task_24h,
+                source="manual",
+            )
+        conn.rollback()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_metric(
+                conn,
+                first_job_id,
+                collection_task_id=task_7d,
+                agent_operation_id=int(operation_id),
+            )
+        conn.rollback()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_metric(conn, int(second_job_id), collection_task_id=task_24h)
+        conn.rollback()
+
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM metrics WHERE collection_task_id IS NOT NULL"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_legacy_job_upgrade_and_contract_idempotency_constraints(tmp_db: Path) -> None:
@@ -932,6 +1377,61 @@ def test_agent_contract_state_constraints_fail_closed(tmp_db: Path) -> None:
             )
 
 
+def test_durable_metrics_revision_downgrade_is_data_preserving_and_reversible(
+    tmp_db: Path,
+) -> None:
+    """e8 -> d4 removes only the ledger binding; normalized evidence survives."""
+    upgraded = _run_alembic(["upgrade", "head"], tmp_db)
+    assert upgraded.returncode == 0, f"upgrade 失败: {upgraded.stderr}"
+
+    with sqlite3.connect(str(tmp_db)) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        _, _, job_id = _insert_legacy_job(conn)
+        task_id = _insert_metrics_task(
+            conn,
+            job_id,
+            status="succeeded",
+            attempts=1,
+            next_attempt_at=None,
+            finished_at="2026-08-11 01:05:00",
+        )
+        metric_id = _insert_metric(conn, job_id, collection_task_id=task_id)
+        conn.commit()
+
+    downgraded = _run_alembic(["downgrade", "d4e8a1c7b5f2"], tmp_db)
+    assert downgraded.returncode == 0, f"e8 downgrade 失败: {downgraded.stderr}"
+
+    with sqlite3.connect(str(tmp_db)) as conn:
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "metrics_collection_tasks" not in tables
+        metric_columns = {row[1] for row in conn.execute("PRAGMA table_info('metrics')")}
+        assert "collection_task_id" not in metric_columns
+        assert "agent_operation_id" in metric_columns
+        assert "source" in metric_columns
+        assert "ix_metrics_job_collected_id" not in _named_index_columns(conn, "metrics")
+        assert conn.execute(
+            """
+            SELECT job_id, likes, comments, shares, views, raw, source
+            FROM metrics WHERE id = ?
+            """,
+            (metric_id,),
+        ).fetchone() == (job_id, 1, 2, 3, 4, "{}", "scheduled")
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
+            "d4e8a1c7b5f2"
+        )
+
+    reupgraded = _run_alembic(["upgrade", "head"], tmp_db)
+    assert reupgraded.returncode == 0, f"e8 re-upgrade 失败: {reupgraded.stderr}"
+    with sqlite3.connect(str(tmp_db)) as conn:
+        assert conn.execute(
+            "SELECT collection_task_id FROM metrics WHERE id = ?",
+            (metric_id,),
+        ).fetchone() == (None,)
+        assert conn.execute("SELECT COUNT(*) FROM metrics_collection_tasks").fetchone()[0] == 0
+
+
 def test_alembic_downgrade_base_removes_schema(tmp_db: Path) -> None:
     """先 upgrade head 再 downgrade base，业务表必须全部清空（schema 可回滚）。
 
@@ -963,6 +1463,7 @@ def test_alembic_downgrade_base_removes_schema(tmp_db: Path) -> None:
         "publication_plans",
         "approval_requests",
         "agent_operations",
+        "metrics_collection_tasks",
     }
     leftover = business_tables & tables
     assert not leftover, (

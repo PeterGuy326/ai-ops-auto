@@ -28,7 +28,13 @@ def _assert_database_at_head(url: str) -> None:
         with engine.connect() as conn:
             revision = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         assert revision == db_mod.get_code_alembic_head()
-        assert "publish_jobs" in inspect(engine).get_table_names()
+        inspector = inspect(engine)
+        assert {"publish_jobs", "metrics", "metrics_collection_tasks"} <= set(
+            inspector.get_table_names()
+        )
+        assert "collection_task_id" in {
+            column["name"] for column in inspector.get_columns("metrics")
+        }
     finally:
         engine.dispose()
 

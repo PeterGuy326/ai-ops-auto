@@ -42,7 +42,7 @@ The dedicated worker still observes `AUTO_PUBLISH_ENABLED`; the default remains
 ## Asset vault and immutable snapshots
 
 `StageContentRequest.assets[].local_path` is a server-side import reference, not
-an arbitrary host path or an upload URL. Configure four deployment values:
+an arbitrary host path or an upload URL. Configure these deployment values:
 
 | Variable | Purpose |
 |---|---|
@@ -51,7 +51,13 @@ an arbitrary host path or an upload URL. Configure four deployment values:
 | `AGENT_ASSET_MAX_BYTES` | Per-file streaming limit; default 512 MiB |
 | `AGENT_ASSET_MAX_TOTAL_BYTES` | Aggregate asset limit for one content snapshot; default 2 GiB and must be at least the per-file limit |
 | `AGENT_METRICS_COLLECTION_TIMEOUT_SECONDS` | Manual collection timeout; default 120 seconds |
-| `AGENT_EXTERNAL_OPERATION_LEASE_SECONDS` | Durable external-operation lease; default 300 seconds and must exceed the collection timeout |
+| `AGENT_EXTERNAL_OPERATION_LEASE_SECONDS` | Durable external-operation lease; default 300 seconds and must exceed the manual collection timeout plus the 30-second finalization margin |
+| `METRICS_TASK_COLLECTION_TIMEOUT_SECONDS` | Automatic fixed-window collection timeout; default 120 seconds |
+| `METRICS_TASK_LEASE_SECONDS` | Automatic task owner lease; default 300 seconds and must exceed its collection timeout plus the 30-second finalization margin |
+| `METRICS_TASK_ACCOUNT_LOCK_TIMEOUT_SECONDS` | Short pre-claim account-lock wait for automatic metrics; default 1 second, then durably deferred without consuming an attempt |
+| `METRICS_TASK_MAX_ATTEMPTS` | Maximum real collector calls per fixed window; default 5 |
+| `METRICS_TASK_RETRY_BASE_SECONDS` | Exponential retry base; default 300 seconds |
+| `METRICS_TASK_MAX_CONCURRENCY` | Independent automatic collection concurrency; default 4 |
 
 The roots must be separate and non-overlapping. The API resolves each source
 strictly below the import root, rejects traversal, symlinks, directories,
@@ -301,7 +307,14 @@ metrics collection also binds its normalized `Metrics` row to an expiring,
 owned operation lease: cancellation makes the lease immediately reclaimable,
 a process loss becomes reclaimable after expiry, and a retry after response
 finalization failure reuses the persisted snapshot instead of calling the
-external collector again.
+external collector again. This guarantees one persisted snapshot, not one
+platform read: if the process stops after the collector responds but before the
+database transaction commits, recovery can invoke the collector again.
+
+Performance review applies its optional half-open time window in the database
+and returns only the latest snapshot per requested job. Equal collection
+timestamps are resolved by the later metric ID, so review IDs and totals are
+deterministic without loading a job's full metric history into service memory.
 
 ## Python and CLI clients
 
@@ -391,9 +404,12 @@ placed in process arguments.
   platform paths fail closed and exact jobs never use Publisher fallback. This
   narrow execution guarantee does not promote either platform to Stable.
 - `collect_metrics` is a scoped manual collection with a durable idempotency
-  lease and snapshot binding. Durable 1h/24h/7d scheduling is a separate
-  metrics-task-ledger tranche; until it lands, the historical APScheduler
-  callbacks are not restart-safe.
+  lease and snapshot binding. Automatic collection is a separate durable ledger:
+  successful publications create fixed 1h/24h/7d tasks, the worker recovers them
+  through fenced expiring leases and bounded retries, and each task uniquely binds
+  one scheduled snapshot. The 1h/24h/7d deadlines allow at most 1h/6h/24h of
+  lateness; expired windows fail instead of relabeling a current observation.
+  These reads continue for already-published jobs when `AUTO_PUBLISH_ENABLED=false`.
 - A v1 approval proves which configured principal reviewed and decided an
   exact digest, with a server-side snapshot recheck at decision time. It does
   not by itself prove platform deployment or readback. Platform maturity

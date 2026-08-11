@@ -36,7 +36,7 @@ Agent / operator
 | Agent（Codex / Claude / custom） | 选题、内容生成、计划、异常诊断、绩效复盘 | 长期任务真相、凭证存储；目标设计中也不拥有审批绕过权 |
 | API/UI | 控制面读写、审批和显式管理操作 | 调度器所有权 |
 | Worker | 调度 owner、到期任务扫描、claim、执行、重试与已实现的指标回采 | 内容审批决策 |
-| Database | Topic/Article/Asset/Account/PublishJob/Metrics 的持久化真相 | 平台页面的实时真相 |
+| Database | Topic/Article/Asset/Account/PublishJob/MetricsCollectionTask/Metrics 的持久化真相 | 平台页面的实时真相 |
 | Publisher | 单平台登录、发布、结果校验和可选 metrics 翻译 | 跨账号策略和任务排程 |
 | 人 | 不可逆发布的授权、登录与风控处置 | 每次重新编排全部技术细节 |
 
@@ -54,6 +54,7 @@ Agent contract v1 使用带最小 scope 的独立 Bearer principal，只有 `typ
 | `Asset` | 图片、视频、音频、字幕与文档资产 |
 | `Account` | 平台账号、数据库内加密的 credential blob、健康和配额；外部 profile 文件不在该加密边界内 |
 | `PublishJob` | 一个 Article 向一个 Account 发布的持久化执行记录 |
+| `MetricsCollectionTask` | 一个成功 job 的固定 1h/24h/7d 回采意图、lease、重试和截止时间 |
 | `Metrics` | 关联 PublishJob 的带来源时序快照 |
 
 v1 还持久化 `PublicationPlan`、`ApprovalRequest` 与 `AgentOperation`，分别保存不可变计划/摘要、
@@ -69,6 +70,10 @@ Article: DRAFT -> READY -> SCHEDULED -> PUBLISHING -> PUBLISHED
 Job:     PENDING -> RUNNING -> SUCCESS
                     |   \----> RETRYING -> RUNNING
                     \--------> FAILED / DEAD
+
+Metrics task: QUEUED -> CLAIMED -> SUCCEEDED
+                    |      \----> QUEUED
+                    \-----------> FAILED
 ```
 
 具体迁移以模型和 worker 代码为准；文档不应虚构代码里不存在的 `metrics_collecting`
@@ -92,15 +97,18 @@ ai-ops worker  # 唯一调度 owner
 这里的“唯一”是当前部署约束，不是分布式选主保证。代码尚未实现数据库 leader lease；如果误启
 多个 worker，PublishJob 的原子 claim 可以保护同一轮发布入口，但 cron 仍可能重复注册。
 
-`AUTO_PUBLISH_ENABLED=false` 时 worker 保持运行，但不执行自动发布扫描。账号健康和报表 cron
-可继续运行。该开关不应被解释为“所有管理端点都无副作用”。
+`AUTO_PUBLISH_ENABLED=false` 时 worker 保持运行，但不执行自动发布扫描。已授权且已成功发布内容的
+到期指标任务、账号健康和报表 cron 仍会运行。该开关不应被解释为“所有管理端点或外部读取都无副作用”。
 
 ## 调度与执行不变量
 
-- 数据库中的 `PublishJob` 是任务真相，APScheduler 只是唤醒/扫描机制。
+- 数据库中的 `PublishJob` 与 `MetricsCollectionTask` 是任务真相；APScheduler 承载 cron 和发布
+  唤醒优化，发布后指标不再注册一次性 date callback。
 - worker 启动时会重新发现已到期的持久化任务，不依赖上个进程的内存 job。
 - 任务在执行平台副作用前必须原子 claim；不符合可执行状态时立即返回。
 - 重试是持久化时间，基础退避由 `JOB_RETRY_BASE_SECONDS` 控制。
+- 指标任务使用独立的 collection timeout、lease、重试和并发配置；任务的原始 `due_at` 不随重试
+  改动，超出固定窗口截止时间后明确失败，不用迟到的当前快照冒充历史窗口数据。
 - 扫描节奏由 `SCHEDULER_POLL_SECONDS` 控制；它不是精确到秒的执行 SLA。
 - 同时执行数由 `SCHEDULER_MAX_CONCURRENCY` 限制，单次外部调用由
   `JOB_EXECUTION_TIMEOUT_SECONDS` fail-closed。
@@ -157,8 +165,15 @@ publish -> verify post identity -> collect normalized metrics -> update topic si
 但只有 Publisher 返回可校验的 post id/url，并且实现真实 `collect_metrics`，这条链路才成立。
 大部分平台目前没有这一证据，因此不应对外声称已完成跨平台数据飞轮。
 
-现有发布后 1h/24h/7d 指标 callback 仍由 APScheduler 保存在内存中，worker 重启可能丢失；
-它们还不是像 PublishJob 一样的持久化任务。
+成功发布会以 `finished_at` 为锚点，在数据库中固定建立 1h/24h/7d 三个任务。1h、24h、7d
+分别允许最多额外 1h、6h、24h 的采集宽限；到期 worker 通过条件 claim 和 expiring lease 执行，
+重启后由扫描器恢复。任务快照用唯一外键绑定，旧 lease owner 不能补写或重复落库。
+
+新的 24h task 用绑定 `window_seconds=86400` 的快照做当次健康判断，手动采集和更晚的 7d 数据
+不会替代本次窗口证据；没有 task-bound 历史快照的 legacy job 仍保留旧的 latest-metric fallback。
+账本只保证控制面的排程、恢复和数据库快照去重，不保证外部读取 exactly once：collector 返回后、
+事务提交前的崩溃可能使恢复任务再次读取平台数据。Publisher 仍必须提供可验证 post identity 和真实
+`collect_metrics`，因此这仍不是跨平台数据飞轮完成声明。
 
 ## 部署拓扑
 

@@ -222,9 +222,17 @@ from ai_ops.core.db import get_code_alembic_head, get_db_alembic_head
 
 package_path = Path(ai_ops.__file__).resolve()
 assert package_path.is_relative_to(Path(sys.prefix).resolve()), package_path
-assert get_code_alembic_head() == get_db_alembic_head() == "d4e8a1c7b5f2"
-tables = set(inspect(create_engine(os.environ["DATABASE_URL"])).get_table_names())
-assert {"publication_plans", "approval_requests", "agent_operations"} <= tables
+assert get_code_alembic_head() == get_db_alembic_head() == "e8b4c6d2a901"
+database_inspector = inspect(create_engine(os.environ["DATABASE_URL"]))
+tables = set(database_inspector.get_table_names())
+assert {
+    "publication_plans",
+    "approval_requests",
+    "agent_operations",
+    "metrics_collection_tasks",
+} <= tables
+metric_columns = {column["name"] for column in database_inspector.get_columns("metrics")}
+assert "collection_task_id" in metric_columns
 expected_v1_routes = {
     ("POST", "/v1/contents"),
     ("POST", "/v1/publication-plans"),

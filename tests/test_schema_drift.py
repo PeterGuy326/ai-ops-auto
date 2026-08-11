@@ -305,6 +305,8 @@ def test_try_auto_upgrade_promotes_old_db_to_head(production_session_on_tmp, tmp
     metrics_cols_after = [c["name"] for c in _inspect(engine).get_columns("metrics")]
     assert "source" in metrics_cols_after, "Round 6 metrics.source 字段必须被自动升级加上"
     assert "agent_operation_id" in metrics_cols_after
+    assert "collection_task_id" in metrics_cols_after
+    assert "metrics_collection_tasks" in _inspect(engine).get_table_names()
 
 
 def test_try_auto_upgrade_dry_run_does_not_change_db(tmp_db_url):
@@ -337,8 +339,27 @@ def test_safe_init_runs_real_migrations_on_empty_database(tmp_db_url, tmp_db_pat
     finally:
         engine.dispose()
     assert set(Base.metadata.tables).issubset(tables)
+    assert "metrics_collection_tasks" in tables
     assert "alembic_version" in tables
     assert tmp_db_path.exists()
+
+
+def test_alembic_head_has_no_drift_from_create_all_metadata(tmp_db_url):
+    """A migrated database and Base.metadata.create_all describe one exact schema."""
+    from alembic.autogenerate import compare_metadata
+    from alembic.migration import MigrationContext
+
+    _run_alembic_command("upgrade", "head")
+    engine = create_engine(tmp_db_url, future=True)
+    try:
+        with engine.connect() as connection:
+            context = MigrationContext.configure(
+                connection,
+                opts={"compare_type": True, "compare_server_default": True},
+            )
+            assert compare_metadata(context, Base.metadata) == []
+    finally:
+        engine.dispose()
 
 
 def test_safe_init_adopts_only_exact_current_create_all_schema(
@@ -347,6 +368,14 @@ def test_safe_init_adopts_only_exact_current_create_all_schema(
     """An exact legacy create_all DB is stamped at head with its data preserved."""
     SessionLocal, engine = production_session_on_tmp
     Base.metadata.create_all(engine)
+    inspector = inspect(engine)
+    assert "metrics_collection_tasks" in inspector.get_table_names()
+    assert "collection_task_id" in {column["name"] for column in inspector.get_columns("metrics")}
+    assert {
+        "ix_metrics_collection_tasks_due",
+        "ix_metrics_collection_tasks_expired_lease",
+        "ix_metrics_collection_tasks_deadline",
+    } <= {index["name"] for index in inspector.get_indexes("metrics_collection_tasks")}
     with SessionLocal() as session:
         session.add(Topic(name="legacy-row"))
         session.commit()

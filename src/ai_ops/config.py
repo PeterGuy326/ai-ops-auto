@@ -36,6 +36,10 @@ AGENT_V1_SCOPES = frozenset(
 APPROVAL_DECIDE_SCOPE = SCOPE_APPROVAL_DECIDE
 HUMAN_APPROVAL_SCOPES = frozenset({SCOPE_APPROVAL_READ, SCOPE_APPROVAL_DECIDE})
 
+# Collection leases also cover validation, database fencing, and commit after
+# the bounded external call returns.
+EXTERNAL_OPERATION_FINALIZE_MARGIN_SECONDS = 30
+
 
 class AgentPrincipalConfig(BaseModel):
     """One pre-provisioned bearer principal.
@@ -169,6 +173,16 @@ class Settings(BaseSettings):
     scheduler_poll_seconds: int = Field(default=15, ge=1)
     scheduler_max_concurrency: int = Field(default=4, ge=1, le=100)
     job_retry_base_seconds: int = Field(default=60, ge=1)
+    # Post-publication 1h/24h/7d reads use their own durable task ledger. The
+    # owner lease must outlive the bounded collector call.
+    metrics_task_collection_timeout_seconds: int = Field(default=120, ge=1, le=1800)
+    metrics_task_lease_seconds: int = Field(default=300, ge=2, le=7200)
+    metrics_task_max_attempts: int = Field(default=5, ge=1, le=20)
+    metrics_task_retry_base_seconds: int = Field(default=300, ge=1, le=86400)
+    metrics_task_max_concurrency: int = Field(default=4, ge=1, le=100)
+    # Metrics never wait behind a long publish/login operation while occupying
+    # a bounded scanner slot; a busy row is durably deferred without an attempt.
+    metrics_task_account_lock_timeout_seconds: int = Field(default=1, ge=0, le=60)
     # Publisher hard timeout is lower than stale RUNNING reconciliation so an
     # active execution cannot be mistaken for an abandoned one.
     job_execution_timeout_seconds: int = Field(default=1800, ge=1)
@@ -193,6 +207,16 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "YOUTUBE_UPLOADER_TIMEOUT_SECONDS must be lower than JOB_EXECUTION_TIMEOUT_SECONDS"
+            )
+        if (
+            self.metrics_task_lease_seconds
+            <= self.metrics_task_collection_timeout_seconds
+            + EXTERNAL_OPERATION_FINALIZE_MARGIN_SECONDS
+        ):
+            raise ValueError(
+                "METRICS_TASK_LEASE_SECONDS must be greater than "
+                "METRICS_TASK_COLLECTION_TIMEOUT_SECONDS plus the 30-second "
+                "finalization margin"
             )
         return self
 
@@ -371,10 +395,12 @@ class Settings(BaseSettings):
         if (
             self.agent_external_operation_lease_seconds
             <= self.agent_metrics_collection_timeout_seconds
+            + EXTERNAL_OPERATION_FINALIZE_MARGIN_SECONDS
         ):
             raise ValueError(
                 "AGENT_EXTERNAL_OPERATION_LEASE_SECONDS must be greater than "
-                "AGENT_METRICS_COLLECTION_TIMEOUT_SECONDS"
+                "AGENT_METRICS_COLLECTION_TIMEOUT_SECONDS plus the 30-second "
+                "finalization margin"
             )
         return self
 

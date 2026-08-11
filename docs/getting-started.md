@@ -88,8 +88,9 @@ AUTO_PUBLISH_ENABLED=false
 GITHUB_PAGES_DRY_RUN=true
 ```
 
-`AUTO_PUBLISH_ENABLED=false` 只会禁止后台扫描器自动真发布。显式的运行端点仍是有副作用的管理操作；
-离线演示中不要调用它们。
+`AUTO_PUBLISH_ENABLED=false` 只会禁止后台扫描器自动真发布。显式的运行端点仍是有副作用的管理操作，
+已有成功发布内容的到期指标任务和账号健康检查仍可能访问外部平台；要停止全部 worker 侧平台访问，
+必须停止 worker。离线演示中不要调用这些入口。
 
 ## 4. 初始化与启动
 
@@ -109,8 +110,8 @@ source .venv/bin/activate
 ai-ops worker
 ```
 
-API 与 worker 必须分进程。在 `AUTO_PUBLISH_ENABLED=false` 时，worker 保持健康/报表 cron，
-但不会自动执行发布任务。
+API 与 worker 必须分进程。在 `AUTO_PUBLISH_ENABLED=false` 时，worker 不会自动执行发布任务，
+但仍运行到期指标读取、健康检查和报表 cron；前两者可能访问外部平台。
 
 在第三个终端检查：
 

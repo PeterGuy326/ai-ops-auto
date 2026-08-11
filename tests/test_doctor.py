@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 from cryptography.fernet import Fernet
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect as sqlalchemy_inspect, text
 
 from ai_ops.core.models import Base
 from ai_ops.doctor import (
@@ -230,6 +230,7 @@ def test_postgresql_probe_sets_transaction_read_only_before_catalog_queries(monk
                 "approval_requests",
                 "agent_operations",
                 "publish_jobs",
+                "metrics_collection_tasks",
                 "metrics",
                 "resume_profiles",
                 "job_postings",
@@ -272,6 +273,15 @@ def test_postgresql_probe_sets_transaction_read_only_before_catalog_queries(monk
             from ai_ops.doctor import _AGENT_CONTRACT_REQUIRED_CHECKS
 
             return [{"name": name} for name in _AGENT_CONTRACT_REQUIRED_CHECKS]
+
+        def get_indexes(self, table_name):
+            from ai_ops.doctor import _AGENT_CONTRACT_REQUIRED_INDEXES
+
+            return [
+                {"name": name, "column_names": columns}
+                for source, name, columns in _AGENT_CONTRACT_REQUIRED_INDEXES
+                if source == table_name
+            ]
 
     monkeypatch.setattr("ai_ops.doctor.create_engine", lambda *_args, **_kwargs: FakeEngine())
     monkeypatch.setattr("ai_ops.doctor.inspect", lambda _connection: FakeInspector())
@@ -341,6 +351,103 @@ def test_schema_at_head_fails_when_agent_contract_columns_are_missing(tmp_path):
 
     assert schema.outcome == CheckOutcome.FAIL
     assert "response_json" in schema.details["missing_columns"]["agent_operations"]
+
+
+@pytest.mark.parametrize(
+    ("missing_shape", "detail_key"),
+    [
+        ("column", "missing_columns"),
+        ("foreign_key", "missing_foreign_keys"),
+        ("unique", "missing_unique_constraints"),
+        ("check", "missing_check_constraints"),
+        ("index", "missing_indexes"),
+    ],
+)
+def test_schema_at_head_fails_when_metrics_ledger_shape_is_missing(
+    tmp_path,
+    monkeypatch,
+    missing_shape,
+    detail_key,
+):
+    config = _config(tmp_path)
+    _create_at_head_database(config)
+
+    class FilteringInspector:
+        def __init__(self, connection):
+            self.delegate = sqlalchemy_inspect(connection)
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+        def get_columns(self, table_name):
+            columns = self.delegate.get_columns(table_name)
+            if missing_shape == "column" and table_name == "metrics_collection_tasks":
+                return [item for item in columns if item["name"] != "collection_deadline_at"]
+            return columns
+
+        def get_foreign_keys(self, table_name):
+            foreign_keys = self.delegate.get_foreign_keys(table_name)
+            if missing_shape == "foreign_key" and table_name == "metrics":
+                return [
+                    item
+                    for item in foreign_keys
+                    if item.get("constrained_columns") != ["collection_task_id", "job_id"]
+                ]
+            return foreign_keys
+
+        def get_unique_constraints(self, table_name):
+            uniques = self.delegate.get_unique_constraints(table_name)
+            if missing_shape == "unique" and table_name == "metrics_collection_tasks":
+                return [
+                    item
+                    for item in uniques
+                    if item.get("column_names") != ["job_id", "interval_index"]
+                ]
+            return uniques
+
+        def get_check_constraints(self, table_name):
+            checks = self.delegate.get_check_constraints(table_name)
+            if missing_shape == "check" and table_name == "metrics_collection_tasks":
+                return [
+                    item
+                    for item in checks
+                    if item.get("name") != "ck_metrics_collection_tasks_lifecycle"
+                ]
+            return checks
+
+        def get_indexes(self, table_name):
+            indexes = self.delegate.get_indexes(table_name)
+            if missing_shape == "index" and table_name == "metrics_collection_tasks":
+                return [
+                    item
+                    for item in indexes
+                    if item.get("name") != "ix_metrics_collection_tasks_due"
+                ]
+            return indexes
+
+    monkeypatch.setattr("ai_ops.doctor.inspect", FilteringInspector)
+
+    checks = _database_checks(config, (_migration_heads(_source_resource_root())[0],))
+    schema = {check.check_id: check for check in checks}["database.schema"]
+
+    assert checks[0].outcome == CheckOutcome.PASS
+    assert schema.outcome == CheckOutcome.FAIL
+    assert schema.details[detail_key]
+
+    if missing_shape == "column":
+        assert schema.details[detail_key] == {
+            "metrics_collection_tasks": ["collection_deadline_at"]
+        }
+    elif missing_shape == "check":
+        assert schema.details[detail_key] == ["ck_metrics_collection_tasks_lifecycle"]
+    elif missing_shape == "index":
+        assert schema.details[detail_key] == [
+            [
+                "metrics_collection_tasks",
+                "ix_metrics_collection_tasks_due",
+                ("status", "next_attempt_at", "id"),
+            ]
+        ]
 
 
 def test_missing_packaged_resources_is_a_core_failure(tmp_path):

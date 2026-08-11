@@ -23,8 +23,9 @@ ai-ops serve
 ai-ops worker
 ```
 
-API lifespan 不启动 APScheduler。`ai-ops worker` 是唯一调度 owner，负责到期任务、健康检查和报表 cron。
-`AUTO_PUBLISH_ENABLED=false` 时 worker 仍应运行：它不执行自动发布，但健康/报表任务仍可运行。
+API lifespan 不启动 APScheduler。`ai-ops worker` 是唯一调度 owner，负责到期发布/指标任务、健康检查
+和报表 cron。`AUTO_PUBLISH_ENABLED=false` 时 worker 仍应运行：它不执行自动发布，但已成功发布
+内容的持久指标读取、健康检查和报表任务仍会运行。
 
 “唯一 worker”目前由部署者保证，项目尚无 leader lease。不要同时启动两个 worker；原子 job
 claim 不能阻止健康检查、报表等 cron 被重复注册。
@@ -55,12 +56,18 @@ Kubernetes 多副本或把本项目描述为分布式系统。当前调度后端
 | `AGENT_ASSET_MAX_BYTES` | 单个素材流式入库上限；默认 512 MiB，按平台与容量策略下调 |
 | `AGENT_ASSET_MAX_TOTAL_BYTES` | 单份 v1 内容快照的素材总量上限；默认 2 GiB，不得小于单文件上限 |
 | `AGENT_METRICS_COLLECTION_TIMEOUT_SECONDS` | v1 手动指标回采超时；默认 120 秒 |
-| `AGENT_EXTERNAL_OPERATION_LEASE_SECONDS` | 外部读取幂等 lease；默认 300 秒，必须大于指标回采超时 |
+| `AGENT_EXTERNAL_OPERATION_LEASE_SECONDS` | 外部读取幂等 lease；默认 300 秒，必须大于手动指标回采超时加 30 秒事务收尾余量 |
 | `AUTO_PUBLISH_ENABLED` | 默认 `false`；只控制后台扫描，真账号 canary 完成后才显式打开 |
 | `SCHEDULER_BACKEND` | 只能是 `apscheduler` |
 | `SCHEDULER_TIMEZONE` | 健康检查/报表 cron 的业务时区，默认 `Asia/Shanghai` |
 | `SCHEDULER_POLL_SECONDS` | 持久任务扫描周期，默认 15 秒 |
 | `SCHEDULER_MAX_CONCURRENCY` | 同时执行的发布上限，默认 4；按机器/浏览器容量下调 |
+| `METRICS_TASK_COLLECTION_TIMEOUT_SECONDS` | 单次自动指标读取超时，默认 120 秒 |
+| `METRICS_TASK_LEASE_SECONDS` | 自动指标任务 owner lease，默认 300 秒，必须大于自动指标读取超时加 30 秒事务收尾余量 |
+| `METRICS_TASK_ACCOUNT_LOCK_TIMEOUT_SECONDS` | 自动指标任务等待账号锁的短超时，默认 1 秒；忙账号会无损延后，避免占满批次 |
+| `METRICS_TASK_MAX_ATTEMPTS` | 每个固定窗口最多调用 collector 的次数，默认 5，范围 1–20 |
+| `METRICS_TASK_RETRY_BASE_SECONDS` | 自动指标读取指数退避基数，默认 300 秒；重试不会越过窗口截止时间 |
+| `METRICS_TASK_MAX_CONCURRENCY` | 同时执行的自动指标读取上限，默认 4；与发布并发独立 |
 | `JOB_RETRY_BASE_SECONDS` | 重试基础退避，默认 60 秒 |
 | `JOB_EXECUTION_TIMEOUT_SECONDS` | 单次 Publisher hard timeout，默认 1800 秒 |
 | `JOB_RUNNING_TIMEOUT_SECONDS` | 失联 `RUNNING` 的 fail-closed 阈值，默认 7200 秒，必须大于执行超时 |
@@ -203,6 +210,8 @@ curl -fsS -H "X-API-Key: <redacted>" http://127.0.0.1:8000/topics
 - API 和 worker 都只记录脱敏的数据库信息，不出现完整 `DATABASE_URL`。
 - worker 日志明确输出 `AUTO_PUBLISH_ENABLED` 状态。
 - `false` 时已到期 PublishJob 没有被自动执行。
+- `false` 时已成功发布内容的到期 MetricsCollectionTask 仍会执行外部只读采集；如需完全停止
+  平台访问，应停止 worker，而不只是关闭自动发布。
 - `false` 时 `/jobs/{id}/run` 等显式管理端点仍可产生副作用；验收时同时检查管理端访问边界。
 - 通知目标和外部端点只来自当前部署配置，不是代码默认值。
 - 开启自动发布前检查待执行 backlog；关闭期间积压的到期任务在开关打开后可能很快被扫描到。
@@ -229,6 +238,10 @@ curl -fsS -H "X-API-Key: <redacted>" http://127.0.0.1:8000/topics
 5. 启动 API 并验证读写，再启动 worker。
 6. 保持自动发布关闭，直到新版本 canary 完成。
 
+首次升级到持久指标账本后，worker 会有界补齐带 `platform_post_id` 的历史成功 job。仍在固定
+宽限期内的窗口可以执行；已经过期的窗口直接记录为失败，不会用升级时的当前数据冒充旧的
+1h/24h/7d 快照。启动前应先评估该只读 backlog，并确认 collector 凭证仍有效。
+
 ## 回滚
 
 不要在没有审查 migration 的情况下盲目执行 `alembic downgrade -1`；downgrade 可能丢字段/数据。
@@ -241,7 +254,10 @@ curl -fsS -H "X-API-Key: <redacted>" http://127.0.0.1:8000/topics
 - 没有 worker leader lease；单 worker 是部署约束，不是代码层选主。
 - 硬退出时已 claim 的 `RUNNING` 任务会在失联阈值后 fail-closed 到失败状态，不会自动重发。
   先核对平台端是否已经成功，再人工处置，避免重复发布。
-- 发布后的指标 callback 目前不是持久化任务，worker 重启可能丢失 1h/24h/7d 回采计划。
+- 指标任务本身可重启恢复，但没有 post identity、真实 collector 或有效凭证时只会得到明确失败，
+  不能视为平台数据已经闭环。
+- 指标 lease 防止旧 owner 提交和重复持久化快照，但不保证平台读取 exactly once；collector 返回后、
+  数据库事务提交前的进程崩溃可能使恢复任务再次读取平台数据。
 - worker 有统一执行超时，但部分 subprocess adapter 尚未保证取消时终止其子进程；生产环境仍需
   进程级监控和告警保护。
 - 大多数平台 Publisher 不是 Stable，平台 UI 改版会使 selector 失效。
