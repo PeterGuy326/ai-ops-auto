@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/dialog"
 import { CategoryBadge } from "@/components/topics/category-badge"
 import { CreateAccountForm } from "@/components/accounts/create-account-form"
+import { QueryError } from "@/components/query-error"
 
 const HEALTH_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
   healthy: "default",
@@ -35,7 +36,7 @@ const HEALTH_VARIANT: Record<string, "default" | "secondary" | "outline" | "dest
 
 export default function Accounts() {
   const { topicId } = useTopicFilter()
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["accounts", { topic_id: topicId ?? null }],
     queryFn: () => api.accounts(topicId),
   })
@@ -83,7 +84,9 @@ export default function Accounts() {
           <CardTitle>账号列表（{data?.length ?? 0}）</CardTitle>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
+          {error ? (
+            <QueryError error={error} />
+          ) : isLoading ? (
             <p className="text-sm text-muted-foreground">加载中...</p>
           ) : data && data.length > 0 ? (
             <Table>

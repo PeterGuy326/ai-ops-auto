@@ -1,0 +1,67 @@
+name: Platform regression
+description: Report that a Publisher adapter no longer logs in, publishes, verifies, or collects metrics.
+title: "platform: "
+labels: [platform-regression]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never upload cookies, QR codes, account screenshots, private post URLs, or browser traces containing credentials.
+        A Publisher existing in code is not a Stable support promise; check the capability matrix first.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Xiaohongshu
+        - Toutiao
+        - Zhihu
+        - Douyin
+        - Bilibili
+        - Kuaishou
+        - WeChat Channels
+        - WeChat Official Account
+        - Baijiahao
+        - Sohuhao
+        - TikTok
+        - YouTube
+        - GitHub Pages / static site
+    validations:
+      required: true
+  - type: input
+    id: adapter
+    attributes:
+      label: Adapter and upstream version
+      placeholder: Publisher class plus exact upstream commit/tag if applicable
+    validations:
+      required: true
+  - type: input
+    id: last_success
+    attributes:
+      label: Last known successful date
+      placeholder: YYYY-MM-DD or never verified
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Sanitized environment
+      placeholder: OS, Python, browser engine/version, content type, account type
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Reproduction and evidence
+      description: State which stage failed and what server-side success/failure evidence was observed.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I used a test account or clearly stated why that was impossible.
+          required: true
+        - label: I removed all credentials, account identifiers, personal content, QR codes, and private URLs.
+          required: true

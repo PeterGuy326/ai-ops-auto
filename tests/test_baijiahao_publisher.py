@@ -56,11 +56,16 @@ def test_platform_enum_added():
     assert Platform.BAIJIAHAO.value == "baijiahao"
 
 
-def test_publisher_registered():
-    """default_registry.resolve(BAIJIAHAO) 必须返回 BaijiahaoPublisher 实例（DONE-2）。"""
-    from ai_ops.publishers.registry import default_registry
-    pubs = default_registry.resolve(Platform.BAIJIAHAO)
-    assert pubs, "BAIJIAHAO 平台未注册任何 publisher"
+def test_publisher_is_default_off_but_can_be_explicitly_enabled(monkeypatch):
+    """未经 canary 的 selector Stub 不得默认暴露真实写路径。"""
+    from ai_ops.config import settings
+    from ai_ops.publishers.registry import build_default_registry
+
+    monkeypatch.setattr(settings, "baijiahao_publisher_enabled", False)
+    assert build_default_registry().resolve(Platform.BAIJIAHAO) == []
+
+    monkeypatch.setattr(settings, "baijiahao_publisher_enabled", True)
+    pubs = build_default_registry().resolve(Platform.BAIJIAHAO)
     assert any(isinstance(p, BaijiahaoPublisher) for p in pubs)
 
 
@@ -203,6 +208,8 @@ def test_do_publish_success_returns_url():
     result: PublishResult = asyncio.run(pub._do_publish(page, _content()))
 
     assert result.success is True
+    assert result.effect_applied is True
+    assert result.retryable is False
     assert result.platform_url == real_url
     assert result.platform_post_id == "1730009999988887777"
     assert result.raw_response["real_url"] == real_url
@@ -222,10 +229,75 @@ def test_do_publish_returns_failure_when_url_is_draft():
     result = asyncio.run(pub._do_publish(page, _content()))
 
     assert result.success is False, "草稿 URL 不应被判 success——防虚假闭环"
+    assert result.effect_applied is True
+    assert result.outcome_uncertain is False
+    assert result.retryable is False
     assert "草稿" in (result.error or "")
     assert result.platform_url and "/builder/rc/edit" in result.platform_url
     assert result.raw_response["is_published"] is False
     assert result.raw_response["url_resolved_from_backend"] is False
+    assert result.raw_response["write_started"] is True
+
+
+def test_do_publish_click_exception_is_unknown_non_retryable():
+    """最终点击抛错时请求可能已送达，不能允许 worker 自动重发。"""
+    pub = BaijiahaoPublisher()
+    page = _build_publish_page(metadata_dict=None)
+    page.wait_for_selector.return_value.click = AsyncMock(
+        side_effect=RuntimeError("connection closed after click")
+    )
+
+    result = asyncio.run(pub._do_publish(page, _content()))
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert result.raw_response["write_started"] is True
+    assert "RuntimeError" in (result.error or "")
+
+
+def test_do_publish_unknown_url_has_no_confirmed_effect():
+    """没有公开 ID 或草稿 ID 时只能标记结果未知，不能声称副作用已发生。"""
+    pub = BaijiahaoPublisher()
+    page = _build_publish_page(
+        metadata_dict=None,
+        fallback_page_url="https://baijiahao.baidu.com/builder/rc/edit?type=news",
+    )
+
+    result = asyncio.run(pub._do_publish(page, _content()))
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+
+
+def test_publish_preserves_confirmed_receipt_when_browser_close_fails(monkeypatch):
+    """远端 ID 已确认后，浏览器 teardown 失败只能作为附加观测。"""
+    pub = BaijiahaoPublisher()
+    post_id = "1730009999988887777"
+    page = _build_publish_page(
+        metadata_dict={"url": f"https://baijiahao.baidu.com/s?id={post_id}"}
+    )
+    context = MagicMock()
+    context.add_cookies = AsyncMock()
+    context.new_page = AsyncMock(return_value=page)
+    browser = MagicMock()
+    browser.new_context = AsyncMock(return_value=context)
+    browser.close = AsyncMock(side_effect=RuntimeError("close failed"))
+    playwright = MagicMock()
+    playwright.chromium.launch = AsyncMock(return_value=browser)
+    _patch_async_playwright(monkeypatch, playwright)
+
+    result = asyncio.run(
+        pub.publish(1, {"cookies": [{"name": "session", "value": "redacted"}]}, _content())
+    )
+
+    assert result.success is True
+    assert result.effect_applied is True
+    assert result.platform_post_id == post_id
+    assert result.raw_response["teardown_error"] == "RuntimeError"
 
 
 def test_do_publish_video_type_blocked_at_publish_entry():

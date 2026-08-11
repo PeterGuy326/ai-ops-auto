@@ -159,6 +159,8 @@ def _patch_collect_one_externals(monkeypatch, *, collected_views: int = 200):
         }
 
     fake_pub = MagicMock()
+    fake_pub.kind = "test"
+    fake_pub.supports_metrics = True
     fake_pub.collect_metrics = fake_collect
     monkeypatch.setattr(metrics_mod.default_registry, "resolve", lambda platform: [fake_pub])
 

@@ -68,7 +68,7 @@ fi
 # ---------------- 6. 数据库 ----------------
 echo
 echo "▎[6/7] 初始化数据库"
-PYTHONPATH=src python3 scripts/init_db.py && ok "DB 表已创建"
+PYTHONPATH=src python3 scripts/init_db.py && ok "DB 已安全迁移到 Alembic head"
 
 # ---------------- 7. 自检 ----------------
 echo

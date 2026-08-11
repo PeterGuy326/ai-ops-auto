@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · ai-ops-auto</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh; margin: 0; display: grid; place-items: center;
+      background: #0f1419; color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    main { width: min(400px, calc(100% - 32px)); background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 28px; }
+    h1 { margin: 0 0 8px; color: #58a6ff; font-size: 22px; }
+    p { color: #8b949e; font-size: 13px; line-height: 1.6; }
+    label { display: block; margin: 22px 0 8px; font-size: 13px; }
+    input { width: 100%; padding: 10px 12px; color: #e6edf3; background: #0d1117; border: 1px solid #30363d; border-radius: 5px; }
+    button { width: 100%; margin-top: 16px; padding: 10px; border: 0; border-radius: 5px; background: #238636; color: white; cursor: pointer; }
+    .error { padding: 9px 11px; border: 1px solid #f8514966; border-radius: 5px; background: #f8514922; color: #ff7b72; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ai-ops-auto</h1>
+    <p>输入部署时配置的 API key 进入运营控制台。凭证只用于本次验证，不会保存在页面或会话 cookie 中。</p>
+    {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+    <form method="post" action="/ui/login" autocomplete="off">
+      <label for="api-key">API key</label>
+      <input id="api-key" name="api_key" type="password" required autofocus autocomplete="current-password">
+      <button type="submit">登录</button>
+    </form>
+  </main>
+</body>
+</html>

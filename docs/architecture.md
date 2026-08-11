@@ -1,199 +1,176 @@
 # 架构设计
 
-## 五端闭环水线（端到端视图）
+## 定位
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       ai-ops-auto · 五端闭环发布水线                        │
-└─────────────────────────────────────────────────────────────────────────────┘
+`ai-ops-auto` 是 Agent-native Creator Ops **控制面**，不是内容大模型、通用 Agent 或平台上传引擎。
 
-     ① 内容池端              ② 中控生成端           ③ 数据中枢端
-   ┌──────────────┐       ┌──────────────────┐    ┌──────────────────┐
-   │ Topic 主题库  │──────▶│ ContentGenerator │───▶│ Article 状态机   │
-   │  · 关键词    │       │  · LLM Driver    │    │ draft→ready→     │
-   │  · 人设画像  │       │  · 多平台调性    │    │ scheduled→...    │
-   │  · 热度分    │◀──────│ VideoEngine(MPT) │───▶│ Asset 物料库     │
-   │              │ 反馈   │  · 主题→视频    │    │  · image/video   │
-   └──────────────┘       └──────────────────┘    └──────────────────┘
-                                                          │
-                                                          ▼
-     ⑤ 运行管理端                                  ④ 触发引擎端
-   ┌──────────────────┐                          ┌────────────────────┐
-   │ PublishJob 队列  │◀─────── Scheduler ──────▶│ PublisherRegistry  │
-   │  · 调度/重试    │           (APScheduler)   │  按优先级 fallback  │
-   │  · attempts<=N  │                          │ ┌───────────────┐  │
-   │ ┌────────────┐  │                          │ │ SAU (主力)    │  │
-   │ │ Metrics 采集│ │ ◀──── 数据回流 ───────────│ │ XHS Skills    │  │
-   │ │  ·赞 评 转 │  │                          │ │ Zhihu(自建)   │  │
-   │ │  ·健康检查 │  │                          │ │ Toutiao(自建) │  │
-   │ └────────────┘  │                          │ └───────────────┘  │
-   │ Account 多账号  │ ◀─── 风控降权 ────────────│   Fernet 凭证      │
-   └──────────────────┘                          └────────────────────┘
-                                                          │
-                                                          ▼
-                                            ┌──────────────────────────┐
-                                            │   外部工具引擎层（不写） │
-                                            │  · social-auto-upload    │
-                                            │  · MoneyPrinterTurbo     │
-                                            │  · XiaohongshuSkills     │
-                                            └──────────────────────────┘
-                                                          │
-                                                          ▼
-                                            ┌──────────────────────────┐
-                                            │  小红书·抖音·快手·B站   │
-                                            │  视频号·头条·知乎·...    │
-                                            └──────────────────────────┘
+```text
+Agent / operator
+      |
+      | CLI / HTTP API / future MCP
+      v
++---------------------- control plane ----------------------+
+| content state | approval | accounts | policy | job ledger |
++---------------------------+--------------------------------+
+                            |
+                            v
+                    single worker process
+              scheduler | claim | retry | metrics
+                            |
+                            v
+                    Publisher Registry
+                            |
+              +-------------+--------------+
+              |                            |
+      built-in browser adapters     external tools/APIs
+              |                            |
+              +-------------+--------------+
+                            v
+                     content platforms
 ```
 
-**闭环点**：⑤运行管理端的 Metrics 采集结果回流到 ①内容池端 的 `heat_score`，
-驱动 ②中控生成端 下一轮选题——这是真正的"运营自动化飞轮"，不只是单向分发。
+## 角色分工
 
-## 顶层逻辑
+| 层 | 拥有的决策/状态 | 不拥有 |
+|---|---|---|
+| Agent（Codex / Claude / custom） | 选题、内容生成、计划、异常诊断、绩效复盘 | 长期任务真相、凭证存储；目标设计中也不拥有审批绕过权 |
+| API/UI | 控制面读写、审批和显式管理操作 | 调度器所有权 |
+| Worker | 调度 owner、到期任务扫描、claim、执行、重试与已实现的指标回采 | 内容审批决策 |
+| Database | Topic/Article/Asset/Account/PublishJob/Metrics 的持久化真相 | 平台页面的实时真相 |
+| Publisher | 单平台登录、发布、结果校验和可选 metrics 翻译 | 跨账号策略和任务排程 |
+| 人 | 不可逆发布的授权、登录与风控处置 | 每次重新编排全部技术细节 |
 
-本项目定位为 **编排层（Orchestration Layer）**，不重复造发布器和视频剪辑的轮子。
+当前 Alpha 还没有角色身份模型：审批、分发和显式执行端点使用同一个全权限管理 `API_KEY`。
+因此控制面记录的是审核状态迁移，不能证明调用者一定是人。上表的 human gate 是目标边界；现阶段
+必须由反向代理、密钥托管或外部工作流把 Agent 与人工审批权限隔离。
 
-三层分工：
+## 核心数据
 
-| 层级 | 角色 | 我们的关系 |
-|------|------|-----------|
-| **编排层** | 内容/账号/调度/审核/数据回流 | ✅ 我们写 |
-| **引擎层** | 各平台发布、视频剪辑、AI 生成 | 🔌 集成外部开源 |
-| **基础层** | DB、队列、文件系统、浏览器 | ⬜ 标准基础设施 |
+| 实体 | 用途 |
+|---|---|
+| `Topic` | 选题、关键词、人设、目标平台和热度 |
+| `Article` | 平台无关的内容与审核/发布状态 |
+| `Asset` | 图片、视频、音频、字幕与文档资产 |
+| `Account` | 平台账号、数据库内加密的 credential blob、健康和配额；外部 profile 文件不在该加密边界内 |
+| `PublishJob` | 一个 Article 向一个 Account 发布的持久化执行记录 |
+| `Metrics` | 关联 PublishJob 的带来源时序快照 |
 
-## 核心抽象
+Article 与 Job 是两层状态：一篇 Article 可以扇出多个 PublishJob，不应用某一个平台的结果
+覆盖其他账号的真相。
 
-### 1. PublisherBase（发布器抽象）
+```text
+Article: DRAFT -> READY -> SCHEDULED -> PUBLISHING -> PUBLISHED
+                                             \----> FAILED / DEAD
 
-所有平台发布通过统一接口，底层可换工具：
+Job:     PENDING -> RUNNING -> SUCCESS
+                    |   \----> RETRYING -> RUNNING
+                    \--------> FAILED / DEAD
+```
+
+具体迁移以模型和 worker 代码为准；文档不应虚构代码里不存在的 `metrics_collecting`
+或 `closed` 状态。
+
+## API 与 worker 分进程
+
+API lifespan **不启动 APScheduler**。部署单元包含：
+
+```bash
+ai-ops serve   # HTTP API / UI
+ai-ops worker  # 唯一调度 owner
+```
+
+分离原因：
+
+- API worker 数量不应决定调度器数量。
+- Web 进程重启不应丢失持久化任务。
+- 唯一 worker owner 让 cron、扫描和日志语义更清晰；任务级原子 claim 仍用来防止重入。
+
+这里的“唯一”是当前部署约束，不是分布式选主保证。代码尚未实现数据库 leader lease；如果误启
+多个 worker，PublishJob 的原子 claim 可以保护同一轮发布入口，但 cron 仍可能重复注册。
+
+`AUTO_PUBLISH_ENABLED=false` 时 worker 保持运行，但不执行自动发布扫描。账号健康和报表 cron
+可继续运行。该开关不应被解释为“所有管理端点都无副作用”。
+
+## 调度与执行不变量
+
+- 数据库中的 `PublishJob` 是任务真相，APScheduler 只是唤醒/扫描机制。
+- worker 启动时会重新发现已到期的持久化任务，不依赖上个进程的内存 job。
+- 任务在执行平台副作用前必须原子 claim；不符合可执行状态时立即返回。
+- 重试是持久化时间，基础退避由 `JOB_RETRY_BASE_SECONDS` 控制。
+- 扫描节奏由 `SCHEDULER_POLL_SECONDS` 控制；它不是精确到秒的执行 SLA。
+- 同时执行数由 `SCHEDULER_MAX_CONCURRENCY` 限制，单次外部调用由
+  `JOB_EXECUTION_TIMEOUT_SECONDS` fail-closed。
+- 一次性任务按 UTC 解释；健康检查/报表 cron 使用显式 `SCHEDULER_TIMEZONE`。
+- 当前只实现 `apscheduler`；`celery` 不是可用后端。
+
+当前恢复边界必须明确：scanner 自动执行到期的 `PENDING`/`RETRYING`。进程若在平台调用期间
+硬退出，超过 `JOB_RUNNING_TIMEOUT_SECONDS` 的 `RUNNING` 会 fail-closed 到需要人工处置的失败
+状态，不会直接盲重试。平台端仍可能已经成功；在实现 claim lease、平台幂等键和自动
+reconciliation 前，运营者必须先核对平台真实状态。
+
+## Publisher 契约
+
+`PublisherBase` 把平台差异收口为：
 
 ```python
-class PublisherBase(ABC):
-    platform: Platform
-
-    @abstractmethod
-    async def login(self, account: Account) -> bool: ...
-
-    @abstractmethod
-    async def publish(self, account: Account, content: Content) -> PublishResult: ...
-
-    @abstractmethod
-    async def health_check(self, account: Account) -> AccountHealth: ...
+async def login(account_id, credential) -> bool: ...
+async def publish(account_id, credential, content) -> PublishResult: ...
+async def health_check(account_id, credential) -> AccountHealth: ...
+async def collect_metrics(post_id, post_url, credential) -> dict: ...
 ```
 
-实现策略：
-- `SocialAutoUploadPublisher`：调 social-auto-upload 的 CLI，覆盖 7 个平台
-- `XhsSpecializedPublisher`：小红书加固版，调 xhs-toolkit
-- `ShortVideoAutoPublisher`：覆盖头条/百家号
+`PublisherRegistry` 可以为一个 Platform 注册多个实现并按优先级 fallback。worker 遇到以下任一
+结果都会停止尝试下一实现：`success=True`、`effect_applied=True` 或
+`outcome_uncertain=True`。只有适配器明确返回“失败且无副作用、结果也确定”的预检失败，才允许
+fallback。它只能提高技术容错，不能代替幂等性、服务端成功验证或平台能力证据。
 
-通过 `PublisherRegistry` 按 `Platform → Publisher` 路由，支持优先级 + fallback。
+这套边界取决于 Adapter 如实报告结果。目前迁移过的 CLI/Git 路径已使用上述字段；旧浏览器
+Adapter 仍是 Experimental，异常后的副作用判定并不都具备同等证据，不能把该保证外推到所有平台。
 
-### 2. VideoEngineBase（视频引擎抽象）
+对外支持等级只看 [平台能力矩阵](platform-capabilities.md)。
 
-```python
-class VideoEngineBase(ABC):
-    @abstractmethod
-    async def render(self, brief: VideoBrief) -> VideoArtifact: ...
+## 外部工具边界
+
+支持三种 Adapter 形式：
+
+1. subprocess CLI，例如版本门禁的知乎 canary、social-auto-upload/FunClip。
+2. HTTP API，例如外置视频生成服务。
+3. 少量 Python 调用。
+
+外部工具不是本仓库的依赖锁定一部分；真实发布证据必须同时记录它们的精确版本。
+数据库中的 credential blob 由 Fernet 保护，但知乎独立 HOME、YouTube OAuth 文件、SAU cookie
+镜像和浏览器 persistent profile 是部署机上的独立敏感状态，只受目录/文件权限与主机隔离保护，
+不会被 `FERNET_KEY` 自动加密。
+
+## 指标闭环的现实边界
+
+理想闭环是：
+
+```text
+publish -> verify post identity -> collect normalized metrics -> update topic signal -> agent review
 ```
 
-实现：
-- `MoneyPrinterEngine`：主题→自动出视频（口播/混剪）
-- `NarratoEngine`：解说类（电影解说、纪录片）
-- `FFmpegRawEngine`：手动剪辑兜底（用户已有素材时）
+但只有 Publisher 返回可校验的 post id/url，并且实现真实 `collect_metrics`，这条链路才成立。
+大部分平台目前没有这一证据，因此不应对外声称已完成跨平台数据飞轮。
 
-### 3. ContentGeneratorBase（内容生成抽象）
+现有发布后 1h/24h/7d 指标 callback 仍由 APScheduler 保存在内存中，worker 重启可能丢失；
+它们还不是像 PublishJob 一样的持久化任务。
 
-```python
-class ContentGeneratorBase(ABC):
-    @abstractmethod
-    async def generate(self, topic: Topic, profile: AccountProfile) -> Article: ...
+## 部署拓扑
+
+当前推荐最小拓扑：
+
+```text
+reverse proxy/TLS
+      |
+      v
+ one API process ---- PostgreSQL/SQLite
+                           ^
+                           |
+                    one worker process
+                           |
+                  browsers/external tools
 ```
 
-LLM 解耦：OpenAI / Anthropic / DeepSeek / 通义 都是 driver，配置切换。
-
-## 状态机
-
-```
-   [draft] ──写完──→ [ready] ──排程──→ [scheduled]
-                                            │
-                                            ↓
-                                     [publishing]
-                                       │     │
-                            success ←──┘     └──→ [failed] ──重试──┐
-                              │                                     │
-                              ↓                                     │
-                       [published] ←───────── 重试上限 ─── [dead]   │
-                              │                                     │
-                              ↓                                     │
-                       [metrics_collecting] ──回流──→ [closed]      │
-                                                                    │
-                                              ←───────────────────┘
-```
-
-关键约束：
-- 状态变更必须落库 + 写审计日志
-- 失败可重试 N 次，超限进死信
-- 数据采集是独立异步阶段，不阻塞发布
-
-## 数据模型
-
-| 实体 | 字段要点 |
-|------|---------|
-| `Topic` | 主题名、关键词、人设画像、目标平台、热度分 |
-| `Article` | 关联 topic，标题/正文/物料、状态、目标平台、目标账号、计划发布时间 |
-| `Asset` | 类型（image/video/audio）、本地路径、来源（用户/AI生成）、metadata |
-| `Account` | 平台、昵称、cookie 加密blob、状态、风控等级 |
-| `PublishJob` | 关联 article + account，状态、重试次数、平台返回 id、发布 URL |
-| `Metrics` | 关联 PublishJob，点赞/评论/转发/曝光，时序快照 |
-
-## 多账号策略
-
-- **隔离**：cookie 单独加密存储（Fernet），按 account_id 取
-- **限流**：每账号每平台独立限流计数（每日/每小时）
-- **风控感知**：连续失败自动降权，触发健康检查
-- **轮换**：同平台多账号场景下，按权重轮询 + 内容查重
-
-## 调度
-
-第一版：**APScheduler**（in-process，零外部依赖）。
-- 文章排程：定时触发 publishing
-- 健康检查：每日扫账号
-- 数据采集：发布后 1h/24h/7d 三次采集
-
-切 Celery 触发条件：
-- 任务量 > 1k/day
-- 需要跨机器分布式
-- 视频剪辑要 GPU 节点
-
-## 集成外部工具的方式
-
-详见 [external-tools.md](external-tools.md)。三种方式：
-
-1. **subprocess CLI**：调用外部工具的命令行（social-auto-upload）
-2. **HTTP API**：外部工具作为独立服务（MoneyPrinterTurbo 的 API 模式）
-3. **Python import**：少数工具打了 pip 包
-
-优先级：HTTP > subprocess > import。隔离性越好越优先。
-
-## 风控与合规
-
-- 内容查重：同账号 7 天内 simhash 相似度阈值
-- 频率控制：单账号单平台每日上限可配
-- 审核钩子：可插入 LLM 审核 / 人工 review 队列
-- 敏感词：可配置词库 + 命中阻断
-
-## 数据回流闭环
-
-```
-发布完成 → 采集互动 → 主题热度更新 → 生成器策略调整 → 下一轮选题
-```
-
-这是真正的"运营自动化"——不只是分发，是有反馈的飞轮。
-
-## 扩展性
-
-新加平台只需：
-1. 在 `Platform` 枚举加值
-2. 实现一个 `PublisherBase` 子类（或扩展 `SocialAutoUploadPublisher` 的平台映射）
-3. 在 `PublisherRegistry` 注册
-
-新加视频引擎同理。
+在完成多实例数据库和调度验证前，不要把 API/worker 扩成多副本并宣称已支持分布式运行。
+操作步骤见 [部署指南](deployment.md)。

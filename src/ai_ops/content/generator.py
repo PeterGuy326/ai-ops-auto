@@ -1,26 +1,38 @@
 """AI 内容生成器 — LLM 抽象层。
 
-driver 可切：openai / anthropic / deepseek / dashscope。
+driver 可切：OpenAI-compatible / Anthropic / Claude CLI。
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import os
 from pathlib import Path
+import sys
 
 from ..config import settings
 from ..core.exceptions import DuplicateContentError
 from ..core.schemas import ArticleIn
+from ..runtime.browser_engine import build_subprocess_env
+from ..runtime.subprocess import communicate_bounded, stop_process_group
 from .humanize import HumanizeOptions, ai_smell_score, humanize_for_xhs
 
 # 同账号近 N 天内 simhash 重生循环参数（与 worker.SIMHASH_* 同语义）。
 # 重生最多 2 轮：首次 + 2 轮重生 = 3 次 LLM 调用上限，控住配额。
 _DEDUP_MAX_REGEN = 2
 _DEDUP_LOOKBACK_DAYS = 7
-_DEDUP_HAMMING_THRESHOLD = 8
+_DEDUP_HAMMING_THRESHOLD = settings.simhash_hamming_threshold
 
 # 专题 prompt 根目录：<repo_root>/prompts/topics/
 # generator.py 位于 src/ai_ops/content/generator.py，向上 4 层到 repo 根。
 _TOPICS_PROMPT_DIR = Path(__file__).resolve().parents[3] / "prompts" / "topics"
+
+
+def _topic_prompt_dirs() -> tuple[Path, ...]:
+    """Return prompt roots for source/editable and regular wheel installs."""
+    return (
+        _TOPICS_PROMPT_DIR,
+        Path(sys.prefix) / "share" / "ai-ops-auto" / "prompts" / "topics",
+    )
 
 
 def _load_topic_prompt(topic_slug: str) -> str:
@@ -28,15 +40,23 @@ def _load_topic_prompt(topic_slug: str) -> str:
 
     文件不存在或 slug 为空时返回空串——不抛异常，保证向后兼容。
     """
-    if not topic_slug:
+    # A topic slug is a filename stem, never an arbitrary relative path.
+    # Unicode names are allowed, while separators and dot traversal fail closed.
+    if (
+        not topic_slug
+        or Path(topic_slug).name != topic_slug
+        or topic_slug in {".", ".."}
+    ):
         return ""
-    path = _TOPICS_PROMPT_DIR / f"{topic_slug}.md"
-    if not path.is_file():
-        return ""
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
+    for root in _topic_prompt_dirs():
+        path = root / f"{topic_slug}.md"
+        if not path.is_file():
+            continue
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+    return ""
 
 
 class LLMDriver(ABC):
@@ -100,14 +120,19 @@ class ClaudeCliDriver(LLMDriver):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=build_subprocess_env(),
+            start_new_session=os.name == "posix",
         )
         try:
             out, err = await asyncio.wait_for(
-                proc.communicate(user.encode("utf-8")),
+                communicate_bounded(proc, input_data=user.encode("utf-8")),
                 timeout=settings.claude_cli_timeout_seconds,
             )
+        except asyncio.CancelledError:
+            await stop_process_group(proc)
+            raise
         except asyncio.TimeoutError as e:
-            proc.kill()
+            await stop_process_group(proc)
             raise RuntimeError(
                 f"claude CLI 超时（>{settings.claude_cli_timeout_seconds}s）"
             ) from e

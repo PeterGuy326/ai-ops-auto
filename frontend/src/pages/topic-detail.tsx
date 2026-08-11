@@ -32,6 +32,7 @@ import {
 import { CategoryBadge } from "@/components/topics/category-badge"
 import { CreateAccountForm } from "@/components/accounts/create-account-form"
 import { categoryIndicatorClass } from "@/lib/topic-utils"
+import { QueryError } from "@/components/query-error"
 
 const HEALTH_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
   healthy: "default",
@@ -185,7 +186,7 @@ function Stat({ label, value }: { label: string; value: number }) {
 // ---------- Tab: Accounts ----------
 
 function AccountsTab({ topicId }: { topicId: number }) {
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["accounts", { topic_id: topicId }],
     queryFn: () => api.accounts(topicId),
   })
@@ -217,7 +218,9 @@ function AccountsTab({ topicId }: { topicId: number }) {
         </Dialog>
       </CardHeader>
       <CardContent>
-        {isLoading ? (
+        {error ? (
+          <QueryError error={error} />
+        ) : isLoading ? (
           <p className="text-sm text-muted-foreground">加载中...</p>
         ) : data && data.length > 0 ? (
           <Table>
@@ -269,7 +272,7 @@ function AccountsTab({ topicId }: { topicId: number }) {
 // ---------- Tab: Articles ----------
 
 function ArticlesTab({ topicId }: { topicId: number }) {
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["articles", { topic_id: topicId }],
     queryFn: () => api.articles(topicId),
   })
@@ -279,7 +282,9 @@ function ArticlesTab({ topicId }: { topicId: number }) {
         <CardTitle>文章（{data?.length ?? 0}）</CardTitle>
       </CardHeader>
       <CardContent>
-        {isLoading ? (
+        {error ? (
+          <QueryError error={error} />
+        ) : isLoading ? (
           <p className="text-sm text-muted-foreground">加载中...</p>
         ) : data && data.length > 0 ? (
           <Table>
@@ -332,7 +337,7 @@ function ArticlesTab({ topicId }: { topicId: number }) {
 
 function JobsTab({ topicId }: { topicId: number }) {
   const qc = useQueryClient()
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["jobs", { topic_id: topicId }],
     queryFn: () => api.jobs(topicId),
   })
@@ -350,7 +355,8 @@ function JobsTab({ topicId }: { topicId: number }) {
         <CardTitle>发布任务（{data?.length ?? 0}）</CardTitle>
       </CardHeader>
       <CardContent>
-        {isLoading ? (
+        <QueryError error={error ?? runMut.error ?? collectMut.error} />
+        {error ? null : isLoading ? (
           <p className="text-sm text-muted-foreground">加载中...</p>
         ) : data && data.length > 0 ? (
           <Table>

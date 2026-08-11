@@ -1,409 +1,211 @@
-# 部署 SOP — ai-ops-auto 生产部署手册
+# 部署指南（Alpha）
 
-> **底层逻辑**：从"能本地跑"到"能交生产"差的不是代码，是**运维 SOP 的颗粒度**。  
-> 本文是部署的唯一信源，按顺序读 + 按顺序做。漏一步 = 上线 100% 出事故。
+`ai-ops-auto` 尚处于 Alpha。本文档给出当前有证据支持的自托管拓扑，不构成高可用或无人值守承诺。
 
----
+## 支持的拓扑
 
-## 0. 阅读顺序
+API 和调度 worker 必须分进程：
 
-新接手运维 → 章节 1 → 2 → 3，按顺序逐条做。  
-升级 → 章节 4。回滚 → 章节 5。容器化 → 章节 6。  
-凭证轮换 → 章节 7。可观测性 → 章节 8。出问题 → 章节 9 FAQ。
+```text
+TLS reverse proxy
+       |
+       v
+  one API process -------- database
+                              ^
+                              |
+                       one worker process
+                              |
+                    browser/external tools
+```
 
----
+```bash
+ai-ops serve
+ai-ops worker
+```
 
-## 1. 环境要求
+API lifespan 不启动 APScheduler。`ai-ops worker` 是唯一调度 owner，负责到期任务、健康检查和报表 cron。
+`AUTO_PUBLISH_ENABLED=false` 时 worker 仍应运行：它不执行自动发布，但健康/报表任务仍可运行。
 
-- **Python**：3.11+（pyproject `requires-python = ">=3.11"`，3.10 直接装不上）
-- **操作系统**：Linux / macOS（容器内推荐 `python:3.11-slim`）
-- **数据库**：二选一
-  - SQLite（默认，零配置，单进程小流量够用，**生产慎用**——并发写锁问题）
-  - PostgreSQL 14+（生产推荐，装 `pip install -e .[postgres]` 引入 psycopg2-binary）
-- **浏览器**（**只有真发布时需要**，纯 API 后端可跳过）：
-  ```bash
-  # playwright 内置浏览器（默认引擎）
-  playwright install chromium
-  # 高风控平台（小红书）走 camoufox 加固档：
-  pip install -e .[stealth-pro]
-  python -m camoufox fetch
-  ```
-- **磁盘**：素材产物 `data/assets`、视频产物 `data/outputs`、SQLite `data/ai_ops.db`，预留 ≥ 20GB
+“唯一 worker”目前由部署者保证，项目尚无 leader lease。不要同时启动两个 worker；原子 job
+claim 不能阻止健康检查、报表等 cron 被重复注册。
 
----
+目前建议单 API + 单 worker。在完成多副本压力和故障恢复验证前，不要使用 Gunicorn 多 worker、
+Kubernetes 多副本或把本项目描述为分布式系统。当前调度后端只有 APScheduler，不支持 Celery。
 
-## 2. 环境变量清单
+## 环境需求
 
-`.env` 文件放在项目根，与 `pyproject.toml` 同级。**永远不要 commit 到 git**（已在 .gitignore）。
+- Python 3.11 或 3.12。
+- Linux/macOS；建议先在目标 OS 上对适配器做 canary。
+- SQLite 只用于单机低并发验证；长期自托管优先 PostgreSQL 14+。
+- 只有真实浏览器发布时才需要 Chrome/Playwright/Camoufox 等平台工具。
+- 视频产物可以很大；`data/` 需要持久化和容量监控。
 
-### 2.1 必填（缺一启动就废）
+## 关键配置
 
-| 变量 | 说明 | 示例 |
-|------|------|------|
-| `FERNET_KEY` | Cookies / 凭证对称加密密钥。**一旦设定不可换**，换了所有已加密 cookies 立即解密失败 | `bWVfb25seV9hX3Rlc3RfMzJfYnl0ZXNfMTIzNDU2Nzg=` |
-| `DATABASE_URL` | SQLAlchemy URL；不设则用 `sqlite:///./data/ai_ops.db` | `postgresql+psycopg2://user:pw@host:5432/aiops` |
+从 `.env.example` 开始，不要复用其他环境的 `.env`。
 
-**生成 FERNET_KEY 命令**（**必须在首次部署前跑一次并把结果安全保存到密钥管理系统**）：
+| 变量 | 要求 |
+|---|---|
+| `DATABASE_URL` | API 与 worker 必须指向同一数据库 |
+| `FERNET_KEY` | 必须持久保存；只加密数据库 credential blob，丢失后无法解密；不覆盖磁盘 profile/OAuth/cookie |
+| `API_KEY` | 非空强随机值；所有对外部署必须设置；当前是审批/分发/执行共用的全权限管理 key |
+| `AUTO_PUBLISH_ENABLED` | 默认 `false`；只控制后台扫描，真账号 canary 完成后才显式打开 |
+| `SCHEDULER_BACKEND` | 只能是 `apscheduler` |
+| `SCHEDULER_TIMEZONE` | 健康检查/报表 cron 的业务时区，默认 `Asia/Shanghai` |
+| `SCHEDULER_POLL_SECONDS` | 持久任务扫描周期，默认 15 秒 |
+| `SCHEDULER_MAX_CONCURRENCY` | 同时执行的发布上限，默认 4；按机器/浏览器容量下调 |
+| `JOB_RETRY_BASE_SECONDS` | 重试基础退避，默认 60 秒 |
+| `JOB_EXECUTION_TIMEOUT_SECONDS` | 单次 Publisher hard timeout，默认 1800 秒 |
+| `JOB_RUNNING_TIMEOUT_SECONDS` | 失联 `RUNNING` 的 fail-closed 阈值，默认 7200 秒，必须大于执行超时 |
+| `LOG_FORMAT` | 本地可用 `text`，日志平台建议 `json` |
+
+生成密钥：
+
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
-> 备份建议：FERNET_KEY 存到 HashiCorp Vault / AWS Secrets Manager / 1Password，**纸质备份一份保险柜**。丢了 = 所有账号 cookie 报废 → 全员重新扫码登录。
-
-### 2.2 强烈建议（不设有安全风险）
-
-| 变量 | 不设的代价 | 推荐值 |
-|------|----------|--------|
-| `API_KEY` | **dev 模式自动放行**——任何人 curl `/topics` 都能改你数据 | 32+ 字符随机串：`python -c "import secrets; print(secrets.token_urlsafe(32))"` |
-| `FEISHU_WEBHOOK_URL` | 失败 / 风控告警没人收到，运维变盲人 | 飞书群机器人 webhook URL |
-
-### 2.3 可观测性（接 Sentry / ELK 时必填）
-
-| 变量 | 说明 | 默认 |
-|------|------|------|
-| `SENTRY_DSN` | Sentry 上报 DSN；空 = 不启用（sentry-sdk 软依赖） | `""` |
-| `SENTRY_ENVIRONMENT` | Sentry 环境 tag | `dev` |
-| `LOG_FORMAT` | `text`（本地友好）/ `json`（ELK/Datadog 推荐） | `text` |
-| `LOG_LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
-
-### 2.4 业务可调（按需）
-
-| 变量 | 说明 | 默认 |
-|------|------|------|
-| `BROWSER_ENGINE` | `playwright_chrome_channel` / `playwright_chromium` / `patchright` / `camoufox` | `playwright_chrome_channel` |
-| `BROWSER_HEADLESS` | 高风控平台建议 `false` | `false` |
-| `BROWSER_PROXY` | 每账号独立 IP 反风控核心 | 空 |
-| `PUBLISH_MIN_INTERVAL_SECONDS` | 同账号两次发布最小间隔 | `14400`（4h）|
-| `PUBLISH_MAX_PER_DAY` | 单账号每日上限 | `2` |
-| `NURTURE_DAYS` | 新号养号期天数 | `7` |
-| `LLM_DEFAULT` | `openai` / `anthropic` / `deepseek` / `dashscope` | `openai` |
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY` / `DASHSCOPE_API_KEY` | 对应 LLM 厂商 key | 空 |
-| `API_HOST` / `API_PORT` | uvicorn 监听 | `127.0.0.1:8000` |
-
-完整字段对照 `src/ai_ops/config.py` 的 `Settings` 类。
-
-### 2.5 .env 模板（首次部署照抄）
-
-```dotenv
-# === 必填 ===
-FERNET_KEY=<上面命令生成的 key>
-DATABASE_URL=sqlite:///./data/ai_ops.db
-
-# === 强烈建议 ===
-API_KEY=<上面命令生成的 token>
-FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx
-
-# === 可观测性（生产推荐）===
-SENTRY_DSN=
-LOG_FORMAT=json
-LOG_LEVEL=INFO
-
-# === 业务可调 ===
-BROWSER_ENGINE=playwright_chrome_channel
-PUBLISH_MIN_INTERVAL_SECONDS=14400
-PUBLISH_MAX_PER_DAY=2
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
----
+第一个输出用于 `FERNET_KEY`，第二个用于 `API_KEY`。手工放入部署密钥管理系统，不要把值写进
+Dockerfile、Compose YAML、Shell 历史或 Git。
 
-## 3. 首次部署 SOP（**严格按顺序**）
+当前项目没有调用者身份/RBAC，不能用同一个 `API_KEY` 区分 Agent 与人工审批者。需要强制 human
+gate 时，把管理 key 留在人工工作流或网关侧，并给 Agent 暴露更窄的外层接口。知乎/YouTube/SAU
+和浏览器的磁盘 profile 还需用专用系统用户、`0700/0600` 权限和受控备份单独保护。
 
-### 3.1 准备代码 + 依赖
+## 源码部署
 
 ```bash
-# 1. 拉代码
-git clone <repo-url> /opt/ai-ops-auto
+git clone https://github.com/PeterGuy326/ai-ops-auto.git /opt/ai-ops-auto
 cd /opt/ai-ops-auto
 
-# 2. 装依赖（生产档：不装 dev / llm-* 可选包）
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -e .
-
-# 3. 装可选 stealth 档（如需高风控平台）
-pip install -e .[stealth-pro]
-python -m camoufox fetch
+pip install -e ".[postgres]"  # SQLite 可用 pip install -e .
 ```
 
-### 3.2 准备 .env + 密钥
+把密钥管理系统注入的环境变量提供给两个进程，然后在**单一管理步骤**中安全初始化/迁移：
 
 ```bash
-# 1. 生成 FERNET_KEY 并安全保存（密码管理 + 离线备份）
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-
-# 2. 生成 API_KEY
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-
-# 3. 按 §2.5 模板写 .env
-vim .env
-chmod 600 .env  # 权限收紧
-```
-
-### 3.3 **跑 alembic upgrade head**（**第一关键步骤**）
-
-```bash
-# 创建 schema 到最新版本
-alembic upgrade head
-
-# 验证当前版本号
+ai-ops init-db
 alembic current
 ```
 
-> ⚠️ **绝对不要**用 `python scripts/init_db.py` 替代——那是 dev 路径（`Base.metadata.create_all`），生产用 = 后续加字段全部炸（无法平滑迁移）。`alembic upgrade head` 才是唯一正确路径。
+该命令内部使用 Alembic；未知的无版本业务库会直接拒绝，不会猜测版本或覆盖 schema。
 
-### 3.4 启动服务
-
-```bash
-# 开发 / 单实例（够小流量验证）
-uvicorn ai_ops.api.main:app --host 0.0.0.0 --port 8000
-
-# 生产：gunicorn + uvicorn worker（worker 数推荐 = CPU × 2 + 1）
-pip install gunicorn
-gunicorn ai_ops.api.main:app \
-  --workers $(($(nproc) * 2 + 1)) \
-  --worker-class uvicorn.workers.UvicornWorker \
-  --bind 0.0.0.0:8000 \
-  --access-logfile - \
-  --error-logfile -
-```
-
-### 3.5 启动自检
+分别用 systemd/supervisor 等进程管理器启动：
 
 ```bash
-# 健康检查（不需要 API_KEY）
-curl -s http://127.0.0.1:8000/health
-# 期望：{"ok":true}
-
-# 鉴权确认（必须带 API_KEY）
-curl -s -H "X-API-Key: <你的 API_KEY>" http://127.0.0.1:8000/topics
-# 期望：JSON 数组（首次为空 []）
+ai-ops serve --host 127.0.0.1 --port 8000
+ai-ops worker
 ```
 
-如果启动日志看到 `[DEPLOY-CHECK]` warning（API_KEY 未设 / FERNET_KEY 未设），说明 .env 配错——**回到 §2 重检环境变量**。
+反向代理负责 TLS、请求大小上限、超时和与公网的隔离。不建议直接向公网绑定 `0.0.0.0:8000`。
 
----
+## Docker
 
-## 4. 升级 SOP
+根目录 Dockerfile 包含 Python API/worker、Alembic 迁移与服务端 HTML 模板，但**不包含**：
+
+- React `frontend/dist`。
+- Playwright/Camoufox 浏览器二进制。
+- social-auto-upload、MoneyPrinterTurbo、FunClip 等外部仓库。
+- 真实平台凭证。
+
+因此基础镜像可以运行控制面和本地 SQLite 演示数据路径；当前还没有完整 Fake Publisher 闭环。
+真平台 Publisher 需要额外、经过验证的运行镜像。
 
 ```bash
-# 1. 拉新代码
-cd /opt/ai-ops-auto
-git fetch origin
-git checkout <new-tag>
-
-# 2. 装新依赖（可能有新增）
-source .venv/bin/activate
-pip install -e .
-
-# 3. 跑迁移（必跑，不论代码有没有新 migration）
-alembic upgrade head
-alembic current  # 确认版本前进
-
-# 4. 重启 service
-systemctl restart ai-ops-auto
-# 或 supervisor / pm2 / docker-compose restart api
+docker build -t ai-ops-auto:local .
 ```
 
-> 升级前**强烈建议**：备份 SQLite `data/ai_ops.db` 或 Postgres `pg_dump`，回滚救命用。
-
----
-
-## 5. 回滚 SOP
-
-```bash
-# 1. 回滚一步迁移（如新版本有 schema 变更）
-alembic downgrade -1
-alembic current  # 确认版本回退
-
-# 2. 回退代码
-git checkout <old-tag>
-
-# 3. 重装依赖（如需要）
-pip install -e .
-
-# 4. 重启 service
-systemctl restart ai-ops-auto
-```
-
-> 如果新版本**没有 schema 变更**（`alembic history` 看一致），可跳过 step 1 直接回代码。
-
----
-
-## 6. 容器化部署（Docker / docker-compose）
-
-项目根有 `Dockerfile` + `docker-entrypoint.sh`，entrypoint 会**自动跑 alembic upgrade head 再启 uvicorn**。
-
-### 6.1 单容器
-
-```bash
-# 构建
-docker build -t ai-ops-auto:latest .
-
-# 运行（挂载 data 卷 + 注入环境变量）
-docker run -d \
-  --name ai-ops-auto \
-  -p 8000:8000 \
-  -v $(pwd)/data:/app/data \
-  --env-file .env \
-  ai-ops-auto:latest
-```
-
-### 6.2 docker-compose.yml（参考片段）
+Compose 最小拓扑示例：
 
 ```yaml
-version: "3.9"
 services:
   api:
-    build: .
-    image: ai-ops-auto:latest
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./data:/app/data
-    env_file:
-      - .env
+    image: ai-ops-auto:local
+    env_file: [.env]
+    ports: ["127.0.0.1:8000:8000"]
+    volumes: ["ai_ops_data:/app/data"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
       interval: 30s
       timeout: 5s
-      retries: 3
-  # postgres: 可选——把 .env 的 DATABASE_URL 切到 postgres://...
-  # postgres:
-  #   image: postgres:16
-  #   environment:
-  #     POSTGRES_DB: aiops
-  #     POSTGRES_USER: aiops
-  #     POSTGRES_PASSWORD: <strong-pw>
-  #   volumes:
-  #     - ./pgdata:/var/lib/postgresql/data
+      retries: 5
+
+  worker:
+    image: ai-ops-auto:local
+    command: ["ai-ops", "worker"]
+    env_file: [.env]
+    environment:
+      SKIP_MIGRATIONS: "1"
+    volumes: ["ai_ops_data:/app/data"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  ai_ops_data:
 ```
 
-### 6.3 K8s 注意点
+API 容器的 entrypoint 执行 `ai-ops init-db` 安全迁移；worker 在 API 就绪后启动并显式跳过重复迁移。
+在 Kubernetes 中应当改为单独 migration Job/initContainer，两个业务容器均设置 `SKIP_MIGRATIONS=1`。
+当前不建议部署多副本。
 
-- `data/` 必须挂 PersistentVolume（SQLite 文件 / 素材产物都靠它）
-- entrypoint 自动跑 `alembic upgrade head` → 多 Pod 滚动更新时建议串行（initContainer 跑 migration 后 Deployment 起 Pod），避免多实例并发 migration race
-
----
-
-## 7. 凭证轮换
-
-| 凭证 | 能不能轮换 | 操作 |
-|------|----------|------|
-| `FERNET_KEY` | **不能轻易换** | 换了之后所有 Account.encrypted_credential 解密失败 → 全平台账号需重新扫码登录。**必须的话**先 dump 所有 cookies 明文 → 换 key → 用新 key 重新 encrypt 落库 |
-| `API_KEY` | ✅ 可滚动轮换 | 更新 .env → 重启 service → 通知所有调用方更新 X-API-Key header |
-| `OPENAI_API_KEY` 等 LLM key | ✅ 可轮换 | 更新 .env → 重启 |
-| `FEISHU_WEBHOOK_URL` | ✅ 可换 | 更新 .env → 重启；旧 webhook 失效会 4xx 但不阻塞主流程 |
-| `BROWSER_PROXY` | ✅ 可换 | 更新 .env → 重启；账号粒度的代理建议改 `Account.proxy` 字段（DB 层） |
-
----
-
-## 8. 可观测性接入
-
-### 8.1 Sentry
+## 启动验收
 
 ```bash
-# 1. 装软依赖
-pip install sentry-sdk
-
-# 2. .env 配 DSN
-echo "SENTRY_DSN=https://<key>@o<org>.ingest.sentry.io/<project>" >> .env
-echo "SENTRY_ENVIRONMENT=prod" >> .env
-
-# 3. 重启 → init_observability() lifespan 内会自动启用
+curl -fsS http://127.0.0.1:8000/health
+curl -fsS -H "X-API-Key: <redacted>" http://127.0.0.1:8000/topics
 ```
 
-### 8.2 Feishu webhook（失败 / 风控告警）
+另外检查：
 
-```bash
-# 1. 飞书群 → 设置 → 群机器人 → 添加自定义机器人 → 复制 webhook URL
-# 2. 配置
-echo "FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx" >> .env
-# 3. 重启
-```
+- API 和 worker 都只记录脱敏的数据库信息，不出现完整 `DATABASE_URL`。
+- worker 日志明确输出 `AUTO_PUBLISH_ENABLED` 状态。
+- `false` 时已到期 PublishJob 没有被自动执行。
+- `false` 时 `/jobs/{id}/run` 等显式管理端点仍可产生副作用；验收时同时检查管理端访问边界。
+- 通知目标和外部端点只来自当前部署配置，不是代码默认值。
+- 开启自动发布前检查待执行 backlog；关闭期间积压的到期任务在开关打开后可能很快被扫描到。
 
-去重窗口默认 5 分钟内最多 2 条同事件（`NOTIFY_DEDUP_WINDOW_SECONDS` + `NOTIFY_DEDUP_THRESHOLD`）。
+## 打开真实发布
 
-### 8.3 结构化日志接 ELK / Loki / Datadog
+先完成下列门禁：
 
-```bash
-# .env 切 json 格式
-echo "LOG_FORMAT=json" >> .env
-echo "LOG_LEVEL=INFO" >> .env
+1. 平台在 [能力矩阵](platform-capabilities.md) 中不是 Stub。
+2. 使用专用测试账号，记录适配器与上游精确版本。
+3. 人工审核内容、目标账号、时间和平台条款。
+4. 单账号、单平台、最小配额跑 canary，确认 post id/url 或等价服务端证据。
+5. 备份数据库，配置告警，再设置 `AUTO_PUBLISH_ENABLED=true` 并重启 worker。
 
-# stdout 直接是 JSON 行 → docker logs / journalctl 接 Fluent Bit / Vector 转发
-```
+不要用“发布失败后立即再发一条覆盖”作为安全策略。这可能创建第二条公开内容；
+应先停止 worker、确认平台端真实状态，再由人决定后续。
 
----
+## 升级
 
-## 9. 常见运维问题 FAQ
+1. 记录当前 commit/镜像 digest，备份数据库和 `FERNET_KEY`。
+2. 停止 worker，避免升级期间开始新的外部副作用。
+3. 审查待应用 Alembic migration，在备份/预发数据上验证。
+4. 安装新代码或拉取已验证镜像，执行一次 `ai-ops init-db`。
+5. 启动 API 并验证读写，再启动 worker。
+6. 保持自动发布关闭，直到新版本 canary 完成。
 
-### Q1. 启动报 `sqlalchemy.exc.OperationalError: no such table: topics`
+## 回滚
 
-→ alembic 没跑。**马上跑** `alembic upgrade head`，再重启。
+不要在没有审查 migration 的情况下盲目执行 `alembic downgrade -1`；downgrade 可能丢字段/数据。
+首选恢复经过验证的数据库备份与对应代码/镜像。回滚前先停 worker，回滚后保持
+`AUTO_PUBLISH_ENABLED=false` 并重新 canary。
 
-### Q2. `alembic current` 显示版本比代码 `alembic/versions/` 里最新的低？
+## 已知限制
 
-→ 这就是 schema 落后状态，写数据会炸。**立刻**跑：
-```bash
-alembic upgrade head
-alembic current  # 确认追平
-```
-
-### Q3. 启动后所有 publisher 调用都 `cryptography.fernet.InvalidToken`
-
-→ `FERNET_KEY` 跟当年加密 cookies 时用的不一致。**不要硬换**：
-- 排查 `.env` / 环境变量 / docker secrets 是不是覆盖了正确的 KEY
-- 实在找不回旧 KEY → 所有账号必须重新扫码登录（DB 层 `Account.encrypted_credential` 全部置 NULL）
-
-### Q4. 所有 API 请求 401 Unauthorized
-
-→ `API_KEY` 已设但调用方没带 / 带错了。客户端必须发：
-```
-X-API-Key: <你 .env 里的 API_KEY 值>
-```
-
-### Q5. `/health` 通但写 API 报 401，并且 .env 里 API_KEY 没设
-
-→ 这就是 dev 模式自动放行被生产配置遗忘的典型坑。**设 API_KEY 后重启**。
-
-### Q6. 数据卷迁移（换机器 / 换容器）
-
-```bash
-# 老机器：
-tar czf data-backup.tgz data/
-
-# 新机器：
-tar xzf data-backup.tgz
-# .env 复制过去（FERNET_KEY 必须一致！）
-# alembic upgrade head（追平 schema）
-# 启动
-```
-
-### Q7. Postgres 切换（从 SQLite 迁移）
-
-参考 `docs/dev-db-migration.md`（如有）。简版：dump SQLite → 建 Postgres schema (`alembic upgrade head` on PG URL) → 用 csv / pandas / 脚本搬数据。
-
-### Q8. Cron / 定时任务（每日健康检查、日报 / 周报）没跑
-
-→ APScheduler in-process，service 重启间隙会丢任务。多副本时只一个 worker 应注册 cron（用 leader election / `SCHEDULER_BACKEND=celery` 切 Celery+Redis）。
-
-### Q9. K8s 滚动更新时 alembic 跑了多次？
-
-→ initContainer 单独跑 migration，App container 不再跑（Dockerfile 留环境变量 `SKIP_MIGRATIONS=1` 可禁用 entrypoint 的 alembic）。
-
----
-
-## 10. 验收 checklist（上线前最后一遍走）
-
-- [ ] FERNET_KEY 已生成 + 安全备份
-- [ ] API_KEY 已设非空
-- [ ] `.env` 文件权限 600，**未** commit
-- [ ] `alembic current` 输出 = `alembic heads`（schema 追平）
-- [ ] `curl /health` 返回 200
-- [ ] 带 X-API-Key 的 `curl /topics` 返回 JSON
-- [ ] 飞书 webhook 收到测试消息（用 `curl` 手动 hit webhook）
-- [ ] 启动日志无 `[DEPLOY-CHECK]` warning
-- [ ] `data/` 目录已挂卷 / 已备份
-- [ ] 监控（Sentry / 日志收集）接好
-
-> 这 10 项过完才叫"部署完成"。少一项 = 你在生产埋雷。
+- 没有已验证的高可用/多区域部署。
+- 没有 worker leader lease；单 worker 是部署约束，不是代码层选主。
+- 硬退出时已 claim 的 `RUNNING` 任务会在失联阈值后 fail-closed 到失败状态，不会自动重发。
+  先核对平台端是否已经成功，再人工处置，避免重复发布。
+- 发布后的指标 callback 目前不是持久化任务，worker 重启可能丢失 1h/24h/7d 回采计划。
+- worker 有统一执行超时，但部分 subprocess adapter 尚未保证取消时终止其子进程；生产环境仍需
+  进程级监控和告警保护。
+- 大多数平台 Publisher 不是 Stable，平台 UI 改版会使 selector 失效。
+- 基础 Docker 镜像不能单独完成真实浏览器发布。
+- 不是所有 Publisher 都返回 post identity 或真实 metrics，数据回流不应视为全平台闭环。
+- 发布是不可逆外部副作用，运营者对账号、内容和平台合规负责。

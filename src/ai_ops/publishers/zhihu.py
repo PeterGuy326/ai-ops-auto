@@ -26,7 +26,6 @@ import asyncio
 import random
 import re
 
-from ..config import settings
 from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
 from ..core.schemas import PublishContent, PublishResult
 from ..runtime.playwright_factory import get_async_playwright, get_launch_kwargs
@@ -106,6 +105,7 @@ async def _paste_html_to_draftjs(page, html: str) -> None:
 class ZhihuPublisher(PublisherBase):
     platform = Platform.ZHIHU
     kind = PublisherKind.SOCIAL_AUTO_UPLOAD  # 复用枚举值
+    supports_metrics = True
 
     async def login(self, account_id: int, credential: dict) -> bool:
         """有窗口模式打开知乎登录页，由用户手动扫码 / 验证码登录。
@@ -169,6 +169,7 @@ class ZhihuPublisher(PublisherBase):
 
         async_playwright = get_async_playwright()
         kwargs = get_launch_kwargs()
+        result: PublishResult | None = None
 
         try:
             async with async_playwright() as p:
@@ -178,10 +179,18 @@ class ZhihuPublisher(PublisherBase):
                     await ctx.add_cookies(cookies)
                     page = await ctx.new_page()
 
-                    return await self._do_publish(page, content)
+                    result = await self._do_publish(page, content)
                 finally:
                     await browser.close()
+            return result
         except Exception as e:
+            # Browser/context teardown happens after _do_publish has already
+            # produced the platform receipt.  A local close failure must never
+            # overwrite that result and turn a confirmed post into a retry.
+            if result is not None:
+                raw = dict(result.raw_response or {})
+                raw["teardown_error"] = type(e).__name__
+                return result.model_copy(update={"raw_response": raw})
             return PublishResult(success=False, error=f"知乎发布异常: {e}")
 
     async def health_check(self, account_id: int, credential: dict) -> AccountHealth:
@@ -266,47 +275,76 @@ class ZhihuPublisher(PublisherBase):
         await publish_btn.scroll_into_view_if_needed()
         await _random_delay(1, 2)
         url_before = page.url
-        await publish_btn.click()
-
-        # 等待 URL 变化（跳转到文章详情）
+        # 从调用最终发布按钮开始，远端可能已经接受写入。此后的任何本地
+        # DOM/URL/解析异常都不能再降级为可重试失败。
         try:
-            await page.wait_for_url("**/p/*", timeout=30000)
-        except Exception:
-            # 没拿到详情页跳转，再宽松判断 URL 是否变化
-            await asyncio.sleep(5)
-            if page.url == url_before:
+            await publish_btn.click()
+
+            # 等待 URL 变化（跳转到文章详情）
+            try:
+                await page.wait_for_url("**/p/*", timeout=30000)
+            except Exception:
+                # 没拿到详情页跳转，再宽松判断 URL 是否变化
+                await asyncio.sleep(5)
+                if page.url == url_before:
+                    return PublishResult(
+                        success=False,
+                        effect_applied=False,
+                        retryable=False,
+                        outcome_uncertain=True,
+                        error="提交后未跳转，可能未发布成功（被风控或表单问题）",
+                        raw_response={"write_started": True},
+                    )
+
+            article_url = page.url
+
+            # 闭环关键：判 /edit 后缀，草稿状态不算成功，防止虚假闭环
+            is_published, normalized_url = _check_published_url(article_url)
+            if not is_published:
+                draft_confirmed = bool(
+                    re.fullmatch(
+                        r"https?://zhuanlan\.zhihu\.com/p/\d+/edit/?",
+                        article_url,
+                    )
+                )
                 return PublishResult(
                     success=False,
-                    error="提交后未跳转，可能未发布成功（被风控或表单问题）",
+                    effect_applied=draft_confirmed,
+                    retryable=False,
+                    outcome_uncertain=not draft_confirmed,
+                    platform_url=article_url,
+                    error=f"知乎仍处于草稿状态或 URL 异常: {article_url}",
+                    raw_response={
+                        "final_url": article_url,
+                        "is_published": False,
+                        "write_started": True,
+                    },
                 )
 
-        article_url = page.url
+            # 提取 article_id（URL 已通过严格正则，rstrip 已在 _check_published_url 内做）
+            article_id = normalized_url.rsplit("/", 1)[-1]
 
-        # 闭环关键：判 /edit 后缀，草稿状态不算成功，防止虚假闭环
-        is_published, normalized_url = _check_published_url(article_url)
-        if not is_published:
             return PublishResult(
-                success=False,
-                platform_url=article_url,
-                error=f"知乎仍处于草稿状态或 URL 异常: {article_url}",
+                success=True,
+                effect_applied=True,
+                retryable=False,
+                platform_post_id=article_id,
+                platform_url=normalized_url,
                 raw_response={
                     "final_url": article_url,
-                    "is_published": False,
+                    "is_published": True,
+                    "write_started": True,
                 },
             )
-
-        # 提取 article_id（URL 已通过严格正则，rstrip 已在 _check_published_url 内做）
-        article_id = normalized_url.rsplit("/", 1)[-1]
-
-        return PublishResult(
-            success=True,
-            platform_post_id=article_id,
-            platform_url=normalized_url,
-            raw_response={
-                "final_url": article_url,
-                "is_published": True,
-            },
-        )
+        except Exception as exc:
+            return PublishResult(
+                success=False,
+                effect_applied=False,
+                retryable=False,
+                outcome_uncertain=True,
+                error=f"知乎发布写入后状态无法确认: {type(exc).__name__}",
+                raw_response={"write_started": True},
+            )
 
     async def collect_metrics(self, post_id: str, post_url, credential: dict) -> dict:
         """知乎文章数据采集：直接走 Web API（不需要签名，只要 cookie）。

@@ -11,11 +11,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from ai_ops.accounts.health_monitor import (
+    BAN_PAUSE_HOURS,
     compute_baseline,
     evaluate_after_metrics,
+    get_ban_probe_at,
     get_paused_until,
+    is_ban_probe_due,
     is_paused,
     pause_account,
+    recover_banned_account,
 )
 from ai_ops.core.enums import AccountHealth, JobStatus, Platform
 from ai_ops.core.models import Account, Article, Base, Metrics, PublishJob, Topic
@@ -85,7 +89,7 @@ def _mk_success_job_with_metric(
 # compute_baseline
 # ---------------------------------------------------------------------------- #
 def test_compute_baseline_empty(db_session):
-    topic = _mk_topic(db_session)
+    _mk_topic(db_session)
     acc = _mk_account(db_session)
     baseline = compute_baseline(db_session, acc.id, lookback_days=7)
     assert baseline["sample_size"] == 0
@@ -151,6 +155,58 @@ def test_is_paused_corrupt_value(db_session):
     acc2 = db_session.get(Account, acc.id)
     # 解析失败 → False（放行，避免误锁）
     assert is_paused(acc2) is False
+
+
+def test_banned_probe_boundary_is_inclusive(db_session):
+    """BANNED stays unprobeable before its deadline and becomes probeable at it."""
+    acc = _mk_account(db_session)
+    deadline = datetime(2026, 8, 10, 2, 0, 0)
+    acc.health = AccountHealth.BANNED
+    acc.profile = {"paused_until": deadline.isoformat(), "paused_reason": "risk"}
+    db_session.flush()
+
+    assert get_ban_probe_at(acc) == deadline
+    assert not is_ban_probe_due(acc, now=deadline - timedelta(microseconds=1))
+    assert is_ban_probe_due(acc, now=deadline)
+
+
+def test_legacy_banned_account_gets_seven_day_probe_deadline(db_session):
+    """Legacy worker bans without paused_until do not remain locked forever."""
+    acc = _mk_account(db_session)
+    banned_at = datetime(2026, 8, 1, 12, 0, 0)
+    acc.health = AccountHealth.BANNED
+    acc.profile = {}
+    acc.last_health_check_at = banned_at
+    db_session.flush()
+
+    expected = banned_at + timedelta(hours=BAN_PAUSE_HOURS)
+    assert get_ban_probe_at(acc) == expected
+    assert not is_ban_probe_due(acc, now=expected - timedelta(seconds=1))
+    assert is_ban_probe_due(acc, now=expected)
+
+    from ai_ops.accounts.manager import list_accounts
+
+    projected = list_accounts(db_session)[0]
+    assert projected.health_recheck_at == expected
+
+
+def test_recovery_rechecks_deadline_and_clears_pause(db_session):
+    acc = _mk_account(db_session)
+    deadline = datetime(2026, 8, 10, 2, 0, 0)
+    acc.health = AccountHealth.BANNED
+    acc.profile = {"paused_until": deadline.isoformat(), "paused_reason": "risk"}
+    db_session.flush()
+
+    assert not recover_banned_account(
+        db_session, acc.id, now=deadline - timedelta(seconds=1)
+    )
+    assert acc.health == AccountHealth.BANNED
+
+    assert recover_banned_account(db_session, acc.id, now=deadline)
+    assert acc.health == AccountHealth.HEALTHY
+    assert "paused_until" not in acc.profile
+    assert "paused_reason" not in acc.profile
+    assert acc.last_health_check_at == deadline
 
 
 # ---------------------------------------------------------------------------- #

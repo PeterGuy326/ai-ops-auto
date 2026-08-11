@@ -1,185 +1,98 @@
-# Metrics Feedback SOP（L5 监测层）
+# Metrics 与报表 SOP（Alpha）
 
-> 没有数据回流的运营是盲投。这一层是整个 5 层闭环的"反馈环"。**数据采集 → 中枢回写 → 日报 → 周报**，全链路走统一 CLI，按 cron 排程自动出报。
+本页描述当前代码能执行的指标/报表契约，以及尚未完成的边界。它不是跨平台数据飞轮的
+完成声明；逐平台能力以[平台能力矩阵](platform-capabilities.md)为准。
 
-## 一、指标定义
+## 当前数据链
 
-| 平台 | 核心指标 | 互动指标 |
-|---|---|---|
-| 小红书 | 展示量、阅读量 | 点赞、收藏、评论、分享 |
-| 头条号 | 推荐量、阅读量 | 点赞、评论、转发 |
-| 公众号 | 阅读量 | 点赞、在看、收藏、转发 |
+```text
+Publisher result
+   | optional initial_metadata
+   v
+Metrics row (source=initial)
 
-回流粒度：**(account_id, content_id, platform)**——每个 row_id 一行数据，跟账号矩阵对齐。
-
-T+1 拉取，通过 `your_cli content update` 写入中枢对应行（详见 [content-package-format.md](./content-package-format.md)）。
-
-## 二、获取方式（优先级降序）
-
-```
-[最优] 平台官方 API
-   ↓ 大部分平台无开放 API
-[次选] 创作者后台爬虫（复用 sau cookie + patchright 直爬）
-   ↓ 反爬严重时
-[兜底] IM 提醒人工录入，配置文件/中枢一键提交
+successful PublishJob with platform_post_id
+   | manual collect or in-memory 1h/24h/7d callback
+   v
+Publisher.collect_metrics
+   v
+Metrics row (source=manual/scheduled) -> topic heat / health evaluation
+   v
+daily / weekly local Markdown report
 ```
 
-各平台现状（按你自己环境 verify）：
+只有同时满足以下条件时，某个 job 才有真实指标回流：
 
-| 平台 | API | profile 复用 |
-|---|---|---|
-| 小红书 | 无开放 API | 复用 L4 的 Chrome profile 爬创作者后台 |
-| 头条号 | 有"创作中心"数据接口（需登录态） | 复用 L4 profile |
-| 公众号 | 有数据接口（需 token） | 复用 L4 profile |
+1. Publisher 能确认发布成功，并返回可验证的 `platform_post_id`（可选 `platform_url`）。
+2. 该 Publisher 实现了真实 `collect_metrics`，而不是基类的空结果。
+3. 登录态/平台 API 仍可用，并且采集结果通过平台特定校验。
 
-## 三、采集频率
+缺任一条件时，控制面可以保存 job 和生成报表，但数据不代表真实平台表现。
 
-| 数据 | 频率 | 触发方式 |
-|---|---|---|
-| 发布后 24h 内 | 每 4 小时一次 | 抓"首日爆款"曲线 |
-| 发布后 24h-7d | 每天一次 | 抓"长尾"曲线 |
-| 发布 7d 之后 | 不再追，status 推进到 `stat-locked` | 数据稳定 |
+## 数据模型
 
-实现：cron 定时跑 `your_cli metrics pull` → 内部调 `your_cli content update` 批量回写。
+`Metrics` 通过 `job_id` 关联 `PublishJob`，保存：
 
-## 四、自动出报：日报
+- `views`、`likes`、`comments`、`shares`
+- `source`：`initial`、`manual` 或 `scheduled`
+- `raw`：适配器返回的已允许原始字段
+- `collected_at`
 
-每日 18:00 自动跑 `your_cli report daily`，内部调用日志/日报模板：
+`Account`、`Article` 和平台侧 post identity 通过 PublishJob 间接关联。不同平台对“阅读/播放/展示”
+的定义并不一致；当前只做基础字段归一化，不提供可直接比较的跨平台 ROI/CPM 结论。
+
+## 手动采集
+
+对已有 `platform_post_id` 的成功 job，可用鉴权 API 显式采集：
 
 ```bash
-your_cli report daily \
-  --template "ops-daily-report" \
-  --date $(date +%Y-%m-%d) \
-  --content-file ./daily-report-$(date +%Y-%m-%d).md
+curl -fsS -X POST \
+  -H "X-API-Key: <redacted>" \
+  http://127.0.0.1:8000/jobs/<job_id>/collect
 ```
 
-日报内容（从中枢聚合）：
+返回 `skipped=true` 时，按 `reason` 检查 post identity、凭证和 Publisher。HTTP 成功不等于指标
+一定来自真实平台；还需结合能力矩阵和 adapter evidence。
 
-```
-[运营日报] {date}
+## 自动采集边界
 
-今日发布：{N} 条
-  - 小红书：{n_xhs}（{accounts}）
-  - 头条号：{n_tt}
-  - 公众号：{n_gzh}
+发布成功后，代码会尝试注册 1h/24h/7d 三个 APScheduler callback。当前这些 callback 是
+**内存任务**，不像 PublishJob 一样持久化：
 
-今日发布主题分布：
-  - 产品介绍：{n} / 功能教程：{n} / 集成玩法：{n}
-  - 客户故事：{n} / 版本动态：{n} / 社群运营：{n}
+- worker 重启可能丢失尚未触发的回采计划。
+- API 进程不持有 scheduler；显式 API 发布不应被理解为自动回采有保证。
+- 没有 post identity 或真实 collector 的平台会跳过或写出无业务价值的数据。
 
-24h 内表现 TOP 3：
-  1. 《{title}》- {account_id} - {platform} - {views} 展示 / {engagement} 互动
-  2. ...
+因此关键运营数据应通过人工核验/回填或外部持久采集器补齐，直到 Metrics 任务也进入数据库账本。
 
-发布失败：{n_fail}（需人工处理）
-登录态失效账号：{accounts}
-```
+## 日报和周报
 
-## 五、自动出报：周报
-
-每周一上午 9:00 自动跑 `your_cli report weekly`，内部写入 Wiki/知识库或本地归档：
+本地报表命令已经实现：
 
 ```bash
-your_cli report weekly \
-  --path /ops/weekly/$(date +%Y-W%V).md \
-  --content-file ./weekly-report.md \
-  && your_cli notify webhook \
-  --url $WEBHOOK_OPS \
-  --text "本周宣发周报已生成：{{wiki_link_template}}/$(date +%Y-W%V)"
+ai-ops report daily --date 2026-08-10 --out-dir ./reports --no-notify
+ai-ops report weekly --week 2026-W33 --out-dir ./reports --no-notify
 ```
 
-周报模板：
+不传日期时使用 UTC 日期。`ai-ops worker` 会按 `SCHEDULER_TIMEZONE` 注册每日 18:00 日报和
+每周一 09:00 周报，并尝试通过已配置的通知 adapter 发送就绪消息。
 
-```
-[宣发周报] W{N}（{date_start} - {date_end}）
+报表只聚合数据库已有记录。空指标、缺失指标或来源不同的数据不会因为生成 Markdown 就变得完整；
+阅读报表时必须同时看数据覆盖率和 `source`。
 
-本周发文：{N} 篇 × {M} 账号 = {N*M} 条投放
-总曝光：{total_views}（同比 {±X}%）
-总互动：{total_engagement}（同比 {±X}%）
+## 运营核对清单
 
-主题 ROI 排行：
-  1. 集成玩法：CPM {x}，互动率 {y}%（建议加大）
-  2. 功能教程：CPM {x}，互动率 {y}%
-  3. ...
+1. 对照平台能力矩阵确认该 Publisher 是否有真实采集证据。
+2. 核对 job 的 post id/url，避免把草稿页或发布页 URL 当公开内容。
+3. 记录 collector/upstream commit、采集时间、账号类型和平台字段定义。
+4. 对异常的 0 值先判断“真实为 0”还是“采集缺失”，不要直接优化内容策略。
+5. 报表通知失败时检查本地 `reports/`；通知不是报表成功的唯一证据。
+6. 不在日志、报表或 Issue 中保存 cookie、token、个人账号信息或平台原始敏感响应。
 
-爆款 TOP 3（按 互动率 排序）：
-  1. 《{title}》| {topic} | {platform} | {account_id}
-  2. ...
-  3. ...
+## 待办
 
-账号矩阵表现：
-  - 最高 ROI 账号：{account_id}（建议加投）
-  - 最低 ROI 账号：{account_id}（建议人设 review）
-
-product_features 热度：
-  - feature_a：{n} 篇 / {views} 曝光
-  - feature_b：{n} / {views}
-  - integration-llm：{n} / {views}
-  - ...
-
-prompt 归因：
-  - 高分模式："{successful_prompt_pattern}"
-  - 低分模式："{failed_prompt_pattern}"
-
-下周计划：
-  - 复用模式：{pattern}
-  - 实验方向：{hypothesis}
-  - 重点 push 的 product_features：{features}
-```
-
-## 六、闭环到 L1（最关键）
-
-**数据驱动 prompt 迭代**是整个 SOP 的反馈环：
-
-```
-L5 数据回流（中枢） → 识别高/低 ROI 模式 → 反哺 L3 prompt → 影响 L1 主题选题 → 下次更准
-```
-
-具体机制：
-
-- 每月一次 prompt 迭代会，review 周报合集
-- 高 ROI product_features → 加入下个月 L1 选题排期
-- 高 ROI 风格 → 加入 prompt 的"推荐范式"section
-- 低 ROI 风格 → 加入 prompt 的"避免范式"section
-- 平台算法变化（如小红书禁某些词）→ 触发 prompt review（不超过 2 周一次），结论归档到 `/ops/incidents/`
-
-迭代痕迹沉淀在：
-
-```
-prompts/platform_style/xiaohongshu-style.md   # 当前版本
-prompts/archive/xiaohongshu-v0.md             # 历史版本
-prompts/xiaohongshu-failures.md               # 失败案例库
-```
-
-镜像同步到 Wiki/知识库的 `/ops/prompts/`，非工程同学也能查。
-
-## 七、风险与对策
-
-| 风险 | 对策 |
-|---|---|
-| 反爬升级让数据停摆 | 兜底 → IM 提醒人工录入，不阻塞业务 |
-| 数据时延（T+0 困难） | 接受 T+1，T+0 不在 MVP 范围 |
-| 指标主义陷阱 | 周报必须包含"互动质量观察"段落，不只看数字 |
-| Cookie 过期 | 自动检测 + IM 通知触发重新登录 |
-| 日报/周报调用失败 | 报表本地兜底落到 `./reports/` 目录，事后 retry |
-
-## 八、跟其他层的接口
-
-| 来源 | 数据流 | 接口 |
-|---|---|---|
-| L4 发布层 | 提供 `published_url, published_at` | `your_cli content query --filter status=published` |
-| L5 自身 | 写 `views, likes, ..., last_synced_at` | `your_cli content update` × N |
-| L5 → 日报 | 当日汇总 | `your_cli report daily --template ops-daily-report` |
-| L5 → 周报 | 周回顾 | `your_cli report weekly --path /ops/weekly/...` |
-| L5 → 群通知 | 周报发布提醒 | `your_cli notify webhook --url $WEBHOOK_OPS` |
-| L1 prompt 迭代 | 读 wiki 月度合集 | 人工 review + 改 prompts/*.md + 镜像回 wiki |
-
-## 九、待办（参考）
-
-- [ ] 确认各平台数据源（API / 爬虫 / 手动），更新本文档表格
-- [ ] 实现 `your_cli metrics pull` 定时拉数脚本
-- [ ] 实现 `your_cli report daily` 自动出日报
-- [ ] 实现 `your_cli report weekly` 自动出周报
-- [ ] 日报模板预创建
-- [ ] Wiki/知识库目录树预创建（`/ops/weekly/`、`/ops/prompts/`、`/ops/incidents/`）
-- [ ] prompt 迭代会的 SOP（每月做、做什么、产出什么），结论归档到 Wiki
+- 将 1h/24h/7d 指标节点持久化，支持重启恢复和去重。
+- 为每个平台记录指标字段语义、最后验证日期和数据质量等级。
+- 增加覆盖率/缺失率，让报表区分“0”和“未知”。
+- 建立人工回填与来源标记，不让手填数据冒充自动采集。
+- 在证据充分后再做跨平台归一化和 Agent 绩效复盘契约。

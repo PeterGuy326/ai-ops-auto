@@ -7,18 +7,39 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+from contextvars import ContextVar
+from datetime import datetime, timedelta
 
-from ..accounts.health_monitor import get_paused_until, is_paused
+from sqlalchemy import select, update
+
+from ..accounts.health_monitor import (
+    BAN_PAUSE_HOURS,
+    get_paused_until,
+    is_paused,
+    pause_account,
+)
 from ..accounts.manager import check_rate_limit, get_credential, mark_published, update_health
 from ..core.db import session_scope
 from ..core.dedup import is_too_similar
 from ..core.enums import AccountHealth, ArticleStatus, ContentType, JobStatus, Platform
 from ..core.models import Account, Article, Metrics, PublishJob
 from ..core.schemas import PublishContent, PublishResult
+from ..core.time import as_utc_naive
+from ..config import settings
 from ..observability import get_logger
 from ..observability.sentry import capture_exception
 from ..publishers.registry import default_registry
+from ..runtime.receipts import (
+    new_operation_id,
+    read_publish_receipt,
+    remove_publish_receipt,
+    write_publish_receipt,
+)
+from ..runtime.account_lease import (
+    AccountOperationLease,
+    AccountOperationLeaseTimeout,
+)
 # parse_count 已沉到 core/parsers（TD-Z3-debt 闭环, 2026 Q2）：
 # 通用 UI 数字解析（"1.2万" / "3.5k" → int）是基础设施层，不该绑在 publisher 实现里。
 # 上 sprint 用 `from ..publishers.toutiao import _parse_count` 是反向依赖（L5 调 L4），
@@ -34,81 +55,546 @@ TAINT_PATTERNS: tuple[str, ...] = ("TODO", "未替换占位符", "过期版本�
 
 # simhash 拦截阈值：与该账号 7d 内已发布 article.body 的 hamming 距离 < 此值即视为重复。
 # 对齐 docs/anti-risk.md §63 设定的"相似度 > 0.85"，64 位 simhash 下约 8 bit。
-SIMHASH_HAMMING_THRESHOLD = 8
+SIMHASH_HAMMING_THRESHOLD = settings.simhash_hamming_threshold
 SIMHASH_LOOKBACK_DAYS = 7
+
+# A PublishJob is claimed with one conditional UPDATE before any publisher is
+# entered.  Keeping this list deliberately small makes every other state
+# terminal/non-runnable from execute_job's point of view.
+CLAIMABLE_JOB_STATUSES: tuple[JobStatus, ...] = (
+    JobStatus.PENDING,
+    JobStatus.RETRYING,
+)
+NONTERMINAL_JOB_STATUSES: frozenset[JobStatus] = frozenset(
+    {JobStatus.PENDING, JobStatus.RUNNING, JobStatus.RETRYING}
+)
+
+INTERRUPTED_EXECUTION_ERROR = (
+    "发布执行被中断，平台结果未知；请先在平台核验，再手动重发"
+)
+TIMED_OUT_EXECUTION_ERROR = (
+    "发布执行超时，平台结果未知；请先在平台核验，再手动重发"
+)
+PERSISTENCE_EXECUTION_ERROR = (
+    "发布结果写库失败，平台结果未知；请先在平台核验，再手动重发"
+)
+PERSISTENCE_CONFIRMED_EFFECT_ERROR = (
+    "平台写入回执已确认，但控制面写库失败；已保留发布标识，请人工对账，禁止重发"
+)
+UNCONFIRMED_EXECUTION_ERROR = (
+    "发布器未能确认写入结果，平台结果未知；请先在平台核验，再手动重发"
+)
+PREWRITE_CANCELLED_ERROR = "发布尚未开始：等待账号操作锁时任务被取消"
+
+# Carries the already-redacted adapter result across the final DB transaction.
+# ContextVar keeps concurrent async jobs isolated.  If commit/finalization
+# raises, execute_job can still preserve a confirmed post ID/URL instead of
+# replacing the only receipt with a generic "unknown" marker.
+_FINALIZING_RESULT: ContextVar[PublishResult | None] = ContextVar(
+    "ai_ops_finalizing_publish_result",
+    default=None,
+)
+
+
+def _retry_delay_seconds(attempts: int) -> int:
+    """Return deterministic exponential retry delay for a completed attempt."""
+    base = max(1, int(getattr(settings, "job_retry_base_seconds", 60)))
+    # Cap at one hour: a broken publisher must not create an ever-growing delay,
+    # while the account still gets enough breathing room after repeated failures.
+    return min(base * (2 ** max(0, attempts - 1)), 3600)
+
+
+def _claim_job(session, job_id: int, *, now: datetime) -> PublishJob | None:
+    """Atomically move one runnable job to RUNNING and increment attempts.
+
+    This is a database compare-and-swap, not an ORM read-then-write.  It works on
+    both SQLite and PostgreSQL and ensures concurrent callbacks/scanners cannot
+    both enter the external publisher.
+    """
+    account_id = session.scalar(
+        select(PublishJob.account_id).where(PublishJob.id == job_id)
+    )
+    if account_id is None:
+        return None
+
+    # Serialize admission for one account on databases that support row locks.
+    # This closes the gap where two different jobs pass min-interval/quota checks
+    # before either one records a successful publish. SQLite remains supported by
+    # its single-writer behavior and the documented single-worker topology.
+    session.scalar(
+        select(Account.id)
+        .where(Account.id == account_id)
+        .with_for_update()
+    )
+    other_running = session.scalar(
+        select(PublishJob.id)
+        .where(PublishJob.account_id == account_id)
+        .where(PublishJob.status == JobStatus.RUNNING)
+        .where(PublishJob.id != job_id)
+        .limit(1)
+    )
+    if other_running is not None:
+        return None
+
+    claimed = session.execute(
+        update(PublishJob)
+        .where(PublishJob.id == job_id)
+        .where(PublishJob.status.in_(CLAIMABLE_JOB_STATUSES))
+        .values(
+            status=JobStatus.RUNNING,
+            started_at=now,
+            finished_at=None,
+            attempts=PublishJob.attempts + 1,
+        )
+    )
+    if claimed.rowcount != 1:
+        return None
+    job = session.get(PublishJob, job_id)
+    if job is not None:
+        session.refresh(job)
+    return job
+
+
+def _sync_article_status(session, article_id: int) -> ArticleStatus | None:
+    """Aggregate all fan-out job states into the owning Article lifecycle."""
+    # Serialize sibling aggregation so the last completing fan-out branch always
+    # observes prior committed siblings and performs the terminal Article update.
+    article = session.scalar(
+        select(Article)
+        .where(Article.id == article_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if article is None:
+        return None
+
+    # SessionLocal has autoflush=False; flush the just-finished job before reading
+    # sibling states, otherwise aggregation can observe its previous status.
+    session.flush()
+    raw_statuses = session.scalars(
+        select(PublishJob.status)
+        .where(PublishJob.article_id == article_id)
+        # A failed job replaced by republish_job is historical evidence, not an
+        # active fan-out branch.  Counting it would keep a successfully replaced
+        # article DEAD forever.
+        .where(PublishJob.superseded_by_job_id.is_(None))
+    ).all()
+    statuses = [JobStatus(value) for value in raw_statuses]
+    if not statuses:
+        return article.status
+
+    if all(status == JobStatus.SUCCESS for status in statuses):
+        article.status = ArticleStatus.PUBLISHED
+    elif any(status in NONTERMINAL_JOB_STATUSES for status in statuses):
+        # A DEAD sibling does not make the article terminal while another fan-out
+        # job is still runnable.  Operators should see that work remains active.
+        article.status = ArticleStatus.PUBLISHING
+    elif any(status == JobStatus.DEAD for status in statuses):
+        article.status = ArticleStatus.DEAD
+    elif any(status == JobStatus.FAILED for status in statuses):
+        article.status = ArticleStatus.FAILED
+    else:  # defensive fallback for future JobStatus values
+        article.status = ArticleStatus.FAILED
+    session.flush()
+    return article.status
+
+
+def _finish_failed_attempt(
+    session,
+    job: PublishJob,
+    error: str,
+    *,
+    now: datetime | None = None,
+    retryable: bool = True,
+) -> None:
+    """Persist one failed attempt, including its durable next execution time."""
+    finished_at = now or datetime.utcnow()
+    job.error = error
+    job.finished_at = finished_at
+    if retryable and job.attempts < job.max_attempts:
+        job.status = JobStatus.RETRYING
+        job.scheduled_at = finished_at + timedelta(
+            seconds=_retry_delay_seconds(job.attempts)
+        )
+    elif retryable:
+        job.status = JobStatus.DEAD
+        job.scheduled_at = None
+        # Health escalation counts recent DEAD rows; autoflush is disabled, so
+        # make the current exhausted attempt visible to that aggregate query.
+        session.flush()
+        _escalate_health_on_failure(session, job.account_id)
+    else:
+        job.status = JobStatus.FAILED
+        job.scheduled_at = None
+    _sync_article_status(session, job.article_id)
+
+
+def _defer_without_consuming_attempt(
+    session,
+    job: PublishJob,
+    error: str,
+    *,
+    retry_at: datetime,
+) -> None:
+    """Persist a policy deferral without spending a publisher attempt."""
+    now = datetime.utcnow()
+    job.attempts = max(0, job.attempts - 1)  # undo the CAS reservation
+    job.status = JobStatus.RETRYING
+    job.error = error
+    job.finished_at = now
+    job.scheduled_at = max(retry_at, now + timedelta(seconds=1))
+    _sync_article_status(session, job.article_id)
+
+
+def mark_running_job_uncertain(
+    job_id: int,
+    error: str,
+    *,
+    now: datetime | None = None,
+    started_before: datetime | None = None,
+    known_result: PublishResult | None = None,
+) -> bool:
+    """Fail-close one interrupted RUNNING job without blindly publishing again.
+
+    An external platform may have accepted a post before this process was
+    cancelled or crashed. Retrying that same row automatically could therefore
+    duplicate an irreversible side effect. The conditional update also makes a
+    late recovery pass harmless when another execution already completed.
+    """
+    finished_at = now or datetime.utcnow()
+    with session_scope() as session:
+        row = session.execute(
+            select(
+                PublishJob.article_id,
+                PublishJob.raw_response,
+                PublishJob.publisher_kind,
+                PublishJob.platform_post_id,
+                PublishJob.platform_url,
+            ).where(PublishJob.id == job_id)
+        ).one_or_none()
+        if row is None:
+            return False
+        article_id, prior_raw, prior_kind, prior_post_id, prior_url = row
+        raw_response = dict(prior_raw or {})
+        operation_id = raw_response.get("operation_id")
+        receipt = (
+            read_publish_receipt(job_id, operation_id)
+            if isinstance(operation_id, str)
+            else None
+        )
+
+        platform_post_id: str | None = prior_post_id
+        platform_url: str | None = prior_url
+        publisher_kind = str(prior_kind or "")[:64]
+        effect_applied = False
+        outcome_uncertain = True
+        if known_result is not None:
+            raw_response.update(dict(known_result.raw_response or {}))
+            platform_post_id = known_result.platform_post_id
+            platform_url = known_result.platform_url
+            publisher_kind = str(raw_response.get("publisher_kind") or "")
+            effect_applied = bool(known_result.effect_applied)
+            outcome_uncertain = bool(known_result.outcome_uncertain)
+        elif receipt is not None:
+            receipt_raw = receipt.get("raw_response")
+            if isinstance(receipt_raw, dict):
+                raw_response.update(receipt_raw)
+            post_id = receipt.get("platform_post_id")
+            post_url = receipt.get("platform_url")
+            platform_post_id = post_id if isinstance(post_id, str) else None
+            platform_url = post_url if isinstance(post_url, str) else None
+            publisher_kind = str(receipt.get("publisher_kind") or "")[:64]
+            effect_applied = bool(receipt.get("effect_applied"))
+            outcome_uncertain = bool(receipt.get("outcome_uncertain"))
+            raw_response["receipt_recovered"] = True
+
+        # With no side-effect receipt, an interrupted RUNNING call is unknown.
+        # A known effect is still terminal and requires reconciliation, but its
+        # post identity must not be erased or mislabeled as safe to retry.
+        if effect_applied:
+            error = PERSISTENCE_CONFIRMED_EFFECT_ERROR
+        raw_response["outcome_uncertain"] = outcome_uncertain
+        raw_response["effect_applied"] = effect_applied
+        raw_response["reconciliation_required"] = True
+
+        conditions = [
+            PublishJob.id == job_id,
+            PublishJob.status == JobStatus.RUNNING,
+        ]
+        if started_before is not None:
+            conditions.append(
+                (PublishJob.started_at.is_(None))
+                | (PublishJob.started_at <= started_before)
+            )
+        updated = session.execute(
+            update(PublishJob)
+            .where(*conditions)
+            .values(
+                status=JobStatus.FAILED,
+                error=error,
+                finished_at=finished_at,
+                scheduled_at=None,
+                raw_response=raw_response,
+                platform_post_id=platform_post_id,
+                platform_url=platform_url,
+                publisher_kind=publisher_kind,
+            )
+        )
+        if updated.rowcount != 1:
+            return False
+        _sync_article_status(session, article_id)
+        return True
+
+
+def _best_effort_mark_uncertain(
+    job_id: int,
+    error: str,
+    *,
+    scope: str,
+    known_result: PublishResult | None = None,
+) -> bool:
+    """Preserve the caller's control flow even if reconciliation storage fails."""
+    try:
+        return mark_running_job_uncertain(job_id, error, known_result=known_result)
+    except Exception as reconciliation_error:
+        logger.exception(
+            "worker could not persist unknown platform outcome",
+            extra={"job_id": job_id, "scope": scope},
+        )
+        try:
+            capture_exception(
+                reconciliation_error,
+                scope=scope,
+                job_id=job_id,
+            )
+        except Exception:
+            logger.exception(
+                "worker could not report reconciliation failure",
+                extra={"job_id": job_id, "scope": scope},
+            )
+        return False
 
 
 def schedule_job_runs(jobs, *, default_when: datetime | None = None) -> list[tuple[int, datetime]]:
-    """把一批 PublishJob 排期到调度器自动执行（分发→真发布的接线）。
+    """Persist jittered run times and optionally register in-memory callbacks.
 
-    复用 queue.schedule_publish 的 jitter + 凌晨保护 + 风控间隔；每条 job 按其
-    scheduled_at（缺省用 default_when 或 now）排期，到点自动调 execute_job。
-
-    容错：调度后端未启动 / 无事件循环（如单测、CLI）时静默跳过，不阻塞建记录——
-    真发布在 API 进程（lifespan 已 queue.start()）里才需要。
+    The durable ``scheduled_at`` value is authoritative.  This prevents the
+    database scanner from observing the pre-jitter planned time and publishing
+    early.  APScheduler is only a latency optimization when it is running in the
+    dedicated worker; restart recovery never depends on its in-memory callback.
     """
+    if not bool(getattr(settings, "auto_publish_enabled", False)):
+        logger.info("schedule_job_runs: auto publish disabled; jobs remain pending")
+        return []
+
     from .queue import queue
+    from .jitter import jitter_publish_time
 
     planned_base = default_when or datetime.utcnow()
     out: list[tuple[int, datetime]] = []
     for j in jobs:
-        when = getattr(j, "scheduled_at", None) or planned_base
+        when = as_utc_naive(getattr(j, "scheduled_at", None) or planned_base)
         try:
-            _sid, actual = queue.schedule_publish(
-                when, (lambda jid=j.id: execute_job(jid)), job_id=f"pub-{j.id}"
+            actual = jitter_publish_time(when)
+        except Exception as e:
+            logger.warning(
+                "schedule_job_runs: jitter failed for job %s (%s); using planned time",
+                getattr(j, "id", "?"),
+                e,
             )
-            out.append((j.id, actual))
+            actual = when
+
+        # Jobs returned by distributor.distribute are attached to the caller's
+        # session, so this assignment is committed with the API transaction.
+        # It also keeps detached/CLI objects truthful for their caller.
+        j.scheduled_at = actual
+        out.append((j.id, actual))
+
+        if not bool(getattr(getattr(queue, "_scheduler", None), "running", False)):
+            continue
+        try:
+            queue.schedule_once(
+                actual,
+                (lambda jid=j.id: execute_job(jid)),
+                job_id=f"pub-{j.id}",
+            )
         except Exception as e:  # 无 loop / 调度器未启 → 跳过，不影响记录
             logger.warning("schedule_job_runs: skipped job %s (%s)", getattr(j, "id", "?"), e)
     return out
 
 
 async def execute_job(job_id: int) -> PublishResult:
-    """执行一个 PublishJob。"""
+    """Run one job and fail-close unexpected post-claim persistence errors."""
+    result_token = _FINALIZING_RESULT.set(None)
+    try:
+        return await _execute_job_once(job_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        known_result = _FINALIZING_RESULT.get()
+        persistence_error = (
+            PERSISTENCE_CONFIRMED_EFFECT_ERROR
+            if known_result is not None and known_result.effect_applied
+            else PERSISTENCE_EXECUTION_ERROR
+        )
+        marked = _best_effort_mark_uncertain(
+            job_id,
+            persistence_error,
+            scope="worker.finalize_unknown_outcome",
+            known_result=known_result,
+        )
+        logger.exception(
+            "worker execution crashed outside publisher boundary",
+            extra={"job_id": job_id, "marked_failed": marked},
+        )
+        try:
+            capture_exception(
+                exc,
+                scope="worker.execute_job",
+                job_id=job_id,
+            )
+        except Exception:
+            logger.exception(
+                "worker could not report execution failure",
+                extra={"job_id": job_id},
+            )
+        if known_result is not None:
+            raw_response = dict(known_result.raw_response or {})
+            raw_response["reconciliation_required"] = True
+            raw_response["persistence_failed"] = True
+            return PublishResult(
+                success=False,
+                effect_applied=known_result.effect_applied,
+                retryable=False,
+                outcome_uncertain=known_result.outcome_uncertain,
+                platform_post_id=known_result.platform_post_id,
+                platform_url=known_result.platform_url,
+                error=persistence_error,
+                raw_response=raw_response,
+            )
+        return PublishResult(
+            success=False,
+            retryable=False,
+            outcome_uncertain=True,
+            error=PERSISTENCE_EXECUTION_ERROR,
+        )
+    finally:
+        _FINALIZING_RESULT.reset(result_token)
+
+
+async def _execute_job_once(job_id: int) -> PublishResult:
+    """Execute one job after a database-level conditional claim.
+
+    Explicit calls are intentionally allowed even when automatic publishing is
+    disabled.  The API/CLI authorization layer owns that human-triggered action;
+    only automatic scheduling/scanning is guarded by ``auto_publish_enabled``.
+    """
     with session_scope() as s:
-        job: PublishJob | None = s.get(PublishJob, job_id)
-        if job is None:
+        existing: PublishJob | None = s.get(PublishJob, job_id)
+        if existing is None:
             return PublishResult(success=False, error=f"job {job_id} 不存在")
+
+        job = _claim_job(s, job_id, now=datetime.utcnow())
+        if job is None:
+            # Another worker already claimed it, or it is terminal.  This path
+            # never reaches credential loading/the external publisher.
+            s.refresh(existing)
+            return PublishResult(
+                success=False,
+                error=f"job {job_id} 当前状态 {existing.status}，不可执行",
+            )
 
         article: Article | None = s.get(Article, job.article_id)
         if article is None:
-            job.status = JobStatus.FAILED
-            job.error = "article 缺失"
-            return PublishResult(success=False, error=job.error)
+            error = "article 缺失"
+            _finish_failed_attempt(s, job, error, retryable=False)
+            return PublishResult(success=False, error=error)
+
+        # Claim is the point where an article leaves SCHEDULED.  Fan-out
+        # aggregation keeps it PUBLISHING until every sibling has succeeded.
+        _sync_article_status(s, article.id)
 
         # 风控限流校验（养号期 + 间隔 + 单日上限）
-        gate = check_rate_limit(s, job.account_id)
+        gate = check_rate_limit(s, job.account_id, exclude_job_id=job.id)
         if not gate.allowed:
-            job.status = JobStatus.FAILED
-            job.error = f"rate-limit: {gate.reason}"
-            return PublishResult(success=False, error=job.error)
+            error = f"rate-limit: {gate.reason}"
+            if gate.retry_at is not None:
+                _defer_without_consuming_attempt(
+                    s,
+                    job,
+                    error,
+                    retry_at=gate.retry_at,
+                )
+            else:
+                _finish_failed_attempt(s, job, error, retryable=False)
+            return PublishResult(success=False, error=error)
 
         # 风控降权暂停期检查（health_monitor 写入 account.profile["paused_until"]）
         account = s.get(Account, job.account_id)
         if account is not None and is_paused(account):
             until = get_paused_until(account)
-            job.status = JobStatus.FAILED
-            job.error = f"账号暂停中至 {until.isoformat() if until else 'unknown'}"
-            return PublishResult(success=False, error=job.error)
+            error = f"账号暂停中至 {until.isoformat() if until else 'unknown'}"
+            if until is not None:
+                _defer_without_consuming_attempt(s, job, error, retry_at=until)
+            else:
+                _finish_failed_attempt(s, job, error)
+            return PublishResult(success=False, error=error)
+
+        # Health is an execution gate, not merely a dashboard label. Jobs may
+        # have been scheduled before a health check changed the account, so the
+        # worker must re-check immediately before loading credentials or
+        # entering a publisher. UNKNOWN remains allowed for newly-added
+        # accounts; DEGRADED/BANNED/EXPIRED require an operator/health check to
+        # restore the account before a new job is created or manually retried.
+        if account is None:
+            error = "account 缺失"
+            _finish_failed_attempt(s, job, error, retryable=False)
+            return PublishResult(success=False, retryable=False, error=error)
+        account_health = AccountHealth(account.health)
+        if account_health not in {AccountHealth.HEALTHY, AccountHealth.UNKNOWN}:
+            error = f"账号健康状态 {account_health.value}，禁止发布"
+            _finish_failed_attempt(s, job, error, retryable=False)
+            return PublishResult(success=False, retryable=False, error=error)
 
         # 内容层前置兜底：TAINT 词 + simhash 查重。
         # 任何一个命中即 fail-fast，不再消耗下游的解密 / 浏览器开销。
         ok, pre_err = _pre_publish_check(s, job, article)
         if not ok:
-            job.status = JobStatus.FAILED
-            job.error = pre_err
-            job.finished_at = datetime.utcnow()
+            _finish_failed_attempt(
+                s,
+                job,
+                pre_err or "内容检查失败",
+                retryable=False,
+            )
             return PublishResult(success=False, error=pre_err)
 
         try:
             credential = get_credential(s, job.account_id)
-        except ValueError as e:
-            job.status = JobStatus.FAILED
-            job.error = str(e)
-            return PublishResult(success=False, error=str(e))
+        except ValueError:
+            # 部分适配器（SAU / Camoufox / GitHub Pages）依赖 account_name、
+            # 持久化浏览器 profile 或本机 git 状态，本来就没有 cookie/token。
+            # 凭证是否必需由 publisher 判定；编排层传空 dict 让它给出
+            # 平台特定结果，不在 registry 之前误杀磁盘态适配器。
+            credential = {}
 
-        platform = Platform(job.platform)
+        try:
+            platform = Platform(job.platform)
+        except ValueError:
+            error = f"未知平台: {job.platform}"
+            _finish_failed_attempt(s, job, error, retryable=False)
+            return PublishResult(success=False, error=error)
+        operation_id = new_operation_id()
+        claim_response = dict(job.raw_response or {})
+        claim_response.update(
+            {
+                "operation_id": operation_id,
+                "operation_attempt": job.attempts,
+            }
+        )
+        job.raw_response = claim_response
         content = _build_content(article)
+        content.job_id = job.id
+        content.operation_id = operation_id
 
         # 小红书图文：发布前对图片做反指纹处理（EXIF/微裁剪/微旋转/调色）
         # 仅对 XIAOHONGSHU + IMAGE_TEXT 执行，规避其它平台回归
@@ -133,21 +619,133 @@ async def execute_job(job_id: int) -> PublishResult:
                     account_id=job.account_id,
                 )
 
-        job.status = JobStatus.RUNNING
-        job.started_at = datetime.utcnow()
-        job.attempts += 1
-        s.flush()
+        # Snapshot primitives before the session closes.  The CAS transaction is
+        # committed before the external call so other workers observe RUNNING.
+        account_id = job.account_id
 
     # 跳出 session 调外部工具，避免长事务
-    result = await _try_publishers(platform, job.account_id, credential, content)
+    execution_uncertain = False
+    write_lease_acquired = False
+    try:
+        timeout_seconds = float(
+            getattr(settings, "job_execution_timeout_seconds", 1800)
+        )
+        lock_timeout = float(
+            getattr(settings, "account_operation_lock_timeout_seconds", 120)
+        )
+        async with AccountOperationLease(
+            account_id,
+            timeout_seconds=lock_timeout,
+        ):
+            write_lease_acquired = True
+            publish_call = _try_publishers(platform, account_id, credential, content)
+            if timeout_seconds > 0:
+                result = await asyncio.wait_for(publish_call, timeout=timeout_seconds)
+            else:
+                result = await publish_call
+    except asyncio.CancelledError:
+        if not write_lease_acquired:
+            _best_effort_mark_uncertain(
+                job_id,
+                PREWRITE_CANCELLED_ERROR,
+                scope="worker.cancel_before_publish",
+                known_result=PublishResult(
+                    success=False,
+                    effect_applied=False,
+                    retryable=False,
+                    outcome_uncertain=False,
+                    error=PREWRITE_CANCELLED_ERROR,
+                    raw_response={"write_started": False},
+                ),
+            )
+            raise
+        marked = _best_effort_mark_uncertain(
+            job_id,
+            INTERRUPTED_EXECUTION_ERROR,
+            scope="worker.cancel_unknown_outcome",
+        )
+        logger.warning(
+            "worker execution cancelled; platform outcome is unknown",
+            extra={"job_id": job_id, "marked_failed": marked},
+        )
+        raise
+    except AccountOperationLeaseTimeout:
+        result = PublishResult(
+            success=False,
+            effect_applied=False,
+            retryable=True,
+            outcome_uncertain=False,
+            error="账号 profile 正被其他操作占用，稍后重试",
+            raw_response={"write_started": False, "account_operation_busy": True},
+        )
+    except TimeoutError:
+        execution_uncertain = True
+        result = PublishResult(
+            success=False,
+            outcome_uncertain=True,
+            error=TIMED_OUT_EXECUTION_ERROR,
+        )
+    except Exception as e:  # defensive: lock or injected/custom registry implementations
+        if not write_lease_acquired:
+            result = PublishResult(
+                success=False,
+                effect_applied=False,
+                retryable=True,
+                outcome_uncertain=False,
+                error=f"账号操作锁不可用: {type(e).__name__}",
+                raw_response={"write_started": False, "account_operation_lock_error": True},
+            )
+        else:
+            # The coroutine was already entered, so an arbitrary failure cannot
+            # prove that no external write happened. Do not retry/fallback, and
+            # do not persist exception text that may embed CLI output/credentials.
+            result = PublishResult(
+                success=False,
+                retryable=False,
+                outcome_uncertain=True,
+                error=f"publisher 调用状态无法确认: {type(e).__name__}",
+            )
+
+    if result.success and not result.effect_applied:
+        result = result.model_copy(
+            update={
+                "success": False,
+                "retryable": False,
+                "error": result.error or "Publisher 只生成了预览，没有执行对外发布",
+            }
+        )
+
+    # Make the parsed receipt available to execute_job before entering the
+    # final transaction.  `_try_publishers` has already written the same result
+    # to a durable sidecar for process-crash/stale-job recovery.
+    _FINALIZING_RESULT.set(result)
 
     with session_scope() as s:
         job = s.get(PublishJob, job_id)
         if job is None:
             return result
-        job.finished_at = datetime.utcnow()
+        # Only the claimant may complete a RUNNING job.  A future cancellation or
+        # admin transition must not be overwritten by a late publisher response.
+        if job.status != JobStatus.RUNNING:
+            return PublishResult(
+                success=False,
+                error=f"job {job_id} 完成时状态已变为 {job.status}",
+            )
+
+        finished_at = datetime.utcnow()
+        job.finished_at = finished_at
+        # `_try_publishers` stamps the adapter that actually ended the fallback
+        # chain. Persist that execution fact (not the originally planned/first
+        # registry entry) so metrics route back to the same implementation.
+        actual_publisher_kind = (result.raw_response or {}).get("publisher_kind")
+        if (
+            isinstance(actual_publisher_kind, str)
+            and 0 < len(actual_publisher_kind) <= 64
+        ):
+            job.publisher_kind = actual_publisher_kind
         if result.success:
             job.status = JobStatus.SUCCESS
+            job.error = None
             job.platform_post_id = result.platform_post_id
             job.platform_url = result.platform_url
             job.raw_response = result.raw_response
@@ -175,9 +773,8 @@ async def execute_job(job_id: int) -> PublishResult:
                     job_id=job.id,
                 )
 
+            _sync_article_status(s, job.article_id)
             article = s.get(Article, job.article_id)
-            if article and article.status == ArticleStatus.PUBLISHING:
-                article.status = ArticleStatus.PUBLISHED
 
             # 飞轮闭环：发布成功 → 调度 1h/24h/7d 数据采集
             try:
@@ -201,14 +798,29 @@ async def execute_job(job_id: int) -> PublishResult:
                 "title": (article.title if article else "（无标题）"),
             }
         else:
-            job.error = result.error or "unknown"
-            job.raw_response = result.raw_response
-            if job.attempts < job.max_attempts:
-                job.status = JobStatus.RETRYING
-            else:
-                job.status = JobStatus.DEAD
-                # 失败联动：先降级到 DEGRADED；近 24h 内连续 3 次 DEAD → 升级到 BANNED
-                _escalate_health_on_failure(s, job.account_id)
+            raw_response = dict(result.raw_response or {})
+            if result.outcome_uncertain:
+                raw_response["outcome_uncertain"] = True
+            if result.effect_applied:
+                raw_response["effect_applied"] = True
+                job.platform_post_id = result.platform_post_id
+                job.platform_url = result.platform_url
+            job.raw_response = raw_response
+            failure_error = result.error or "unknown"
+            if result.outcome_uncertain and "平台结果未知" not in failure_error:
+                failure_error = f"{UNCONFIRMED_EXECUTION_ERROR}（{failure_error}）"
+            _finish_failed_attempt(
+                s,
+                job,
+                failure_error,
+                now=finished_at,
+                retryable=(
+                    result.retryable
+                    and not execution_uncertain
+                    and not result.outcome_uncertain
+                ),
+            )
+            if job.status == JobStatus.DEAD:
                 # 自动重发钩子（publishing-sop §五 / §八"笔记发了发现内容错"自动通道）：
                 # 默认关（AUTO_REPUBLISH_ON_DEAD=False）——避免 publisher 真挂时无限建 v2 → v3 → ...
                 # 风暴。本钩子仅"建 v2 + 标 v1 superseded"，**不真触发 v2 执行**：
@@ -237,6 +849,7 @@ async def execute_job(job_id: int) -> PublishResult:
             }
 
     # 出 session 后异步通知——session_scope 已 commit，notify 异常不会回滚 job 状态
+    remove_publish_receipt(job_id, operation_id)
     try:
         from ..notify import publish_success, publish_failed
         if notify_snapshot["kind"] == "success":
@@ -282,8 +895,31 @@ async def _try_publishers(
         except NotImplementedError as e:
             result = PublishResult(success=False, error=f"{pub.kind} 未实现: {e}")
         except Exception as e:
-            result = PublishResult(success=False, error=f"{pub.kind} 异常: {e}")
-        if result.success:
+            # An adapter exception does not prove that its external write never
+            # started.  Treat the boundary as unknown; otherwise the next
+            # Publisher or durable retry could create a duplicate post.
+            result = PublishResult(
+                success=False,
+                retryable=False,
+                outcome_uncertain=True,
+                error=f"{pub.kind} 异常后写入状态未知（{type(e).__name__}）",
+                raw_response={
+                    "adapter": str(pub.kind),
+                    "exception_type": type(e).__name__,
+                    "outcome": "unknown",
+                },
+            )
+        raw_response = dict(result.raw_response or {})
+        publisher_kind = getattr(pub.kind, "value", str(pub.kind))
+        raw_response["publisher_kind"] = publisher_kind
+        result = result.model_copy(update={"raw_response": raw_response})
+        write_publish_receipt(
+            job_id=content.job_id,
+            operation_id=content.operation_id,
+            publisher_kind=publisher_kind,
+            result=result,
+        )
+        if result.success or result.effect_applied or result.outcome_uncertain:
             return result
         last = result
     return last or PublishResult(success=False, error="所有 Publisher 都失败")
@@ -303,7 +939,13 @@ def _escalate_health_on_failure(session, account_id: int) -> None:
     ) or 0
 
     if recent_dead >= 3:
-        update_health(session, account_id, AccountHealth.BANNED)
+        pause_account(
+            session,
+            account_id,
+            hours=BAN_PAUSE_HOURS,
+            health=AccountHealth.BANNED,
+            reason=f"24h 内连续 {recent_dead} 次发布 DEAD",
+        )
     else:
         update_health(session, account_id, AccountHealth.DEGRADED)
 
@@ -556,7 +1198,13 @@ AUTO_REPUBLISH_ON_DEAD = False
 _REPUBLISHABLE_STATUSES = (JobStatus.FAILED, JobStatus.DEAD)
 
 
-def republish_job(session, old_job_id: int, *, reason: str = "manual") -> PublishJob:
+def republish_job(
+    session,
+    old_job_id: int,
+    *,
+    reason: str = "manual",
+    platform_checked: bool = False,
+) -> PublishJob:
     """基于失败的旧 PublishJob 创建 v2，并把旧 job 标记为 superseded。
 
     主流程入口（publishing-sop §五"重发覆盖语义"的物理载体）：
@@ -594,6 +1242,17 @@ def republish_job(session, old_job_id: int, *, reason: str = "manual") -> Publis
         raise ValueError(
             f"can only republish FAILED/DEAD jobs, got {old.status}"
         )
+    prior_result = old.raw_response or {}
+    needs_platform_check = bool(
+        prior_result.get("outcome_uncertain")
+        or prior_result.get("effect_applied")
+        or "平台结果未知" in (old.error or "")
+    )
+    if needs_platform_check and not platform_checked:
+        raise ValueError(
+            "the platform may already contain this post; verify it first and set "
+            "platform_checked=true before republishing"
+        )
 
     new_job = PublishJob(
         article_id=old.article_id,
@@ -606,6 +1265,7 @@ def republish_job(session, old_job_id: int, *, reason: str = "manual") -> Publis
         raw_response={
             "republish_reason": reason,
             "republished_from": old.id,
+            "platform_checked": platform_checked,
         },
     )
     session.add(new_job)
@@ -614,4 +1274,3 @@ def republish_job(session, old_job_id: int, *, reason: str = "manual") -> Publis
     # 标 v1 superseded（helper 自带"老 job 不存在则降级"，但此处老 job 100% 存在）
     _mark_job_superseded(session, old.id, new_job.id)
     return new_job
-

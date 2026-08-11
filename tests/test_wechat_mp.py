@@ -1,7 +1,7 @@
 """WechatMpPublisher 单测 — 全 mock，不依赖真账号 / 真浏览器。
 
 测试目标：_do_publish(page, content) 私有方法，覆盖：
-  1. 成功路径（标题 + 正文 + 封面 + 保存草稿 → success=True）
+  1. 草稿路径（标题 + 正文 + 封面 + 保存草稿，不得映射成发布成功）
   2. 标题为空 → 提前返回 success=False
   3. 编辑器找不到（wait_for_selector 抛 TimeoutError）→ success=False
   4. 封面上传失败（set_input_files 抛异常）→ success=False
@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -140,8 +139,8 @@ def _content(title: str = "测试标题", body: str = "正文 **加粗** [link](
     )
 
 
-def test_do_publish_success_path(tmp_path):
-    """成功路径：标题 + 正文 + 封面 + 保存草稿全过且 platform_url 抓回。"""
+def test_do_publish_draft_path_is_not_publication_success(tmp_path):
+    """保存草稿是已发生的部分副作用，但不得把 Job/Article 标成已发布。"""
     pub = WechatMpPublisher()
     cover = tmp_path / "cover.jpg"
     cover.write_bytes(b"\xff\xd8\xff\xe0")  # 任意非空字节，set_input_files 是 mock
@@ -150,13 +149,84 @@ def test_do_publish_success_path(tmp_path):
 
     result: PublishResult = asyncio.run(pub._do_publish(page, _content(images=[str(cover)])))
 
-    assert result.success is True
-    assert result.platform_url
+    assert result.success is False
+    assert result.effect_applied is True
+    assert result.retryable is False
+    assert result.platform_url == "https://mp.weixin.qq.com/cgi-bin/appmsgpublish"
     assert result.platform_post_id == "999"  # 从 URL 抽 appmsgid
     assert result.raw_response["cover_uploaded"] is True
     assert result.raw_response["stage"] == "draft_only"
     page.goto.assert_awaited_once()
     page.evaluate.assert_awaited()  # paste evaluate 被调
+
+
+def test_do_publish_without_draft_id_is_unknown_and_redacted():
+    pub = WechatMpPublisher()
+    editor_root = _build_mock_editor_root()
+    page = _build_mock_page(
+        editor_root,
+        final_url="https://mp.weixin.qq.com/cgi-bin/appmsgpublish?token=private&action=edit",
+    )
+
+    result = asyncio.run(pub._do_publish(page, _content()))
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert "private" not in str(result.raw_response)
+    assert result.raw_response["final_url"] == (
+        "https://mp.weixin.qq.com/cgi-bin/appmsgpublish"
+    )
+
+
+def test_save_draft_click_exception_is_unknown_external_effect():
+    """保存按钮调用抛错时，服务端仍可能已建草稿，必须停止 retry/fallback。"""
+    pub = WechatMpPublisher()
+    editor_root = _build_mock_editor_root(click_raise=RuntimeError("context destroyed"))
+    page = _build_mock_page(editor_root)
+
+    result = asyncio.run(pub._do_publish(page, _content()))
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert result.raw_response["write_started"] is True
+    assert result.raw_response["stage"] == "draft_save_unknown"
+
+
+def test_publish_preserves_confirmed_draft_when_context_close_fails(
+    tmp_path, monkeypatch
+):
+    """已取得 draft ID 后，persistent context 关闭失败不得抹掉回执。"""
+    pub = WechatMpPublisher()
+    editor_root = _build_mock_editor_root()
+    page = _build_mock_page(editor_root)
+    context = MagicMock()
+    context.pages = [page]
+    context.close = AsyncMock(side_effect=RuntimeError("close failed"))
+    playwright = MagicMock()
+    playwright.chromium.launch_persistent_context = AsyncMock(return_value=context)
+
+    class _PlaywrightContext:
+        async def __aenter__(self):
+            return playwright
+
+        async def __aexit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(wmp, "get_async_playwright", lambda: lambda: _PlaywrightContext())
+    profile = tmp_path / "wechat-profile"
+    profile.mkdir()
+
+    result = asyncio.run(pub.publish(1, {"profile_dir": str(profile)}, _content()))
+
+    assert result.success is False
+    assert result.effect_applied is True
+    assert result.platform_post_id == "999"
+    assert result.retryable is False
+    assert result.raw_response["teardown_error"] == "RuntimeError"
 
 
 def test_do_publish_empty_title_returns_failure():

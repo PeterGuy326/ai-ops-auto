@@ -40,6 +40,7 @@ import {
   ChartTooltipContent,
   type ChartConfig,
 } from "@/components/ui/chart";
+import { QueryError } from "@/components/query-error";
 
 function StatCard({
   title,
@@ -124,6 +125,9 @@ export default function Dashboard() {
   const articlesQ = useQuery({ queryKey: ["articles"], queryFn: () => api.articles() });
   const jobsQ = useQuery({ queryKey: ["jobs"], queryFn: () => api.jobs() });
   const heatQ = useQuery({ queryKey: ["heat-rank"], queryFn: () => api.heatRank(5) });
+  const queryError = [topicsQ, accountsQ, articlesQ, jobsQ, heatQ]
+    .map((query) => query.error)
+    .find(Boolean);
 
   const counts = {
     topics: topicsQ.data?.length ?? 0,
@@ -143,6 +147,8 @@ export default function Dashboard() {
         <h1 className="text-2xl font-bold">总览</h1>
         <p className="text-sm text-muted-foreground">运营飞轮实时状态</p>
       </div>
+
+      <QueryError error={queryError} />
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
         <StatCard title="主题" value={counts.topics} icon={BookOpen} />

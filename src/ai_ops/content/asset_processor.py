@@ -15,13 +15,17 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from PIL import Image, ImageEnhance
+
+from ..runtime.browser_engine import build_subprocess_env
 
 from ..config import settings
 
@@ -122,26 +126,88 @@ def diversify_video(
     tag = hashlib.md5(f"{src}-{seed}".encode()).hexdigest()[:8]
     dst = dst_dir / f"{src.stem}_{tag}.mp4"
 
-    if shutil.which("ffmpeg") is None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
         # 兜底：未装 ffmpeg 时直接拷贝（不改 hash，但保证流程不中断）
         shutil.copyfile(src, dst)
         return dst
+
+    # 成功判定需要独立 probe。只有 ffmpeg 而没有 ffprobe 时不生成一个
+    # “看起来已处理”的目标文件，直接保留原视频。
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return src
 
     # CRF 微抖（22-25），bitrate 微调，加 metadata 时间戳
     crf = rng.randint(22, 25)
     ts = datetime.utcnow().isoformat()
     cmd = [
-        "ffmpeg", "-y",
+        ffmpeg, "-y",
         "-i", str(src),
         "-c:v", "libx264", "-crf", str(crf),
         "-preset", "fast",
         "-c:a", "aac", "-b:a", "128k",
         "-metadata", f"comment=ai-ops-{tag}-{ts}",
         "-movflags", "+faststart",
-        str(dst),
     ]
-    subprocess.run(cmd, capture_output=True, check=False)
-    return dst if dst.exists() else src  # 失败时退回原文件
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{dst.stem}.",
+        suffix=".tmp.mp4",
+        dir=dst_dir,
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    cmd.append(str(temp_path))
+    child_env = build_subprocess_env(
+        include_configured_proxy=False,
+        inject_browser_runtime=False,
+    )
+    try:
+        converted = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=600,
+            env=child_env,
+        )
+        if converted.returncode != 0:
+            return src
+
+        if not temp_path.is_file() or temp_path.stat().st_size <= 0:
+            return src
+        probed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(temp_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=30,
+            env=child_env,
+        )
+        if probed.returncode != 0 or b"video" not in (probed.stdout or b"").splitlines():
+            return src
+
+        # temp 与 dst 同目录，os.replace 在同一文件系统内原子切换；失败时旧 dst
+        # 保持不变，残缺 temp 在 finally 清理。
+        os.replace(temp_path, dst)
+        return dst
+    except (OSError, subprocess.TimeoutExpired):
+        return src
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def diversify_content_for_account(

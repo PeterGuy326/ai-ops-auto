@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import random
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from ..config import settings
 from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
@@ -185,6 +186,7 @@ class WechatMpPublisher(PublisherBase):
         # 草稿保存可 headless（不抢焦点）；若反爬严起来再改回 False
         channel = kwargs.pop("channel", None)
         proxy = kwargs.pop("proxy", None)
+        result: PublishResult | None = None
 
         try:
             async with async_playwright() as p:
@@ -197,10 +199,15 @@ class WechatMpPublisher(PublisherBase):
                 )
                 try:
                     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                    return await self._do_publish(page, content)
+                    result = await self._do_publish(page, content)
                 finally:
                     await ctx.close()
+            return result
         except Exception as e:
+            if result is not None:
+                raw = dict(result.raw_response or {})
+                raw["teardown_error"] = type(e).__name__
+                return result.model_copy(update={"raw_response": raw})
             return PublishResult(success=False, error=f"公众号草稿保存异常: {e}")
 
     async def health_check(self, account_id: int, credential: dict) -> AccountHealth:
@@ -310,25 +317,64 @@ class WechatMpPublisher(PublisherBase):
         # ---- 点「保存为草稿」按钮 ----
         try:
             await editor_root.wait_for_selector(SAVE_DRAFT_BUTTON_SELECTOR, timeout=15000)
-            await editor_root.locator(SAVE_DRAFT_BUTTON_SELECTOR).first.click()
         except Exception as e:
-            return PublishResult(success=False, error=f"点「保存为草稿」失败: {e}")
+            return PublishResult(success=False, error=f"未找到「保存为草稿」按钮: {e}")
 
-        await _random_delay(4, 6)
+        # 保存按钮调用是服务端草稿写边界。调用后的任何异常都只能判为
+        # “可能已保存”，不能自动重试并制造重复草稿。
+        try:
+            await editor_root.locator(SAVE_DRAFT_BUTTON_SELECTOR).first.click()
+            await _random_delay(4, 6)
 
-        # ---- 抓草稿 ID / URL ----
-        final_url = page.url or ""
-        draft_id = self._extract_draft_id(final_url)
-        return PublishResult(
-            success=True,
-            platform_post_id=draft_id,
-            platform_url=final_url,
-            raw_response={
-                "final_url": final_url,
-                "cover_uploaded": cover_uploaded,
-                "stage": "draft_only",
-            },
-        )
+            # ---- 抓草稿 ID / URL ----
+            final_url = page.url or ""
+            draft_id = self._extract_draft_id(final_url)
+            safe_url = self._safe_backend_url(final_url)
+            if draft_id is None:
+                return PublishResult(
+                    success=False,
+                    effect_applied=False,
+                    retryable=False,
+                    outcome_uncertain=True,
+                    error="已点击保存草稿，但未取得可验证的 draft id；请到公众号后台核验",
+                    raw_response={
+                        "final_url": safe_url,
+                        "cover_uploaded": cover_uploaded,
+                        "stage": "draft_save_unknown",
+                        "write_started": True,
+                    },
+                )
+            return PublishResult(
+                # A confirmed draft is an external side effect, but it is not a
+                # public post. Keep the publication job failed/non-retryable so the
+                # Article can never be mislabeled PUBLISHED and fallback cannot
+                # create another draft.
+                success=False,
+                effect_applied=True,
+                retryable=False,
+                platform_post_id=draft_id,
+                platform_url=safe_url,
+                error="公众号草稿已保存，尚未群发；请在后台人工确认",
+                raw_response={
+                    "final_url": safe_url,
+                    "cover_uploaded": cover_uploaded,
+                    "stage": "draft_only",
+                    "write_started": True,
+                },
+            )
+        except Exception as exc:
+            return PublishResult(
+                success=False,
+                effect_applied=False,
+                retryable=False,
+                outcome_uncertain=True,
+                error=f"公众号草稿写入后状态无法确认: {type(exc).__name__}",
+                raw_response={
+                    "cover_uploaded": cover_uploaded,
+                    "stage": "draft_save_unknown",
+                    "write_started": True,
+                },
+            )
 
     async def _resolve_editor_root(self, page):
         """返回编辑器操作根：优先 frame_locator(iframe)，否则 page 本身。
@@ -389,3 +435,14 @@ class WechatMpPublisher(PublisherBase):
             if m:
                 return m.group(1)
         return None
+
+    @staticmethod
+    def _safe_backend_url(url: str) -> str:
+        """Strip query/fragment so mp admin tokens never reach API/log storage."""
+        try:
+            parts = urlsplit(url)
+            if parts.scheme not in {"http", "https"}:
+                return ""
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        except ValueError:
+            return ""

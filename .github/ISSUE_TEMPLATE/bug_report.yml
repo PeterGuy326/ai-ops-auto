@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible control-plane, API, scheduler, packaging, or UI problem.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include cookies, tokens, webhook URLs, QR codes, personal content, or internal endpoints.
+        Security vulnerabilities belong in a private security report.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: commit SHA, tag, or image digest
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: OS, Python, database, browser/Node versions as relevant
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: What happened, including sanitized error text and exit status.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest deterministic reproduction with secrets removed.
+    validations:
+      required: true
+  - type: dropdown
+    id: side_effect
+    attributes:
+      label: Did this touch a real external platform?
+      options:
+        - No; offline/local only
+        - Yes; test account only
+        - Yes; production account or content
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, account identifiers, personal data, absolute paths, and private endpoints.
+          required: true
+        - label: This is not an undisclosed security vulnerability.
+          required: true

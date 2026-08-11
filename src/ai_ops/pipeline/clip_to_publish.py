@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from ..core.enums import ContentType, Platform
+from ..core.enums import ContentType
 from ..core.schemas import (
     ClipArtifact,
     ClipPublishPlan,

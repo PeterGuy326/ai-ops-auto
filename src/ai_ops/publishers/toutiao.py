@@ -1,8 +1,8 @@
 """今日头条 / 头条号 Publisher — 自建实现（开源缺口确认后的合理例外）。
 
 gh search 多关键词穷尽（toutiao publish/api/skill 等），唯二命中：
-  - axdlee/toutiao-publish (4⭐, shell skill)
-  - OceanBBBBbb/auto_write_toutiaohao (6⭐, 老代码)
+  - axdlee/toutiao-publish（shell skill）
+  - OceanBBBBbb/auto_write_toutiaohao（历史实现）
 都不够成熟，所以自建。
 
 走和 ZhihuPublisher 一致的"Playwright + patchright factory"路径，
@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
+from urllib.parse import urlsplit, urlunsplit
 
 from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
 from ..core.schemas import PublishContent, PublishResult
@@ -153,6 +155,7 @@ _EXTRACT_CARD_JS = """
 class ToutiaoPublisher(PublisherBase):
     platform = Platform.TOUTIAO
     kind = PublisherKind.SOCIAL_AUTO_UPLOAD  # 复用枚举
+    supports_metrics = True
 
     async def login(self, account_id: int, credential: dict) -> bool:
         """有窗口模式打开头条号登录页，等用户扫码完成后从 context 拿 cookies。
@@ -210,6 +213,7 @@ class ToutiaoPublisher(PublisherBase):
 
         async_playwright = get_async_playwright()
         kwargs = get_launch_kwargs()
+        result: PublishResult | None = None
 
         try:
             async with async_playwright() as p:
@@ -218,10 +222,15 @@ class ToutiaoPublisher(PublisherBase):
                     ctx = await browser.new_context()
                     await ctx.add_cookies(cookies)
                     page = await ctx.new_page()
-                    return await self._do_publish(page, content)
+                    result = await self._do_publish(page, content)
                 finally:
                     await browser.close()
+            return result
         except Exception as e:
+            if result is not None:
+                raw = dict(result.raw_response or {})
+                raw["teardown_error"] = type(e).__name__
+                return result.model_copy(update={"raw_response": raw})
             return PublishResult(success=False, error=f"头条发布异常: {e}")
 
     async def health_check(self, account_id: int, credential: dict) -> AccountHealth:
@@ -394,29 +403,73 @@ class ToutiaoPublisher(PublisherBase):
             )
 
         url_before = page.url
-        await final_btn.click()
-        await _random_delay(5, 8)
-        url_after = page.url
+        # 「确认发布」是远端写边界；按钮调用后，即便 Playwright 抛错，
+        # 平台也可能已经接收请求，必须禁止 fallback/retry。
+        try:
+            await final_btn.click()
+            await _random_delay(5, 8)
+            url_after = page.url
 
-        # 闭环关键：跳到作品管理后台抓真实 /item/{id}/ 链接 + 互动指标快照
-        # 抓不到任何字段都不破坏发布——publish 已成功，metadata 是 bonus。
-        metadata = await self._fetch_post_metadata(page)
-        real_url = (metadata.get("url") if metadata else None) or url_after
-        url_resolved = bool(metadata and metadata.get("url"))
+            # 闭环关键：跳到作品管理后台抓真实 /item/{id}/ 链接 + 互动指标快照
+            metadata = await self._fetch_post_metadata(page)
+            real_url = metadata.get("url") if metadata else None
+            public_match = re.fullmatch(
+                r"https://www\.toutiao\.com/item/(\d+)/?(?:\?[^#]*)?",
+                real_url or "",
+            )
+            safe_final_url = self._safe_observation_url(url_after)
+            if public_match is None:
+                return PublishResult(
+                    success=False,
+                    effect_applied=False,
+                    retryable=False,
+                    outcome_uncertain=True,
+                    error="头条已确认发布但未取得可验证的 post ID/公开 URL；请到平台核验",
+                    raw_response={
+                        "final_url": safe_final_url,
+                        "url_resolved_from_backend": False,
+                        "url_changed": url_after != url_before,
+                        "initial_metadata": metadata or {},
+                        "write_started": True,
+                    },
+                )
+            post_id = public_match.group(1)
+            normalized_url = f"https://www.toutiao.com/item/{post_id}/"
 
-        return PublishResult(
-            success=True,
-            platform_url=real_url,
-            raw_response={
-                "final_url": url_after,
-                "real_url": real_url,
-                "url_resolved_from_backend": url_resolved,
-                "url_changed": url_after != url_before,
-                # 第一份 Metrics 快照：worker 可以直接落 Metrics 表，
-                # 不用等 collect 飞轮 1h 后第一次跑（follow-up: worker 层接入）
-                "initial_metadata": metadata or {},
-            },
-        )
+            return PublishResult(
+                success=True,
+                effect_applied=True,
+                retryable=False,
+                platform_post_id=post_id,
+                platform_url=normalized_url,
+                raw_response={
+                    "final_url": safe_final_url,
+                    "real_url": normalized_url,
+                    "url_resolved_from_backend": True,
+                    "url_changed": url_after != url_before,
+                    "initial_metadata": metadata or {},
+                    "write_started": True,
+                },
+            )
+        except Exception as exc:
+            return PublishResult(
+                success=False,
+                effect_applied=False,
+                retryable=False,
+                outcome_uncertain=True,
+                error=f"头条确认发布后状态无法确认: {type(exc).__name__}",
+                raw_response={"write_started": True},
+            )
+
+    @staticmethod
+    def _safe_observation_url(url: str) -> str:
+        try:
+            parts = urlsplit(url)
+            if parts.scheme not in {"http", "https"}:
+                return ""
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        except ValueError:
+            return ""
 
     async def _fetch_post_metadata(self, page, match_post_id: str | None = None) -> dict | None:
         """跳到作品管理后台 + 抓 .article-card 上的全字段（真链 + 三个互动数）。

@@ -4,7 +4,7 @@
 #
 # 底层逻辑：
 #   1. python:3.11-slim — pyproject 要求 3.11+，slim 镜像 ~50MB，最小可用
-#   2. entrypoint 跑 alembic upgrade head 再启 uvicorn —— schema 永不漏跑
+#   2. entrypoint 跑安全的 ai-ops init-db 再启 uvicorn —— schema 永不漏跑
 #   3. data/ 暴露为 VOLUME —— SQLite 文件 + 素材产物必须持久化
 #   4. 不在镜像里装 playwright 浏览器（~500MB） + 不装 dev / llm-* 可选依赖
 #      —— 真发布场景由运维按需 `docker exec ... playwright install chromium`
@@ -31,10 +31,11 @@ RUN apt-get update \
 WORKDIR /app
 
 # 先拷贝依赖元数据 → 利用 Docker layer cache：源码变了不重装依赖
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 COPY alembic/ ./alembic/
 COPY alembic.ini ./
+COPY prompts/ ./prompts/
 COPY scripts/ ./scripts/
 
 # 装本项目 + 必要运行时依赖
@@ -55,5 +56,6 @@ EXPOSE 8000
 # tini 接管 PID 1 → 转发信号给 entrypoint → entrypoint exec uvicorn
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 
-# CMD 是 entrypoint exec "$@" 接管的命令；运维想覆盖 uvicorn 参数直接 docker run ... <cmd>
+# 默认运行 API 控制面。调度面需用同一镜像另启一个容器：
+# `docker run ... ai-ops worker`。两者必须共享 DATABASE_URL 和 data 卷。
 CMD ["uvicorn", "ai_ops.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

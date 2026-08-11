@@ -62,15 +62,14 @@ async def test_blog_full_chain_dry_run(blog_repo):
     res = await pipe.run(req)
 
     assert res.success is True
+    assert res.effect_applied is False
     assert res.title == "我用 AI 把运维日报自动化了"
     assert res.body_chars > 0
     assert res.tags == ["AI运维", "自动化", "降本增效"]
-    # dry_run 预览里能看到 frontmatter 关键字段
-    preview = res.raw["preview_first_500"]
-    assert "title:" in preview
-    assert "tags:" in preview
-    assert "AI运维" in preview
-    assert "description: AI 自动化运营实践" in preview
+    # dry_run 不落盘、不伪装成已发布，也不把正文写入审计元数据。
+    assert res.raw["dry_run"] is True
+    assert res.raw["rendered_bytes"] > 0
+    assert "preview_first_500" not in res.raw
     # 中文 slug 已 percent-encode 进 URL
     assert "%" in (res.article_url or "")
 

@@ -40,7 +40,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 
 from ai_ops.core import db as db_mod
@@ -148,7 +147,7 @@ def _patch_worker_externals(monkeypatch):
     monkeypatch.setattr(
         worker_mod,
         "check_rate_limit",
-        lambda s, aid: RateCheckResult(allowed=True, reason=""),
+        lambda s, aid, **kwargs: RateCheckResult(allowed=True, reason=""),
     )
     monkeypatch.setattr(worker_mod, "mark_published", lambda s, aid: None)
     monkeypatch.setattr(worker_mod, "is_paused", lambda acc: False)
@@ -177,6 +176,8 @@ def _patch_metrics_externals(monkeypatch, *, collected_views: int = 200):
         }
 
     fake_pub = MagicMock()
+    fake_pub.kind = "toutiao"
+    fake_pub.supports_metrics = True
     fake_pub.collect_metrics = fake_collect
     monkeypatch.setattr(metrics_mod.default_registry, "resolve", lambda platform: [fake_pub])
 

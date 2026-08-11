@@ -22,4 +22,4 @@ post /articles '{"topic_id":2,"title":"小红书爆款标题 10 条公式","body
 post /articles '{"topic_id":3,"title":"用 Claude Code 半天搭一个发布中台","body":"...","content_type":"long_article","target_platforms":["zhihu"],"target_account_ids":[]}'
 
 echo
-echo "✅ 种子数据完成。打开 http://127.0.0.1:5173 查看"
+echo "✅ 种子数据完成。打开 http://127.0.0.1:8000/ui 查看"

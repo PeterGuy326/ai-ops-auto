@@ -172,6 +172,7 @@ class BaijiahaoPublisher(PublisherBase):
 
     platform = Platform.BAIJIAHAO
     kind = PublisherKind.SOCIAL_AUTO_UPLOAD  # 复用枚举
+    supports_metrics = True
 
     async def login(self, account_id: int, credential: dict) -> bool:
         """有窗口模式打开百度 passport 登录页，用户扫码 / 短信验证完成后从 context 拿 cookies。
@@ -230,6 +231,7 @@ class BaijiahaoPublisher(PublisherBase):
 
         async_playwright = get_async_playwright()
         kwargs = get_launch_kwargs()
+        result: PublishResult | None = None
 
         try:
             async with async_playwright() as p:
@@ -238,10 +240,15 @@ class BaijiahaoPublisher(PublisherBase):
                     ctx = await browser.new_context()
                     await ctx.add_cookies(cookies)
                     page = await ctx.new_page()
-                    return await self._do_publish(page, content)
+                    result = await self._do_publish(page, content)
                 finally:
                     await browser.close()
+            return result
         except Exception as e:
+            if result is not None:
+                raw = dict(result.raw_response or {})
+                raw["teardown_error"] = type(e).__name__
+                return result.model_copy(update={"raw_response": raw})
             return PublishResult(success=False, error=f"百家号发布异常: {e}")
 
     async def health_check(self, account_id: int, credential: dict) -> AccountHealth:
@@ -416,49 +423,76 @@ class BaijiahaoPublisher(PublisherBase):
         await publish_btn.scroll_into_view_if_needed()
         await _random_delay(1, 2)
         url_before = page.url
-        await publish_btn.click()
-        await _random_delay(5, 8)
+        # 最终发布按钮是远端写边界。调用开始后，即使 Playwright 抛错或后置
+        # metadata 抓取失败，也不能把结果标成可安全重试，否则可能重复发文。
+        try:
+            await publish_btn.click()
+            await _random_delay(5, 8)
 
-        # 闭环关键：跳到作品管理后台抓真实 /s?id={id} 链接 + 互动指标快照
-        # 直接拿 page.url 只能拿到编辑页 URL，不可分享、不可定位真文章
-        metadata = await self._fetch_post_metadata(page)
-        real_url = (metadata.get("url") if metadata else None) or page.url
-        url_resolved = bool(metadata and metadata.get("url"))
+            # 闭环关键：跳到作品管理后台抓真实 /s?id={id} 链接 + 互动指标快照
+            # 直接拿 page.url 只能拿到编辑页 URL，不可分享、不可定位真文章
+            metadata = await self._fetch_post_metadata(page)
+            real_url = (metadata.get("url") if metadata else None) or page.url
+            url_resolved = bool(metadata and metadata.get("url"))
 
-        # 闭环关键：判草稿 vs 公开，防虚假闭环
-        is_published, normalized_url = _check_published_url(real_url)
-        if not is_published:
+            # 闭环关键：判草稿 vs 公开，防虚假闭环
+            is_published, normalized_url = _check_published_url(real_url)
+            if not is_published:
+                draft_confirmed = bool(
+                    real_url
+                    and (
+                        "/builder/rc/edit" in real_url
+                        or real_url.rstrip("/").endswith("/edit")
+                    )
+                    and re.search(r"[?&]id=[^&#]+", real_url)
+                )
+                return PublishResult(
+                    success=False,
+                    effect_applied=draft_confirmed,
+                    retryable=False,
+                    outcome_uncertain=not draft_confirmed,
+                    platform_url=real_url,
+                    error=f"百家号仍处于草稿状态或 URL 异常: {real_url}",
+                    raw_response={
+                        "final_url": real_url,
+                        "is_published": False,
+                        "url_resolved_from_backend": url_resolved,
+                        "initial_metadata": metadata or {},
+                        "write_started": True,
+                    },
+                )
+
+            # 提取 post_id（百家号 /s?id=<digits>）
+            post_id_match = re.search(r"[?&]id=(\d+)", normalized_url)
+            post_id = post_id_match.group(1) if post_id_match else None
+
             return PublishResult(
-                success=False,
-                platform_url=real_url,
-                error=f"百家号仍处于草稿状态或 URL 异常: {real_url}",
+                success=True,
+                effect_applied=True,
+                retryable=False,
+                platform_post_id=post_id,
+                platform_url=normalized_url,
                 raw_response={
-                    "final_url": real_url,
-                    "is_published": False,
+                    "final_url": normalized_url,
+                    "real_url": real_url,
                     "url_resolved_from_backend": url_resolved,
+                    "url_changed": real_url != url_before,
+                    "is_published": True,
+                    "write_started": True,
+                    # 第一份 Metrics 快照：worker 可以直接落 Metrics 表，
+                    # 不用等 collect 飞轮 1h 后第一次跑
                     "initial_metadata": metadata or {},
                 },
             )
-
-        # 提取 post_id（百家号 /s?id=<digits>）
-        post_id_match = re.search(r"[?&]id=(\d+)", normalized_url)
-        post_id = post_id_match.group(1) if post_id_match else None
-
-        return PublishResult(
-            success=True,
-            platform_post_id=post_id,
-            platform_url=normalized_url,
-            raw_response={
-                "final_url": normalized_url,
-                "real_url": real_url,
-                "url_resolved_from_backend": url_resolved,
-                "url_changed": real_url != url_before,
-                "is_published": True,
-                # 第一份 Metrics 快照：worker 可以直接落 Metrics 表，
-                # 不用等 collect 飞轮 1h 后第一次跑
-                "initial_metadata": metadata or {},
-            },
-        )
+        except Exception as exc:
+            return PublishResult(
+                success=False,
+                effect_applied=False,
+                retryable=False,
+                outcome_uncertain=True,
+                error=f"百家号发布写入后状态无法确认: {type(exc).__name__}",
+                raw_response={"write_started": True},
+            )
 
     async def _fetch_post_metadata(self, page, match_post_id: str | None = None) -> dict | None:
         """跳到作品管理后台 + 抓 .article-list-item 上的全字段（真链 + 三个互动数）。

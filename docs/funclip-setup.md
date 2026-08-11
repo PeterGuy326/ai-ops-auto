@@ -87,13 +87,17 @@ FunClip 的 `funclip/videoclipper.py` 有个 bug：CLI `--stage 2` 单独调用�
 ```dotenv
 # FunClip 仓库路径（默认 ./external/FunClip）
 FUNCLIP_PATH=./external/FunClip
-# FunClip venv 的 python
+# FunClip 仓库内独立 venv 的 python（必填；不回退 PATH/控制面解释器）
 FUNCLIP_PYTHON=./external/FunClip/.venv/bin/python
 # 子进程超时（秒），长视频转写慢，默认 1800
 FUNCLIP_TIMEOUT_SECONDS=1800
 # 切片产物根目录
 FUNCLIP_OUTPUT_ROOT=./data/clips
 ```
+
+子进程只继承运行所需的基础环境，以及显式列出的 CUDA/ROCm、PyTorch、ModelScope、
+Hugging Face 缓存/离线变量。控制面的 `API_KEY`、LLM key、`FERNET_KEY` 不会透传；即使
+浏览器引擎选择 patchright，也不会向 FunClip 注入 `PYTHONPATH/sitecustomize`。
 
 ## 4. 使用示例
 
@@ -124,7 +128,7 @@ async def demo():
 
 | 现象 | 排查 |
 |------|------|
-| `health()` 返回 False | 检查 `FUNCLIP_PATH` 下是否有 `funclip/videoclipper.py`，`FUNCLIP_PYTHON` 指向的文件是否存在 |
+| `health()` 返回 False | 检查 `funclip/videoclipper.py`；`FUNCLIP_PYTHON` 必须位于 `FUNCLIP_PATH` 内、可执行，且所属 venv 根有 `pyvenv.cfg` |
 | `ModuleNotFoundError: librosa` 等 | `FUNCLIP_PYTHON` 必须指向 venv 的 `bin/python`；wrapper 已避免 `resolve()` 跟随 symlink，自定义调用时也别解析它，否则会脱离 venv |
 | stage 1 `IndexError: list index out of range` | 输入视频无可识别人声（纯音乐/静音），ASR 空结果。换有清晰语音的素材 |
 | stage 1 报模型下载失败 | 国内网络去 ModelScope 拉，或 `export MODELSCOPE_CACHE=...` 指本地缓存 |

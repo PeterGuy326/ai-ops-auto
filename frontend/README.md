@@ -1,73 +1,46 @@
-# React + TypeScript + Vite
+# ai-ops-auto React console
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+这是 `ai-ops-auto` 的 React + TypeScript 运营台开发工程。它与 FastAPI 后端分开构建；
+后端自带的 `/ui` 服务端页面不需要本目录。
 
-Currently, two official plugins are available:
+## Local development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+先在仓库根目录启动 API：
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+source .venv/bin/activate
+ai-ops serve
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+再启动前端：
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd frontend
+npm ci
+npm run dev
 ```
+
+Vite 开发服务器会把 `/api/*` 代理到 `http://127.0.0.1:8000`。如需改用其他后端地址，
+设置 `VITE_API_BASE`。
+
+前端请求失败时必须显式报错，不得用 mock 数据伪造查询或写入成功。这是运营控制面的数据真实性边界。
+
+## Checks
+
+```bash
+npm run lint
+npm run build
+```
+
+CI 使用 `npm ci` 从 `package-lock.json` 安装，然后执行上述两个命令。
+
+## Production boundary
+
+`npm run build` 将静态产物写入 `frontend/dist`。当前根目录 Dockerfile **不包含** React 构建产物；
+部署时需要把 `dist` 交给静态托管/反向代理，或单独构建前端镜像。
+
+当前 React 客户端没有完成与后端 `API_KEY`/UI session 的生产鉴权集成，因此应视为本地开发界面。
+对外部署前需要先完成同源鉴权契约或在反向代理层受限访问，不要绕过后端鉴权。
+
+不要把 API key 烘焙进 `VITE_*` 变量：Vite 变量会进入浏览器可见的 JavaScript。
+对外部署应由同源反向代理处理 TLS 与鉴权边界。

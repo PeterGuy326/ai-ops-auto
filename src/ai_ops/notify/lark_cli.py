@@ -22,6 +22,7 @@ from typing import Iterable
 
 from ..config import settings
 from ..observability import get_logger
+from ..runtime.browser_engine import build_subprocess_env
 
 logger = get_logger(__name__)
 
@@ -85,6 +86,7 @@ def send_via_lark_cli(text: str, chat_ids: Iterable[str]) -> bool:
                 encoding="utf-8",
                 timeout=timeout,
                 check=False,
+                env=build_subprocess_env(include_configured_proxy=False),
             )
         except subprocess.TimeoutExpired:
             logger.warning(

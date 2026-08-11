@@ -18,7 +18,7 @@ import pytest
 from ai_ops.core.enums import ContentType, Platform, PublisherKind
 from ai_ops.core.schemas import PublishContent, PublishResult
 from ai_ops.publishers import sohuhao as shh
-from ai_ops.publishers.registry import default_registry
+from ai_ops.publishers.registry import build_default_registry
 from ai_ops.publishers.sohuhao import (
     ARTICLE_CARD_COMMENT_SELECTOR,
     ARTICLE_CARD_LIKE_SELECTOR,
@@ -54,10 +54,15 @@ def test_platform_enum_added():
     assert Platform.SOHUHAO.value == "sohuhao"
 
 
-def test_publisher_registered():
-    """registry.resolve(SOHUHAO) 必须返回至少一个 SohuhaoPublisher 实例。"""
-    pubs = default_registry.resolve(Platform.SOHUHAO)
-    assert pubs, "SohuhaoPublisher 未注册到 default_registry"
+def test_publisher_is_default_off_but_can_be_explicitly_enabled(monkeypatch):
+    """未经 canary 的 selector Stub 不得默认暴露真实写路径。"""
+    from ai_ops.config import settings
+
+    monkeypatch.setattr(settings, "sohuhao_publisher_enabled", False)
+    assert build_default_registry().resolve(Platform.SOHUHAO) == []
+
+    monkeypatch.setattr(settings, "sohuhao_publisher_enabled", True)
+    pubs = build_default_registry().resolve(Platform.SOHUHAO)
     assert any(isinstance(p, SohuhaoPublisher) for p in pubs)
 
 
@@ -215,6 +220,8 @@ def test_do_publish_success_returns_url():
     result: PublishResult = asyncio.run(pub._do_publish(page, _content()))
 
     assert result.success is True
+    assert result.effect_applied is True
+    assert result.retryable is False
     assert result.platform_url == real
     assert result.platform_post_id == "812345678_999888"
     assert result.raw_response["real_url"] == real
@@ -236,11 +243,73 @@ def test_do_publish_returns_failure_when_url_is_draft():
     result = asyncio.run(pub._do_publish(page, _content()))
 
     assert result.success is False, "草稿 URL 不应被判 success——防虚假闭环"
+    assert result.effect_applied is True
+    assert result.outcome_uncertain is False
+    assert result.retryable is False
     assert "草稿" in (result.error or "") or "URL 异常" in (result.error or "")
     assert result.platform_url == draft  # 草稿 URL 保留供运营人工排查
     assert result.raw_response["is_published"] is False
     # initial_metadata 仍然落盘供观测
     assert result.raw_response["initial_metadata"] == meta
+    assert result.raw_response["write_started"] is True
+
+
+def test_do_publish_click_exception_is_unknown_non_retryable():
+    """最终点击抛错时请求可能已送达，不能允许 worker 自动重发。"""
+    pub = SohuhaoPublisher()
+    page = _build_publish_page(metadata_dict=None)
+    page.wait_for_selector.return_value.click = AsyncMock(
+        side_effect=RuntimeError("connection closed after click")
+    )
+
+    result = asyncio.run(pub._do_publish(page, _content()))
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert result.raw_response["write_started"] is True
+    assert "RuntimeError" in (result.error or "")
+
+
+def test_do_publish_unknown_url_has_no_confirmed_effect():
+    """没有公开 ID 或草稿 ID 时只能标记结果未知，不能声称副作用已发生。"""
+    pub = SohuhaoPublisher()
+    page = _build_publish_page(metadata_dict=None)
+
+    result = asyncio.run(pub._do_publish(page, _content()))
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+
+
+def test_publish_preserves_confirmed_receipt_when_browser_close_fails(monkeypatch):
+    """远端 ID 已确认后，浏览器 teardown 失败只能作为附加观测。"""
+    pub = SohuhaoPublisher()
+    post_id = "812345678_999888"
+    page = _build_publish_page(
+        metadata_dict={"url": f"https://www.sohu.com/a/{post_id}"}
+    )
+    context = MagicMock()
+    context.add_cookies = AsyncMock()
+    context.new_page = AsyncMock(return_value=page)
+    browser = MagicMock()
+    browser.new_context = AsyncMock(return_value=context)
+    browser.close = AsyncMock(side_effect=RuntimeError("close failed"))
+    playwright = MagicMock()
+    playwright.chromium.launch = AsyncMock(return_value=browser)
+    _patch_async_playwright(monkeypatch, playwright)
+
+    result = asyncio.run(
+        pub.publish(1, {"cookies": [{"name": "session", "value": "redacted"}]}, _content())
+    )
+
+    assert result.success is True
+    assert result.effect_applied is True
+    assert result.platform_post_id == post_id
+    assert result.raw_response["teardown_error"] == "RuntimeError"
 
 
 def test_do_publish_video_type_blocked_at_publish_entry():

@@ -23,7 +23,7 @@ from ai_ops.core.models import Asset, Base
 from ai_ops.jobhunt import models as jh_models  # noqa: F401  确保四表注册进 metadata
 from ai_ops.jobhunt import resume_parser as rp
 from ai_ops.jobhunt.enums import ApplicationStatus, JobBoard
-from ai_ops.jobhunt.models import Application, JobMatch, JobPosting, ResumeProfile
+from ai_ops.jobhunt.models import Application, JobPosting, ResumeProfile
 from ai_ops.jobhunt.resume_parser import (
     LLMDriver,
     ResumeParser,

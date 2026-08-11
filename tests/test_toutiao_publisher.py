@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -271,6 +271,7 @@ def test_do_publish_success_path_uses_real_url_from_metadata():
 
     assert result.success is True
     assert result.platform_url == real
+    assert result.platform_post_id == "7350009999988887777"
     assert result.raw_response["real_url"] == real
     assert result.raw_response["url_resolved_from_backend"] is True
     # final_url 仍保留发布页 URL 供观测
@@ -279,19 +280,68 @@ def test_do_publish_success_path_uses_real_url_from_metadata():
     assert result.raw_response["initial_metadata"] == meta
 
 
-def test_do_publish_success_falls_back_when_metadata_unavailable():
-    """抓不到 metadata（卡片未渲染 / 异常）时 _do_publish 依然 success=True，
-    platform_url 降级到发布页 URL，url_resolved_from_backend=False，
-    initial_metadata 为空 dict（不是 None，避免下游 raw_response[''].get 炸）。"""
+def test_do_publish_without_receipt_is_unknown_not_false_success():
+    """确认按钮已经点击但无 post identity 时必须停重试并要求人工核验。"""
     pub = ToutiaoPublisher()
     page = _build_publish_page(metadata_dict=None)  # evaluate 返回 None → 整体 None
 
     result = asyncio.run(pub._do_publish(page, _content()))
 
-    assert result.success is True
-    assert result.platform_url == result.raw_response["final_url"]
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert result.platform_url is None
     assert result.raw_response["url_resolved_from_backend"] is False
     assert result.raw_response["initial_metadata"] == {}
+
+
+def test_final_confirm_click_exception_is_unknown_external_effect():
+    """确认发布调用后即进入远端不确定区，DOM 异常不得触发自动重试。"""
+    pub = ToutiaoPublisher()
+    page = _build_publish_page(metadata_dict=None)
+    title_ready = MagicMock()
+    preview = MagicMock()
+    preview.scroll_into_view_if_needed = AsyncMock()
+    preview.click = AsyncMock()
+    final = MagicMock()
+    final.click = AsyncMock(side_effect=RuntimeError("execution context destroyed"))
+    page.wait_for_selector = AsyncMock(side_effect=[title_ready, preview, final])
+
+    result = asyncio.run(pub._do_publish(page, _content()))
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert result.raw_response["write_started"] is True
+
+
+def test_publish_preserves_confirmed_receipt_when_browser_close_fails(monkeypatch):
+    """远端 ID 已确认后，浏览器 teardown 失败只能作为附加观测。"""
+    pub = ToutiaoPublisher()
+    post_id = "7350009999988887777"
+    page = _build_publish_page(
+        metadata_dict={"url": f"https://www.toutiao.com/item/{post_id}/"}
+    )
+    context = MagicMock()
+    context.add_cookies = AsyncMock()
+    context.new_page = AsyncMock(return_value=page)
+    browser = MagicMock()
+    browser.new_context = AsyncMock(return_value=context)
+    browser.close = AsyncMock(side_effect=RuntimeError("close failed"))
+    playwright = MagicMock()
+    playwright.chromium.launch = AsyncMock(return_value=browser)
+    _patch_async_playwright(monkeypatch, playwright)
+
+    result = asyncio.run(
+        pub.publish(1, {"cookies": [{"name": "session", "value": "redacted"}]}, _content())
+    )
+
+    assert result.success is True
+    assert result.effect_applied is True
+    assert result.platform_post_id == post_id
+    assert result.raw_response["teardown_error"] == "RuntimeError"
 
 
 def test_do_publish_video_type_blocked_at_publish_entry():

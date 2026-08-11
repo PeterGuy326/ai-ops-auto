@@ -19,7 +19,6 @@
 """
 from __future__ import annotations
 
-import pytest
 
 from ai_ops.core.parsers import parse_count
 

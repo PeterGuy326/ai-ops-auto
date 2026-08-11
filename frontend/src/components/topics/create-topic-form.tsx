@@ -17,7 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { MOCK_CATEGORIES } from "@/lib/mock-topics"
+import { TOPIC_CATEGORIES } from "@/lib/topic-categories"
 import { categoryLabel } from "@/lib/topic-utils"
 
 export function CreateTopicForm({
@@ -81,7 +81,7 @@ export function CreateTopicForm({
             <SelectValue placeholder="选择分类" />
           </SelectTrigger>
           <SelectContent>
-            {MOCK_CATEGORIES.map((c) => (
+            {TOPIC_CATEGORIES.map((c) => (
               <SelectItem key={c} value={c}>
                 {categoryLabel(c)}
                 <span className="text-muted-foreground text-xs">· {c}</span>

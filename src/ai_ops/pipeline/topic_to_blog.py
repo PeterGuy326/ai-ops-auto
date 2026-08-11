@@ -39,6 +39,7 @@ class BlogRequest(BaseModel):
 class BlogResult(BaseModel):
     """AI 博客编排产物。"""
     success: bool
+    effect_applied: bool = False
     title: str
     body_chars: int = 0
     tags: list[str] = Field(default_factory=list)
@@ -77,6 +78,7 @@ class TopicToBlogPipeline:
 
         return BlogResult(
             success=result.success,
+            effect_applied=bool(result.effect_applied),
             title=content.title,
             body_chars=len(content.body),
             tags=content.tags,

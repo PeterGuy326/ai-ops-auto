@@ -161,6 +161,8 @@ def _patch_collect_one_externals(monkeypatch, *, collected_views: int = 200):
         }
 
     fake_pub = MagicMock()
+    fake_pub.kind = "test"
+    fake_pub.supports_metrics = True
     fake_pub.collect_metrics = fake_collect
     monkeypatch.setattr(metrics_mod.default_registry, "resolve", lambda platform: [fake_pub])
 
@@ -377,27 +379,16 @@ class TestScheduleAfterPublishClosureCapture:
 
         monkeypatch.setattr(metrics_mod, "collect_one", spy_collect_one)
 
-        # spy queue.schedule_once：记录每次 coro_factory 并立即触发它跑回调
-        # 闭包内部是 lambda: asyncio.create_task(collect_one(jid, interval_index=i))
-        # asyncio 是函数体内 local import 的，patch 不到模块属性——直接 patch 全局 asyncio.create_task
+        # spy queue.schedule_once：记录每次 coro_factory 并立即 drive 回调协程。
         registered_ids: list[str] = []
 
-        # 替换 asyncio.create_task：同步 drive coroutine 让 spy_collect_one 抓参数
-        # （否则真创建 task 会因没 event loop 报 RuntimeError）
-        import asyncio as _asyncio
-
-        def fake_create_task(coro):
+        def fake_schedule_once(when, coro_factory, job_id=None):
+            registered_ids.append(job_id)
+            coro = coro_factory()
             try:
                 coro.send(None)
             except StopIteration:
                 pass
-            return None
-
-        monkeypatch.setattr(_asyncio, "create_task", fake_create_task)
-
-        def fake_schedule_once(when, coro_factory, job_id=None):
-            registered_ids.append(job_id)
-            coro_factory()  # 立即触发 lambda → spy_collect_one 被同步抓参数
             return job_id or f"sched-{len(registered_ids)}"
 
         monkeypatch.setattr(metrics_mod.queue, "schedule_once", fake_schedule_once)

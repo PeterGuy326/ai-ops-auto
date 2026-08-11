@@ -6,6 +6,7 @@
   → 比对该账号近 7 天 baseline，若 views 跌破 20% → 累计触发
   → 近 3 次都触发 → DEGRADED + paused_until=now+48h
   → 连续 5 次都触发 → BANNED + paused_until=now+7d
+  → 7 天后只允许定时健康探测；只有明确 HEALTHY 才恢复发布资格
 
 设计要点：
   - paused_until 写入 account.profile["paused_until"]（ISO 字符串），不动 ORM schema
@@ -165,6 +166,102 @@ def get_paused_until(account: Account) -> Optional[datetime]:
     except (TypeError, ValueError):
         return None
     return until if datetime.utcnow() < until else None
+
+
+def get_ban_probe_at(account: Account) -> Optional[datetime]:
+    """Return when a BANNED account may be health-probed again.
+
+    New bans persist ``profile.paused_until``.  Older rows may not have that
+    field because the worker's DEAD escalation historically only updated the
+    health enum.  For those rows, use the last health transition (or, as a final
+    legacy fallback, account creation) plus seven days.  This fallback only
+    permits a read-only health probe; it never makes the account publishable.
+    """
+    if account is None:
+        return None
+    try:
+        health = AccountHealth(account.health)
+    except (TypeError, ValueError):
+        return None
+    if health != AccountHealth.BANNED:
+        return None
+
+    raw = (account.profile or {}).get("paused_until")
+    if raw:
+        try:
+            return datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            # A corrupt legacy profile must not lock the account forever.  Fall
+            # through to a database timestamp, but still require a real probe.
+            pass
+
+    anchor = account.last_health_check_at or account.created_at
+    if anchor is None:
+        return None
+    return anchor + timedelta(hours=BAN_PAUSE_HOURS)
+
+
+def is_ban_probe_due(account: Account, *, now: datetime | None = None) -> bool:
+    """Whether a BANNED account is eligible for a read-only recovery probe."""
+    probe_at = get_ban_probe_at(account)
+    return probe_at is not None and (now or datetime.utcnow()) >= probe_at
+
+
+def recover_banned_account(
+    session: Session,
+    account_id: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Recover a due BANNED account after an explicit HEALTHY probe result.
+
+    The caller is responsible for validating the publisher result.  This helper
+    re-checks both state and deadline inside the write transaction so a stale
+    probe cannot overwrite a newer ban.
+    """
+    a = session.get(Account, account_id)
+    recovered_at = now or datetime.utcnow()
+    if a is None or not is_ban_probe_due(a, now=recovered_at):
+        return False
+
+    profile = dict(a.profile or {})
+    profile.pop("paused_until", None)
+    profile.pop("paused_reason", None)
+    a.profile = profile
+    a.health = AccountHealth.HEALTHY
+    a.last_health_check_at = recovered_at
+    return True
+
+
+def record_banned_probe(
+    session: Session,
+    account_id: int,
+    observed: AccountHealth,
+    *,
+    now: datetime | None = None,
+) -> AccountHealth | None:
+    """Record a non-healthy recovery probe without relaxing BANNED.
+
+    Persisting a normalized ``paused_until`` also repairs legacy BANNED rows,
+    while leaving the expired deadline in place makes them eligible for the next
+    daily read-only probe rather than imposing another seven-day blind period.
+    """
+    a = session.get(Account, account_id)
+    checked_at = now or datetime.utcnow()
+    if a is None:
+        return None
+    if AccountHealth(a.health) != AccountHealth.BANNED:
+        return AccountHealth(a.health)
+
+    probe_at = get_ban_probe_at(a)
+    profile = dict(a.profile or {})
+    if probe_at is not None:
+        profile["paused_until"] = probe_at.isoformat()
+    profile["last_ban_probe_at"] = checked_at.isoformat()
+    profile["last_ban_probe_health"] = AccountHealth(observed).value
+    a.profile = profile
+    a.last_health_check_at = checked_at
+    return AccountHealth.BANNED
 
 
 # ---------------------------------------------------------------------------- #

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
@@ -18,9 +18,20 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..accounts import manager as account_mgr
 from ..observability import init_observability
-from .auth import require_api_key
+from .auth import (
+    UIAuthMiddleware,
+    UI_SESSION_COOKIE,
+    api_key_dev_mode,
+    api_keys_match,
+    clear_ui_session_cookie,
+    create_ui_session_cookie,
+    require_api_key,
+    set_ui_session_cookie,
+    validate_ui_session_cookie,
+    verify_ui_csrf,
+)
 from ..content import manager as content_mgr
-from ..core.db import SessionLocal, init_db
+from ..core.db import SessionLocal
 from ..core.enums import ArticleStatus, ContentType, JobStatus, Platform
 from ..core.models import Account, Article, PublishJob, Topic
 from ..core.schemas import (
@@ -35,8 +46,6 @@ from ..core.schemas import (
     TopicStats,
     TopicUpdate,
 )
-# 触发 lint：JobStatus 用于 dashboard 路由的统计
-from ..scheduler.queue import queue
 from ..scheduler.worker import execute_job
 
 
@@ -79,68 +88,37 @@ async def lifespan(app: FastAPI):
         import sys as _sys
         print(f"[DEPLOY-CHECK] self-check failed (swallowed): {_deploy_err}", file=_sys.stderr)
 
-    # === SCHEMA-CHECK · Round 5 启动期 schema 漂移自检 + 自动升级 ===
-    # 底层逻辑：dev/prod schema parity。早期 dev DB 是 `Base.metadata.create_all()` 建的，
-    # 后续 model 加字段后 create_all 不会自动 ALTER，启动 INSERT 直接炸（Round 5 P9 事故重现）。
-    # 生产已由 Dockerfile entrypoint 自动跑 alembic upgrade head 兜底（auto_upgrade_db=False 默认）；
-    # dev 设 AUTO_UPGRADE_DB=true 后此处自动愈合。与 DEPLOY-CHECK 一致：**不 raise**，
-    # 启动继续，但日志显眼，开发者第一时间能看到。
-    try:
-        from ..core.db import check_schema_drift as _check_schema_drift
-        from ..core.db import try_auto_upgrade as _try_auto_upgrade
-        from ..config import settings as _schema_settings
-        from ..observability import get_logger as _schema_get_logger
-        _schema_logger = _schema_get_logger("ai_ops.schema_check")
-        _drift = _check_schema_drift()
-        if _drift["in_sync"]:
-            _schema_logger.info(
-                "[SCHEMA-CHECK] schema 与 code 对齐 (rev=%s)", _drift["code_head"]
-            )
-        elif _schema_settings.auto_upgrade_db:
-            _schema_logger.warning(
-                "[SCHEMA-CHECK] schema 漂移：db=%s code=%s missing=%s，"
-                "auto_upgrade_db=True，尝试自动升级…",
-                _drift["db_head"], _drift["code_head"], _drift["missing_migrations"],
-            )
-            _up = _try_auto_upgrade()
-            if _up["ok"]:
-                _schema_logger.warning(
-                    "[SCHEMA-CHECK] 已自动升级 schema %s -> %s（dev 模式）",
-                    _up["from_rev"], _up["to_rev"],
-                )
-            else:
-                _schema_logger.error(
-                    "[SCHEMA-CHECK] 自动升级失败 (reason=%s, error=%s)，启动可能炸，"
-                    "运维请手动跑：alembic upgrade head",
-                    _up["reason"], _up["error"],
-                )
-        else:
-            _schema_logger.error(
-                "[SCHEMA-CHECK] schema 漂移：DB 在 %s，代码在 %s，待跑 migration: %s。"
-                "请跑 `alembic upgrade head`（生产）或设 AUTO_UPGRADE_DB=true 后重启（dev）。"
-                "启动继续，但相关表的 INSERT/SELECT 可能直接炸（详见 docs/deployment.md）。",
-                _drift["db_head"], _drift["code_head"], _drift["missing_migrations"],
-            )
-    except Exception as _schema_err:
-        # 自检自己炸了绝不阻塞启动 —— 裸 print 兜底（与 DEPLOY-CHECK 一致）
-        import sys as _sys
-        print(f"[SCHEMA-CHECK] self-check failed (swallowed): {_schema_err}", file=_sys.stderr)
+    # === SCHEMA-CHECK · 启动硬闸门 ===
+    # API 只在 DB 已到 Alembic head 时启动。生产由 entrypoint 先执行安全初始化；
+    # dev 可设 AUTO_UPGRADE_DB=true，复用同一条安全升级路径。未知/部分匹配的
+    # 无版本业务库会被拒绝，绝不再用 create_all 掩盖漂移后继续提供服务。
+    from ..core.db import require_database_at_head as _require_database_at_head
+    from ..observability import get_logger as _schema_get_logger
 
-    init_db()
-    queue.start()
+    _schema_logger = _schema_get_logger("ai_ops.schema_check")
     try:
-        from ..scheduler.health import schedule_daily_health_check
-        schedule_daily_health_check()  # 默认每天 02:00
+        _schema_result = _require_database_at_head()
     except Exception:
-        pass  # 调度注册失败不阻塞启动
-    # === 数据回流自动出报 cron（daily 18:00 / weekly Mon 09:00）===
-    try:
-        from ..reports.cron import schedule_report_crons
-        schedule_report_crons()
-    except Exception:
-        pass  # 报表 cron 注册失败不阻塞启动
+        _schema_logger.exception(
+            "[SCHEMA-CHECK] database is not safely at Alembic head; API startup refused"
+        )
+        raise
+    if _schema_result["attempted"]:
+        _schema_logger.warning(
+            "[SCHEMA-CHECK] schema 已安全初始化/升级 %s -> %s (%s)",
+            _schema_result["from_rev"],
+            _schema_result["to_rev"],
+            _schema_result["reason"],
+        )
+    else:
+        _schema_logger.info(
+            "[SCHEMA-CHECK] schema 与 code 对齐 (rev=%s)",
+            _schema_result["to_rev"],
+        )
+
+    # Web 进程只负责控制面。APScheduler、持久任务恢复和周期任务由
+    # 唯一的 `ai-ops worker` 进程持有，避免 Gunicorn/Uvicorn 多 worker 重复注册。
     yield
-    queue.shutdown()
 
 
 app = FastAPI(title="ai-ops-auto", version="0.1.0", lifespan=lifespan)
@@ -161,6 +139,7 @@ class StripApiPrefixMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(StripApiPrefixMiddleware)
+app.add_middleware(UIAuthMiddleware)
 
 _templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -239,7 +218,9 @@ def api_transition_article(
 
 def _job_out(j: PublishJob) -> JobOut:
     return JobOut(
-        id=j.id, article_id=j.article_id, account_id=j.account_id, platform=j.platform,
+        id=j.id, article_id=j.article_id,
+        topic_id=j.article.topic_id if j.article is not None else None,
+        account_id=j.account_id, platform=j.platform,
         status=j.status, attempts=j.attempts, platform_post_id=j.platform_post_id,
         platform_url=j.platform_url, error=j.error, scheduled_at=j.scheduled_at,
         started_at=j.started_at, finished_at=j.finished_at,
@@ -396,7 +377,8 @@ async def api_login_account(account_id: int):
             if a is not None:
                 a.encrypted_credential = get_store().encrypt(cred)
 
-    return {"ok": ok, "account_id": account_id}
+    error = None if ok else getattr(pubs[0], "last_login_error", None)
+    return {"ok": ok, "account_id": account_id, "error": error}
 
 
 @app.get("/accounts/{account_id}/dispatch-preview", dependencies=[Depends(require_api_key)])
@@ -420,20 +402,7 @@ def api_dispatch_preview(account_id: int, count: int = 1, s: Session = Depends(g
 @app.get("/jobs", response_model=list[JobOut], dependencies=[Depends(require_api_key)])
 def api_list_jobs(limit: int = 100, s: Session = Depends(get_session)):
     return [
-        JobOut(
-            id=j.id,
-            article_id=j.article_id,
-            account_id=j.account_id,
-            platform=j.platform,
-            status=j.status,
-            attempts=j.attempts,
-            platform_post_id=j.platform_post_id,
-            platform_url=j.platform_url,
-            error=j.error,
-            scheduled_at=j.scheduled_at,
-            started_at=j.started_at,
-            finished_at=j.finished_at,
-        )
+        _job_out(j)
         for j in s.execute(
             select(PublishJob).order_by(PublishJob.id.desc()).limit(limit)
         ).scalars().all()
@@ -452,7 +421,11 @@ async def api_run_job(job_id: int):
     response_model=JobOut,
     dependencies=[Depends(require_api_key)],
 )
-def api_republish_job(job_id: int, s: Session = Depends(get_session)):
+def api_republish_job(
+    job_id: int,
+    platform_checked: bool = False,
+    s: Session = Depends(get_session),
+):
     """重发覆盖（publishing-sop §五）：基于失败 job 创建 v2 + 标 v1 superseded。
 
     - 入参：旧 job_id（必须 status ∈ {FAILED, DEAD}）
@@ -463,24 +436,16 @@ def api_republish_job(job_id: int, s: Session = Depends(get_session)):
     from ..scheduler.worker import republish_job
 
     try:
-        new_job = republish_job(s, job_id, reason="manual")
+        new_job = republish_job(
+            s,
+            job_id,
+            reason="manual",
+            platform_checked=platform_checked,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    return JobOut(
-        id=new_job.id,
-        article_id=new_job.article_id,
-        account_id=new_job.account_id,
-        platform=new_job.platform,
-        status=new_job.status,
-        attempts=new_job.attempts,
-        platform_post_id=new_job.platform_post_id,
-        platform_url=new_job.platform_url,
-        error=new_job.error,
-        scheduled_at=new_job.scheduled_at,
-        started_at=new_job.started_at,
-        finished_at=new_job.finished_at,
-    )
+    return _job_out(new_job)
 
 
 @app.post("/jobs/{job_id}/collect", dependencies=[Depends(require_api_key)])
@@ -512,12 +477,49 @@ def health():
 
 # ============== Web UI ==============
 
+@app.get("/ui/login", response_class=HTMLResponse)
+def ui_login_page(request: Request):
+    """UI 登录页。已有有效会话或 dev 模式直接进入控制台。"""
+    if api_key_dev_mode() or validate_ui_session_cookie(
+        request.cookies.get(UI_SESSION_COOKIE)
+    ):
+        return RedirectResponse("/ui", status_code=303)
+    return _templates.TemplateResponse(request, "login.html", {
+        "request": request,
+        "error": "",
+    })
+
+
+@app.post("/ui/login", response_class=HTMLResponse)
+def ui_login(request: Request, api_key: str = Form(default="")):
+    """验证 API key 后签发短期 UI session；响应和 cookie 均不回显 key。"""
+    if api_key_dev_mode():
+        return RedirectResponse("/ui", status_code=303)
+    if not api_keys_match(api_key):
+        return _templates.TemplateResponse(
+            request,
+            "login.html",
+            {"request": request, "error": "API key 不正确"},
+            status_code=401,
+        )
+    response = RedirectResponse("/ui", status_code=303)
+    set_ui_session_cookie(response, create_ui_session_cookie())
+    return response
+
+
+@app.post("/ui/logout")
+def ui_logout(request: Request, csrf_token: str = Form(default="")):
+    """注销当前 UI 会话；注销本身也必须通过 CSRF 校验。"""
+    verify_ui_csrf(request, csrf_token)
+    response = RedirectResponse("/ui/login", status_code=303)
+    clear_ui_session_cookie(response)
+    return response
+
 @app.get("/ui", response_class=HTMLResponse)
 def ui_dashboard(request: Request, s: Session = Depends(get_session)):
     from ..content.heat_engine import top_topics
 
     from datetime import datetime
-    from ..core.enums import AccountHealth
 
     today_start = datetime(datetime.utcnow().year, datetime.utcnow().month, datetime.utcnow().day)
     counts = {
@@ -650,11 +652,16 @@ def ui_article_detail(article_id: int, request: Request, message: str = "", s: S
 
 
 @app.post("/ui/articles/{article_id}/approve")
-def ui_article_approve(article_id: int, s: Session = Depends(get_session)):
+def ui_article_approve(
+    article_id: int,
+    request: Request,
+    csrf_token: str = Form(default=""),
+    s: Session = Depends(get_session),
+):
     """后台按钮：审核通过，回素材详情。"""
-    from fastapi.responses import RedirectResponse
     from ..content import distributor
 
+    verify_ui_csrf(request, csrf_token)
     try:
         distributor.approve(s, article_id)
         msg = "已审核通过，可分发"
@@ -666,18 +673,23 @@ def ui_article_approve(article_id: int, s: Session = Depends(get_session)):
 @app.post("/ui/articles/{article_id}/distribute")
 def ui_article_distribute(
     article_id: int,
+    request: Request,
     account_ids: list[int] = Form(default=[]),
+    csrf_token: str = Form(default=""),
     s: Session = Depends(get_session),
 ):
     """后台按钮：分发到所选账号（表单 account_ids 多选；空=按目标平台全选），回素材详情。"""
-    from fastapi.responses import RedirectResponse
     from ..content import distributor
 
+    verify_ui_csrf(request, csrf_token)
     try:
         jobs = distributor.distribute(s, article_id, account_ids=account_ids or None)
         from ..scheduler.worker import schedule_job_runs
-        schedule_job_runs(jobs)
-        msg = f"已分发到 {len(jobs)} 个账号（已排期自动发布）"
+        scheduled = schedule_job_runs(jobs)
+        if scheduled:
+            msg = f"已分发到 {len(jobs)} 个账号（已写入持久排期）"
+        else:
+            msg = f"已分发到 {len(jobs)} 个账号（自动发布未开启，任务保持待执行）"
     except ValueError as e:
         msg = f"分发失败：{e}"
     return RedirectResponse(f"/ui/articles/{article_id}?message={msg}", status_code=303)

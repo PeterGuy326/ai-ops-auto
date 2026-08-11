@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install project and development tools
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: python -m ruff check .
+      - name: Pytest
+        run: python -m pytest -q
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  package:
+    name: Python package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Verify shipped runtime resources
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+
+          required_suffixes = {
+              "ai_ops/api/templates/base.html",
+              "share/ai-ops-auto/prompts/accounts/_template.md",
+              "share/ai-ops-auto/alembic.ini",
+              "share/ai-ops-auto/alembic/env.py",
+              "share/ai-ops-auto/alembic/versions/b09fbf0bf0f0_initial_schema_baseline.py",
+          }
+          missing = sorted(
+              suffix for suffix in required_suffixes
+              if not any(name.endswith(suffix) for name in names)
+          )
+          if missing:
+              raise SystemExit(f"wheel is missing runtime resources: {missing}")
+          PY
+      - name: Install built wheel and smoke-test CLI
+        run: |
+          python -m venv .package-venv
+          .package-venv/bin/python -m pip install dist/*.whl
+          smoke_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$smoke_dir"' EXIT
+          cd "$smoke_dir"
+          export DATABASE_URL="sqlite:///$smoke_dir/package-smoke.db"
+          export DATA_DIR="$smoke_dir/data"
+          "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" --help
+          "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" init-db
+          "$GITHUB_WORKSPACE/.package-venv/bin/python" - <<'PY'
+          from ai_ops.content.generator import _load_topic_prompt
+          from ai_ops.core.db import get_code_alembic_head, get_db_alembic_head
+
+          assert _load_topic_prompt("dws").strip(), "wheel topic prompt is not readable"
+          code_head = get_code_alembic_head()
+          assert code_head, "wheel Alembic migrations are not discoverable"
+          assert get_db_alembic_head() == code_head, "installed wheel did not migrate to head"
+          PY
+
+  postgres:
+    name: PostgreSQL migration smoke
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ai_ops_ci
+          POSTGRES_USER: ai_ops_ci
+          POSTGRES_PASSWORD: ai_ops_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_ops_ci -d ai_ops_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg2://ai_ops_ci:ai_ops_ci@127.0.0.1:5432/ai_ops_ci
+      DATA_DIR: /tmp/ai-ops-ci-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install PostgreSQL runtime
+        run: python -m pip install -e ".[postgres]"
+      - name: Migrate an empty PostgreSQL database to head
+        run: |
+          ai-ops init-db
+          python - <<'PY'
+          from ai_ops.core.db import get_code_alembic_head, get_db_alembic_head
+
+          code_head = get_code_alembic_head()
+          assert code_head
+          assert get_db_alembic_head() == code_head
+          PY
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ai-ops-auto:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run image and migrate an empty SQLite database
+        run: |
+          docker run --rm \
+            -e DATABASE_URL=sqlite:////tmp/docker-smoke.db \
+            -e DATA_DIR=/tmp/ai-ops-data \
+            ai-ops-auto:ci ai-ops --help

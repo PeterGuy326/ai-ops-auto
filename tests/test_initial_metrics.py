@@ -113,7 +113,7 @@ def _patch_worker_externals(monkeypatch):
     monkeypatch.setattr(
         worker_mod,
         "check_rate_limit",
-        lambda s, aid: RateCheckResult(allowed=True, reason=""),
+        lambda s, aid, **kwargs: RateCheckResult(allowed=True, reason=""),
     )
     monkeypatch.setattr(worker_mod, "mark_published", lambda s, aid: None)
     monkeypatch.setattr(worker_mod, "is_paused", lambda acc: False)

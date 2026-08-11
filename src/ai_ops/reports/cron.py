@@ -12,8 +12,6 @@
 """
 from __future__ import annotations
 
-import asyncio
-
 from ..scheduler.queue import queue
 from .daily import run_daily_report_job
 from .weekly import run_weekly_report_job
@@ -30,23 +28,14 @@ def schedule_report_crons(
 
     job_id 固定（replace_existing=True 保证重启幂等）。
     """
-    scheduler = queue._scheduler  # 直接用底层 AsyncIOScheduler 避开 queue 的 cron 字符串歧义
-
-    did_job = scheduler.add_job(
-        lambda: asyncio.create_task(run_daily_report_job()),
-        trigger="cron",
-        hour=daily_hour,
-        minute=daily_minute,
-        id="report-daily",
-        replace_existing=True,
+    daily_id = queue.schedule_cron(
+        f"{daily_minute} {daily_hour} * * *",
+        run_daily_report_job,
+        job_id="report-daily",
     )
-    wid_job = scheduler.add_job(
-        lambda: asyncio.create_task(run_weekly_report_job()),
-        trigger="cron",
-        day_of_week=weekly_dow,
-        hour=weekly_hour,
-        minute=weekly_minute,
-        id="report-weekly",
-        replace_existing=True,
+    weekly_id = queue.schedule_cron(
+        f"{weekly_minute} {weekly_hour} * * {weekly_dow}",
+        run_weekly_report_job,
+        job_id="report-weekly",
     )
-    return did_job.id, wid_job.id
+    return daily_id, weekly_id

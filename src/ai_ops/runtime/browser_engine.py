@@ -14,22 +14,74 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Collection
 
 from ..config import settings
 
 
 _INJECT_DIR = Path(__file__).parent / "stealth_inject"
+_SUBPROCESS_ENV_ALLOWLIST = {
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "VIRTUAL_ENV",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SYSTEMROOT",
+    "WINDIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "PLAYWRIGHT_BROWSERS_PATH",
+}
 
 
-def build_subprocess_env(base_env: dict | None = None, proxy: str | None = None) -> dict:
-    """生成 subprocess 启动用的 env，注入 stealth + proxy。
+def build_subprocess_env(
+    base_env: dict | None = None,
+    proxy: str | None = None,
+    *,
+    include_configured_proxy: bool = True,
+    inject_browser_runtime: bool = True,
+    extra_allowlist: Collection[str] = (),
+) -> dict:
+    """生成最小 subprocess 环境，可按调用方选择注入 browser runtime。
 
     proxy: http://user:pass@host:port，会同时设到 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY。
+
+    ``extra_allowlist`` 只用于适配器声明其运行时必需的非密钥变量；调用方不得
+    把控制面 API/LLM/Fernet 凭证加入其中。媒体/模型进程应将
+    ``inject_browser_runtime`` 设为 False，避免加载 stealth ``sitecustomize``。
     """
-    env = dict(base_env or os.environ)
+    source = base_env if base_env is not None else os.environ
+    # External browser tools do not need the control plane's API/LLM/Fernet
+    # credentials.  An allowlist prevents ambient secrets from crossing the
+    # subprocess boundary while preserving browser/display/proxy essentials.
+    allowed = _SUBPROCESS_ENV_ALLOWLIST | set(extra_allowlist)
+    env = {key: value for key, value in source.items() if key in allowed}
+    env.update({"NO_COLOR": "1", "PYTHONIOENCODING": "utf-8"})
 
     engine = settings.browser_engine
-    if engine == "patchright":
+    if not inject_browser_runtime:
+        # Explicitly drop ambient injection knobs even if a caller accidentally
+        # adds PYTHONPATH/AI_OPS_STEALTH to its extra allowlist.
+        env.pop("PYTHONPATH", None)
+        env.pop("AI_OPS_STEALTH", None)
+    elif engine == "patchright":
         # PYTHONPATH 前置 stealth_inject，让 sitecustomize 启动时被加载
         sep = os.pathsep
         env["PYTHONPATH"] = f"{_INJECT_DIR}{sep}{env.get('PYTHONPATH', '')}"
@@ -44,7 +96,11 @@ def build_subprocess_env(base_env: dict | None = None, proxy: str | None = None)
         # 裸 Playwright，无注入
         pass
 
-    effective_proxy = proxy or settings.browser_proxy
+    effective_proxy = (
+        proxy
+        if proxy is not None
+        else settings.browser_proxy if include_configured_proxy else ""
+    )
     if effective_proxy:
         env["HTTP_PROXY"] = effective_proxy
         env["HTTPS_PROXY"] = effective_proxy

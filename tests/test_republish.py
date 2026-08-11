@@ -275,6 +275,37 @@ def test_republish_default_reason_is_manual(session_in_memory) -> None:
         assert v2.raw_response.get("republish_reason") == "manual"
 
 
+def test_uncertain_job_requires_explicit_platform_verification(session_in_memory) -> None:
+    SessionLocal = session_in_memory
+    with SessionLocal() as s:
+        _, art, acc = _mk_topic_article_account(s)
+        v1 = _mk_job(s, art.id, acc.id, status=JobStatus.FAILED)
+        v1.raw_response = {"outcome_uncertain": True}
+        s.commit()
+
+        with pytest.raises(ValueError, match="platform may already contain"):
+            republish_job(s, v1.id)
+
+        v2 = republish_job(s, v1.id, platform_checked=True)
+        s.commit()
+        assert v2.raw_response["platform_checked"] is True
+
+
+def test_unknown_error_text_defensively_requires_platform_verification(
+    session_in_memory,
+) -> None:
+    SessionLocal = session_in_memory
+    with SessionLocal() as s:
+        _, art, acc = _mk_topic_article_account(s)
+        v1 = _mk_job(s, art.id, acc.id, status=JobStatus.FAILED)
+        v1.error = "发布执行被中断，平台结果未知；请先核验"
+        v1.raw_response = {}
+        s.commit()
+
+        with pytest.raises(ValueError, match="platform may already contain"):
+            republish_job(s, v1.id)
+
+
 # ---------------------------------------------------------------------------
 # Case 7 (bonus): AUTO_REPUBLISH_ON_DEAD 默认关
 # ---------------------------------------------------------------------------
@@ -324,7 +355,7 @@ def test_auto_republish_branch_not_triggered_when_off(
     monkeypatch.setattr(
         worker_mod,
         "check_rate_limit",
-        lambda s, aid: RateCheckResult(allowed=True, reason=""),
+        lambda s, aid, **kwargs: RateCheckResult(allowed=True, reason=""),
     )
     monkeypatch.setattr(worker_mod, "mark_published", lambda s, aid: None)
     monkeypatch.setattr(worker_mod, "is_paused", lambda acc: False)
