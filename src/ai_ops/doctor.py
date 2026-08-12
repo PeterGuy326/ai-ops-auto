@@ -1,9 +1,11 @@
 """Read-only installation and runtime diagnostics for ai-ops-auto.
 
 The doctor deliberately does not migrate a database, create a SQLite file,
-launch a browser, execute an adapter binary, or contact a publishing platform.
-It only inspects local configuration/resources and opens the configured
-database for a read-only query.
+launch a browser, or contact a publishing platform. It only inspects local
+configuration/resources and opens the configured database for a read-only
+query. The sole adapter execution is an opt-in, fixed ``gh --version`` probe;
+it receives a minimal environment without credentials and never performs API
+or login discovery.
 
 Exit policy is deterministic: required check failures return 1, otherwise 0.
 Callers may opt into ``strict`` mode, where warnings also return 1.  CLI usage
@@ -13,6 +15,7 @@ errors remain the CLI framework's responsibility (normally exit code 2).
 from __future__ import annotations
 
 import ast
+import hashlib
 from dataclasses import dataclass, field
 from enum import StrEnum
 import importlib.util
@@ -20,9 +23,15 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
+import signal
 import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 from typing import Any, Callable, Sequence
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -37,7 +46,9 @@ from .config import (
     SCOPE_CONTENT_STAGE,
     SCOPE_PLAN_CREATE,
     SCOPE_SCHEDULE_CREATE,
+    canonical_github_pages_base,
     settings,
+    valid_github_pages_repository,
 )
 
 
@@ -157,6 +168,156 @@ class DoctorReport:
 
 ModuleProbe = Callable[[str], bool]
 ExecutableProbe = Callable[[str], str | None]
+CommandProbe = Callable[[Sequence[str]], tuple[int, str]]
+FileDigestProbe = Callable[[str], str | None]
+
+_GH_VERSION_PATTERN = re.compile(
+    r"^gh version (?P<version>[0-9]+\.[0-9]+\.[0-9]+)(?: \([^\r\n]+\))?$"
+)
+_GH_PROBE_MAX_OUTPUT_BYTES = 4096
+_GH_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+def _local_file_sha256(value: str) -> str | None:
+    try:
+        path = Path(value).resolve(strict=True)
+        metadata = path.stat()
+        if not path.is_file() or metadata.st_size > 512 * 1024 * 1024:
+            return None
+        with path.open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+    except OSError:
+        return None
+
+
+def _stop_local_probe_tree(process: subprocess.Popen[bytes]) -> None:
+    """Best-effort termination of the probe and descendants."""
+
+    try:
+        if os.name == "posix" and process.pid:
+            os.killpg(process.pid, signal.SIGKILL)
+        elif process.poll() is None:
+            process.kill()
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        process.wait(timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _local_command_probe(argv: Sequence[str]) -> tuple[int, str]:
+    """Run one fixed local metadata probe without forwarding ambient secrets."""
+
+    with tempfile.TemporaryDirectory(prefix="ai-ops-doctor-gh-") as isolated_root:
+        root = Path(isolated_root)
+        safe_env = {
+            "DO_NOT_TRACK": "true",
+            "GH_CONFIG_DIR": str(root / "gh-config"),
+            "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
+            "GH_NO_UPDATE_NOTIFIER": "1",
+            "GH_PROMPT_DISABLED": "1",
+            "GH_TELEMETRY": "false",
+            "HOME": str(root / "home"),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "NO_COLOR": "1",
+            "PATH": os.environ.get("PATH", os.defpath),
+            "TMP": str(root / "tmp"),
+            "TEMP": str(root / "tmp"),
+            "TMPDIR": str(root / "tmp"),
+            "USERPROFILE": str(root / "home"),
+            "XDG_CACHE_HOME": str(root / "xdg-cache"),
+            "XDG_CONFIG_HOME": str(root / "xdg-config"),
+            "XDG_DATA_HOME": str(root / "xdg-data"),
+            "XDG_STATE_HOME": str(root / "xdg-state"),
+        }
+        for directory in (
+            root / "gh-config",
+            root / "home",
+            root / "tmp",
+            root / "xdg-cache",
+            root / "xdg-config",
+            root / "xdg-data",
+            root / "xdg-state",
+        ):
+            directory.mkdir()
+        for name in ("SYSTEMROOT", "WINDIR"):
+            value = os.environ.get(name)
+            if value:
+                safe_env[name] = value
+        popen_kwargs: dict[str, Any] = {
+            "cwd": root,
+            "env": safe_env,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+        }
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        try:
+            process = subprocess.Popen(  # noqa: S603 - fixed probed gh executable
+                tuple(argv),
+                **popen_kwargs,
+            )
+        except OSError:
+            return -1, ""
+
+        output = bytearray()
+        overflow = threading.Event()
+        read_failed = threading.Event()
+        drained = threading.Event()
+
+        def drain_output() -> None:
+            try:
+                assert process.stdout is not None
+                while chunk := process.stdout.read(4096):
+                    remaining = _GH_PROBE_MAX_OUTPUT_BYTES + 1 - len(output)
+                    if remaining > 0:
+                        output.extend(chunk[:remaining])
+                    if len(output) > _GH_PROBE_MAX_OUTPUT_BYTES:
+                        overflow.set()
+            except (OSError, ValueError):
+                read_failed.set()
+            finally:
+                drained.set()
+
+        reader = threading.Thread(target=drain_output, daemon=True)
+        reader.start()
+        deadline = time.monotonic() + _GH_PROBE_TIMEOUT_SECONDS
+        parent_exited_at: float | None = None
+        failed = False
+        while not drained.wait(0.01):
+            now = time.monotonic()
+            if overflow.is_set() or read_failed.is_set() or now >= deadline:
+                failed = True
+                break
+            if process.poll() is not None:
+                parent_exited_at = parent_exited_at or now
+                # A normal `gh --version` has no descendant retaining stdout.
+                if now - parent_exited_at >= 0.1:
+                    failed = True
+                    break
+
+        if overflow.is_set() or read_failed.is_set():
+            failed = True
+        if failed:
+            _stop_local_probe_tree(process)
+            reader.join(timeout=1)
+            return -1, ""
+        try:
+            return_code = process.wait(timeout=1)
+        except (OSError, subprocess.SubprocessError):
+            _stop_local_probe_tree(process)
+            return -1, ""
+        reader.join(timeout=1)
+        if reader.is_alive() or len(output) > _GH_PROBE_MAX_OUTPUT_BYTES:
+            _stop_local_probe_tree(process)
+            return -1, ""
+        return return_code, bytes(output).decode("utf-8", errors="replace")
+
 
 _REQUIRED_CORE_TABLES = frozenset(
     {
@@ -1196,6 +1357,131 @@ def _binary_adapter_check(
     )
 
 
+def _github_pages_gh_check(
+    config: Any,
+    *,
+    executable_probe: ExecutableProbe,
+    command_probe: CommandProbe,
+    file_digest_probe: FileDigestProbe,
+) -> DoctorCheck:
+    enabled = bool(getattr(config, "github_pages_gh_verify_enabled", False))
+    token = getattr(config, "github_pages_gh_token", "")
+    reveal = getattr(token, "get_secret_value", None)
+    token_value = reveal() if callable(reveal) else token
+    token_configured = bool(str(token_value).strip())
+    base_details = {
+        "enabled": enabled,
+        "token_configured": token_configured,
+        "probed_online": False,
+    }
+    if not enabled:
+        return _result(
+            "adapter.github_pages_gh",
+            CheckOutcome.SKIP,
+            "GitHub Pages gh verification is disabled",
+            details=base_details,
+        )
+
+    repository = str(getattr(config, "github_pages_repository", ""))
+    binary = str(getattr(config, "github_pages_gh_bin", "gh"))
+    expected_version = str(getattr(config, "github_pages_gh_version", "2.97.0"))
+    expected_digest = str(getattr(config, "github_pages_gh_sha256", ""))
+    problems: list[str] = []
+    if binary != "gh":
+        problems.append("gh executable contract is not fixed to the audited basename")
+    if expected_version != "2.97.0":
+        problems.append("gh version contract is not the approved release contract")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+        problems.append("gh executable SHA-256 approval pin is missing or malformed")
+    if not valid_github_pages_repository(repository):
+        problems.append("GitHub repository is missing or not exact owner/repo syntax")
+    base_url = str(getattr(config, "github_pages_base_url", ""))
+    base_url_approved = canonical_github_pages_base(base_url, repository=repository) is not None
+    if not base_url_approved:
+        problems.append("GitHub Pages base URL is not the canonical owner github.io HTTPS boundary")
+    if not token_configured:
+        problems.append("project-scoped GitHub Pages token is not configured")
+    if problems:
+        return _result(
+            "adapter.github_pages_gh",
+            CheckOutcome.FAIL,
+            "GitHub Pages gh verification configuration is incomplete or unsafe",
+            remediation=(
+                "configure exact owner/repo, the approved gh contract, and a project-scoped "
+                "Pages:read token, or disable GITHUB_PAGES_GH_VERIFY_ENABLED"
+            ),
+            details={
+                **base_details,
+                "base_url_approved": base_url_approved,
+                "problems": problems,
+                "version_probed": False,
+            },
+        )
+
+    executable = executable_probe(binary)
+    if not executable:
+        return _result(
+            "adapter.github_pages_gh",
+            CheckOutcome.FAIL,
+            "GitHub Pages gh verification is enabled but gh is unavailable",
+            remediation="install the approved gh 2.97.0 binary or disable Pages verification",
+            details={
+                **base_details,
+                "executable_available": False,
+                "version_probed": False,
+                "expected_version": expected_version,
+            },
+        )
+
+    observed_digest = file_digest_probe(executable)
+    if observed_digest != expected_digest:
+        return _result(
+            "adapter.github_pages_gh",
+            CheckOutcome.FAIL,
+            "installed gh does not match the approved executable SHA-256",
+            remediation="verify the official gh 2.97.0 artifact and update the deployment digest pin",
+            details={
+                **base_details,
+                "base_url_approved": base_url_approved,
+                "executable_available": True,
+                "binary_digest_matches": False,
+                "version_probed": False,
+                "expected_version": expected_version,
+            },
+        )
+
+    try:
+        return_code, output = command_probe((executable, "--version"))
+    except (Exception, SystemExit):
+        return_code, output = -1, ""
+    first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    match = _GH_VERSION_PATTERN.fullmatch(first_line)
+    observed_version = match.group("version") if match else None
+    details = {
+        **base_details,
+        "executable_available": True,
+        "version_probed": True,
+        "expected_version": expected_version,
+        "observed_version": observed_version,
+        "base_url_approved": base_url_approved,
+        "binary_digest_matches": True,
+    }
+    if return_code != 0 or observed_version != expected_version:
+        return _result(
+            "adapter.github_pages_gh",
+            CheckOutcome.FAIL,
+            "installed gh does not satisfy the pinned version contract",
+            remediation="install gh 2.97.0 exactly, then rerun doctor",
+            details=details,
+        )
+    return _result(
+        "adapter.github_pages_gh",
+        CheckOutcome.PASS,
+        "approved SHA-256 and self-reported gh 2.97.0 match; authentication and Pages were not probed",
+        details=details,
+    )
+
+
 def _local_adapter_check(
     check_id: str,
     *,
@@ -1320,7 +1606,12 @@ def _isolated_python_adapter_check(
     )
 
 
-def _adapter_checks(config: Any, executable_probe: ExecutableProbe) -> list[DoctorCheck]:
+def _adapter_checks(
+    config: Any,
+    executable_probe: ExecutableProbe,
+    command_probe: CommandProbe = _local_command_probe,
+    file_digest_probe: FileDigestProbe = _local_file_sha256,
+) -> list[DoctorCheck]:
     zhihu = _binary_adapter_check(
         "adapter.zhihu_cli",
         enabled=bool(getattr(config, "zhihu_cli_enabled", False)),
@@ -1334,6 +1625,12 @@ def _adapter_checks(config: Any, executable_probe: ExecutableProbe) -> list[Doct
         binary=str(getattr(config, "youtube_uploader_bin", "youtubeuploader")),
         label="YouTube uploader",
         executable_probe=executable_probe,
+    )
+    github_pages_gh = _github_pages_gh_check(
+        config,
+        executable_probe=executable_probe,
+        command_probe=command_probe,
+        file_digest_probe=file_digest_probe,
     )
 
     sau_root = Path(getattr(config, "external_sau_path", "./external/social-auto-upload"))
@@ -1373,7 +1670,7 @@ def _adapter_checks(config: Any, executable_probe: ExecutableProbe) -> list[Doct
         entry_relative=Path("funclip/videoclipper.py"),
         configured_python=funclip_python,
     )
-    return [zhihu, youtube, sau, xhs, mpt, funclip]
+    return [zhihu, youtube, github_pages_gh, sau, xhs, mpt, funclip]
 
 
 def _publisher_plugin_selection_check(
@@ -1448,6 +1745,8 @@ def run_doctor(
     package_root: Path | None = None,
     module_probe: ModuleProbe = _module_available,
     executable_probe: ExecutableProbe = shutil.which,
+    command_probe: CommandProbe = _local_command_probe,
+    file_digest_probe: FileDigestProbe = _local_file_sha256,
     plugin_entry_points: Sequence[Any] | None = None,
 ) -> DoctorReport:
     """Run the fixed-order, side-effect-free doctor checks."""
@@ -1465,7 +1764,7 @@ def run_doctor(
     checks.extend(_security_checks(active))
     checks.append(_scheduler_check(active, module_probe))
     checks.append(_browser_check(active, module_probe, executable_probe))
-    checks.extend(_adapter_checks(active, executable_probe))
+    checks.extend(_adapter_checks(active, executable_probe, command_probe, file_digest_probe))
     checks.append(_publisher_plugin_selection_check(active, entry_points=plugin_entry_points))
     return DoctorReport(tuple(checks))
 

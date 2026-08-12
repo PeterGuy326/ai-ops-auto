@@ -3,12 +3,70 @@ import ipaddress
 from pathlib import Path
 import re
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PrincipalType = Literal["agent", "human", "service"]
+
+_GITHUB_PAGES_REPOSITORY_RE = re.compile(
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)"
+    r"/(?P<repo>[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9._-])?)\Z"
+)
+
+
+def valid_github_pages_repository(value: str) -> bool:
+    match = _GITHUB_PAGES_REPOSITORY_RE.fullmatch(value)
+    if match is None:
+        return False
+    return (
+        "--" not in match.group("owner")
+        and match.group("repo") not in {".", ".."}
+        and not match.group("repo").endswith(".git")
+    )
+
+
+def canonical_github_pages_base(
+    value: str,
+    *,
+    repository: str,
+) -> tuple[str, str] | None:
+    """Canonical owner github.io boundary shared by config, doctor, and runtime."""
+
+    match = _GITHUB_PAGES_REPOSITORY_RE.fullmatch(repository)
+    if (
+        match is None
+        or not value
+        or value != value.strip()
+        or any(not 0x20 <= ord(character) <= 0x7E for character in value)
+    ):
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    expected_host = f"{match.group('owner').lower()}.github.io"
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() != expected_host
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "%" in parsed.path
+        or "//" in parsed.path
+    ):
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if any(part in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9._~-]+", part) for part in parts):
+        return None
+    return expected_host, ("/" + "/".join(parts) if parts else "/")
+
+
 SCOPE_CONTENT_STAGE = "content:stage"
 SCOPE_PLAN_CREATE = "plan:create"
 SCOPE_APPROVAL_REQUEST = "approval:request"
@@ -318,8 +376,66 @@ class Settings(BaseSettings):
     github_pages_branch: str = "main"
     # 站点 base URL（构成 platform_url）
     github_pages_base_url: str = ""
+    # 可选的 GitHub Pages 部署/readback 验证。默认关闭，只有完成受控 canary
+    # 后才应启用；固定版本升级必须连同契约审计与测试一起提交。
+    github_pages_gh_verify_enabled: bool = False
+    github_pages_repository: str = Field(default="", max_length=140)
+    github_pages_gh_bin: Literal["gh"] = "gh"
+    github_pages_gh_version: Literal["2.97.0"] = "2.97.0"
+    github_pages_gh_sha256: str = Field(default="", max_length=64)
+    # 只接受项目专用的最小 Pages:read token。Publisher 会把解密后的值仅作为
+    # 固定 gh argv 的 GH_TOKEN 注入，不继承 ambient GH_TOKEN/GITHUB_TOKEN。
+    github_pages_gh_token: SecretStr = SecretStr("")
+    github_pages_deploy_timeout_seconds: int = Field(default=600, ge=1, le=3600)
+    github_pages_verify_poll_seconds: int = Field(default=5, ge=1, le=60)
+    github_pages_readback_timeout_seconds: int = Field(default=120, ge=1, le=600)
+    github_pages_readback_request_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    github_pages_readback_max_response_bytes: int = Field(
+        default=2 * 1024 * 1024,
+        ge=1024,
+        le=10 * 1024 * 1024,
+    )
     # dry_run: True 时只渲染 markdown 预览，不写文件 / 不构建 / 不 git push（安全演练）
     github_pages_dry_run: bool = True
+
+    @field_validator("github_pages_repository")
+    @classmethod
+    def _validate_github_pages_repository(cls, value: str) -> str:
+        if not value:
+            return value
+        if value != value.strip() or not valid_github_pages_repository(value):
+            raise ValueError("GITHUB_PAGES_REPOSITORY must use exact owner/repo syntax")
+        return value
+
+    @field_validator("github_pages_gh_sha256")
+    @classmethod
+    def _validate_github_pages_gh_sha256(cls, value: str) -> str:
+        if value and re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("GITHUB_PAGES_GH_SHA256 must be one lowercase SHA-256 digest")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_github_pages_verification(self):
+        if self.github_pages_gh_verify_enabled and not self.github_pages_repository:
+            raise ValueError(
+                "GITHUB_PAGES_REPOSITORY is required when GITHUB_PAGES_GH_VERIFY_ENABLED=true"
+            )
+        if self.github_pages_gh_verify_enabled and not self.github_pages_gh_sha256:
+            raise ValueError(
+                "GITHUB_PAGES_GH_SHA256 is required when GITHUB_PAGES_GH_VERIFY_ENABLED=true"
+            )
+        if (
+            self.github_pages_gh_verify_enabled
+            and canonical_github_pages_base(
+                self.github_pages_base_url,
+                repository=self.github_pages_repository,
+            )
+            is None
+        ):
+            raise ValueError(
+                "GITHUB_PAGES_BASE_URL must be canonical owner github.io HTTPS when gh verification is enabled"
+            )
+        return self
 
     api_host: str = "127.0.0.1"
     api_port: int = 8000

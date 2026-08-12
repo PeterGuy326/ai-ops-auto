@@ -74,7 +74,8 @@ has_python_module() {
 build_project() {
   # The source path is absolute and the interpreter starts from an empty temp
   # directory, avoiding local build artifacts on sys.path.
-  (cd "$VERIFY_BUILD_CWD" && "$PYTHON_BIN" -m build --no-isolation "$PROJECT_ROOT")
+  (cd "$VERIFY_BUILD_CWD" && "$PYTHON_BIN" -m build --no-isolation \
+    --outdir "$VERIFY_BUILD_CWD/dist" "$PROJECT_ROOT")
 }
 
 build_project_with_uv() {

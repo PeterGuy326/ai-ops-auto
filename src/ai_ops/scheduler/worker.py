@@ -475,6 +475,72 @@ def _best_effort_mark_uncertain(
         return False
 
 
+def _recover_timed_out_publish_result(
+    job_id: int,
+    operation_id: str,
+    *,
+    execution_context: WorkerExecutionContext | None = None,
+) -> PublishResult | None:
+    """Recover a confirmed side effect journaled before the outer timeout.
+
+    The publisher task is cancelled by ``asyncio.wait_for``.  A built-in
+    adapter may already have persisted an accepted/deployed receipt before the
+    cancellation arrived, so replacing it with a generic unknown result would
+    erase the only exact platform identity.  Only an exact, versioned receipt
+    that confirms an external effect is promoted into the final DB result.
+    """
+
+    try:
+        receipt = (
+            read_publish_receipt(job_id, operation_id)
+            if execution_context is None
+            else execution_context.receipt_reader(job_id, operation_id)
+        )
+    except Exception as exc:
+        logger.warning(
+            "worker timeout receipt recovery failed closed",
+            extra={"job_id": job_id, "error_type": type(exc).__name__},
+        )
+        return None
+
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("version") != 1
+        or receipt.get("job_id") != job_id
+        or receipt.get("operation_id") != operation_id
+        or receipt.get("effect_applied") is not True
+    ):
+        return None
+
+    raw_value = receipt.get("raw_response")
+    raw_response = dict(raw_value) if isinstance(raw_value, dict) else {}
+    publisher_kind = receipt.get("publisher_kind")
+    if isinstance(publisher_kind, str) and 0 < len(publisher_kind) <= 64:
+        raw_response["publisher_kind"] = publisher_kind
+    raw_response.update(
+        {
+            "receipt_recovered": True,
+            "reconciliation_required": True,
+        }
+    )
+
+    post_id = receipt.get("platform_post_id")
+    platform_post_id = post_id if isinstance(post_id, str) and post_id else None
+    post_url = receipt.get("platform_url")
+    platform_url = post_url if isinstance(post_url, str) and post_url else None
+    receipt_success = receipt.get("success") is True and receipt.get("outcome_uncertain") is False
+    return PublishResult(
+        success=receipt_success,
+        effect_applied=True,
+        retryable=False,
+        outcome_uncertain=not receipt_success,
+        platform_post_id=platform_post_id,
+        platform_url=platform_url,
+        error=None if receipt_success else TIMED_OUT_EXECUTION_ERROR,
+        raw_response=raw_response,
+    )
+
+
 def schedule_job_runs(jobs, *, default_when: datetime | None = None) -> list[tuple[int, datetime]]:
     """Persist jittered run times and optionally register in-memory callbacks.
 
@@ -887,7 +953,11 @@ async def _execute_job_once(
         )
     except TimeoutError:
         execution_uncertain = True
-        result = PublishResult(
+        result = _recover_timed_out_publish_result(
+            job_id,
+            operation_id,
+            execution_context=execution_context,
+        ) or PublishResult(
             success=False,
             outcome_uncertain=True,
             error=TIMED_OUT_EXECUTION_ERROR,

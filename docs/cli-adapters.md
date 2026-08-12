@@ -51,7 +51,7 @@ CLI 是 Publisher 的一种执行后端，不是新的控制面。一个发布 C
 | TikTok | [官方 Content Posting API](https://developers.tiktok.com/products/content-posting-api) | 有 OAuth、publish ID 和状态查询，但不是现成 CLI | 未来用官方 API 做薄 CLI/Publisher |
 | TikTok | [`tiktok-uploader 1.2.0`](https://pypi.org/project/tiktok-uploader/) | Playwright CLI，无 post ID/URL/JSON，失败退出语义不可靠 | 仅浏览器 fallback 候选 |
 | YouTube | [`youtubeuploader v1.25.5`](https://github.com/porjo/youtubeuploader/releases/tag/v1.25.5) | 基于官方 Data API；`-metaJSONout` 可得到 video resource/ID | 已接 default-off canary；receipt 是成功边界，当前没有 SAU fallback |
-| GitHub Pages | 当前：`git` + 固定 `pnpm|npx`；候选：[`gh v2.97.0`](https://github.com/cli/cli/releases/tag/v2.97.0) | 当前只能把本地 commit 与 source branch remote SHA 对账；`gh api`/Actions 可作为后续部署状态来源 | 已加固现有 push；`gh` 尚未集成，Pages deploy/live URL readback 待补 |
+| GitHub Pages | `git` + 固定 `pnpm|npx`；默认关闭的 [`gh v2.97.0`](https://github.com/cli/cli/releases/tag/v2.97.0) 验证 | `gh` 没有 Pages 专用子命令；固定 `gh api` 先校验站点，再按精确 commit 查询 deployment，最后用非秘密 marker 读取公网 URL | 已接 default-off Experimental 验证纵切；只有离线 mock 契约，未连真实 remote/Pages，不能升 Stable |
 
 YouTube 还有平台级前置条件：2020-07-28 后创建且未经审核的 API 项目，通过
 `videos.insert` 上传的视频会被限制为私有，需要完成 Google 审核才能公开。见
@@ -80,8 +80,13 @@ YouTube 还有平台级前置条件：2020-07-28 后创建且未经审核的 API
 
 1. **已落地**：GitHub Pages 只允许固定 `pnpm|npx`/git argv，用本地 commit SHA
    与 source branch 的 `git ls-remote` 对账。live 流程持有仓库级跨进程锁，commit 路径
-   必须与本任务文章/图片精确一致。这只证明远端分支接受了 commit；下一步才是集成 `gh`
-   或等价 API，补 Actions/Pages deploy 与 live URL readback。
+   必须与本任务文章/图片精确一致；每次 transport 使用不可猜的一次性 URL alias，并显式关闭
+   follow-tags/submodule/signed/push-option 扩展。默认关闭的 `gh 2.97.0` 验证使用固定
+   [`gh api`](https://cli.github.com/manual/gh_api) argv 调用 GitHub Pages REST：写前校验站点，
+   仅在 `public=true` 时允许写；push 后按精确 commit 查询 deployment，再从目标 URL 用禁压缩、
+   raw 分块有界响应回读本轮非秘密 marker。实际执行的是按 SHA-256 验收后生成的本轮私有只读
+   `gh` 副本。这个实现只有
+   离线契约测试，尚无真实 remote/Pages canary，因此继续标 Experimental。
 2. **已落地**：`youtubeuploader` 每账号隔离 OAuth 文件，固定 v1.25.5，解析
    `-metaJSONout` video ID；默认关闭，等专用频道 private canary。
 3. **待实现**：B 站改接官方 Open Platform；`biliup` JSON shim 只保留为可选 fallback，
@@ -127,8 +132,10 @@ B 站主路线应以官方 Open Platform 的稿件 ID/查询/webhook 为准；�
   也不会自动改走 Playwright 登录。
 - **控制面回执**：worker 在进入外部写之前为 job 持久化 operation ID；CLI 在返回前、worker 在
   数据库 finalize 前都会把 post identity 与脱敏状态原子写入私有 sidecar。正常落库后删除；若
-  进程崩溃或 finalize 失败，stale reconciliation 会恢复 ID/URL 并保持禁止重发。正文、stdout、
-  cookie、OAuth token 和任意未列入白名单的 raw 字段不会进入 sidecar。
+  publisher 在 accepted/deployed 后撞上 worker 外层 timeout，会先按精确 job/operation 恢复
+  commit、URL 和单调状态，数据库提交后才删除 sidecar；进程崩溃或 finalize 失败则由 stale
+  reconciliation 恢复，并保持禁止重发。正文、stdout、cookie、OAuth token 和任意未列入白名单的
+  raw 字段不会进入 sidecar。
 - **YouTube**：每个账号的 `client_secrets.json`/`request.token` 放在权限
   `0700/0600` 的隔离目录；正文元数据写入临时 `0600` JSON，不进 argv。token 内容不进 argv，
   但 `request.token` 的文件路径会作为 `-cache=...` 参数传给子进程。合法回执中的 video ID 与
@@ -138,9 +145,24 @@ B 站主路线应以官方 Open Platform 的稿件 ID/查询/webhook 为准；�
 - **GitHub Pages**：dry-run 明确 `effect_applied=false`；图片只能来自
   `GITHUB_PAGES_ASSET_ROOT`，拒绝隐藏文件、符号链接、越界和伪造扩展名，并受单张/总大小
   上限约束。live 的 clean/write/build/commit/push 全程持有跨进程仓库锁，commit 路径集合
-  必须与本任务完全相等。push 后的 remote SHA 只是 source branch receipt，不是 Pages 部署
-  完成或公网 URL 可访问的证据。commit 产生前的 build/add/commit 失败只会在 HEAD、index 和
+  必须与本任务完全相等；commit tree 中每个 blob/mode 还必须与写入时密封的批准字节一致。写前要求
+  本地 HEAD 与目标 remote branch HEAD 完全一致，push 使用该预检 SHA 的 exact force-with-lease、
+  固定预检时捕获的无凭证 github.com URL；transport 用每命令一次性随机 alias 映射一次到批准目标，
+  并禁用 Git hooks、implicit tag/submodule/signed/push-option 扩展，阻止并发历史夹带、remote
+  重写和额外 ref 副作用。文章/图片创建、失败清理和 rollback 使用仓库根 dirfd 下逐级 no-follow
+  能力，父目录竞态不会重定向到仓库外。`GITHUB_PAGES_GH_VERIFY_ENABLED=false` 时，push 后的 remote SHA 仍只是
+  `accepted` source receipt。显式启用时，固定 `gh api` 按该 SHA 查询
+  [Pages deployment](https://docs.github.com/en/rest/pages/pages)，只有 `succeed` 才记 `deployed`；
+  随后目标 URL 返回 HTTP 200、HTML 且包含本轮 marker 才记 `verified`。部署或 readback 在 push
+  后无法确认时保留副作用/unknown 语义，禁止盲目重推。commit 产生前的 build/add/commit 失败只会在 HEAD、index 和
   本轮文件指纹仍可证明安全时精确回滚本轮路径；发现用户并发改动就停止自动恢复。
+  `gh` 契约固定为自报 2.97.0；运行时从同一已打开来源复制并核对 SHA-256，只执行本轮私有只读副本，
+  版本探针不接收 token，
+  只有精确白名单 `gh api` argv 才注入项目专用 `GITHUB_PAGES_GH_TOKEN`。子进程关闭 telemetry/update、
+  隔离 HOME/XDG，且不继承 ambient token/proxy/自定义 CA；token、API body 和公网响应正文都不进入回执。
+  首版自动 readback 还要求 workflow publishing source、`https_enforced=true`，并把目标限制在仓库
+  owner 对应的 `https://<owner>.github.io` origin；不跟随 redirect。自定义域名在补齐 DNS/TLS/
+  重绑定风险 canary 前只能人工核验，不能记为自动 `verified`。
 
 指标回采绑定实际完成 fallback 链的 `publisher_kind`。只有同 kind 且显式声明支持 metrics 的
 adapter 才能采集；CLI 没有真实 collector 时返回 `skipped`，不能用全 0 污染热度或账号健康。

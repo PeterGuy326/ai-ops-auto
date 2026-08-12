@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
+import os
 from pathlib import Path
+import sys
+import time
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -18,6 +22,7 @@ from ai_ops.doctor import (
     _browser_check,
     _database_checks,
     _default_resource_roots,
+    _local_command_probe,
     _migration_bundle,
     _migration_heads,
     _publication_safety_check,
@@ -36,6 +41,13 @@ def _config(tmp_path: Path, **overrides):
         "data_dir": tmp_path,
         "auto_publish_enabled": False,
         "github_pages_dry_run": True,
+        "github_pages_gh_verify_enabled": False,
+        "github_pages_repository": "",
+        "github_pages_base_url": "https://owner.github.io/site",
+        "github_pages_gh_bin": "gh",
+        "github_pages_gh_version": "2.97.0",
+        "github_pages_gh_sha256": "a" * 64,
+        "github_pages_gh_token": "",
         "zhihu_cli_enabled": False,
         "zhihu_cli_bin": "zhihu",
         "youtube_uploader_enabled": False,
@@ -602,6 +614,222 @@ def test_enabled_optional_binary_adapter_missing_is_warning(tmp_path):
 
     assert by_id["adapter.zhihu_cli"].outcome == CheckOutcome.WARN
     assert by_id["adapter.youtube_uploader"].outcome == CheckOutcome.SKIP
+    assert by_id["adapter.github_pages_gh"].outcome == CheckOutcome.SKIP
+
+
+def test_enabled_github_pages_gh_requires_exact_local_version_without_network(tmp_path):
+    calls: list[tuple[str, ...]] = []
+    config = _config(
+        tmp_path,
+        github_pages_gh_verify_enabled=True,
+        github_pages_repository="owner/site",
+        github_pages_gh_token="configured-secret",
+    )
+
+    def command_probe(argv):
+        calls.append(tuple(argv))
+        return 0, "gh version 2.97.0 (2026-07-01)\nrelease metadata\n"
+
+    checks = _adapter_checks(
+        config,
+        lambda binary: "/usr/bin/gh" if binary == "gh" else None,
+        command_probe,
+        lambda _binary: "a" * 64,
+    )
+    check = {item.check_id: item for item in checks}["adapter.github_pages_gh"]
+
+    assert check.outcome == CheckOutcome.PASS
+    assert calls == [("/usr/bin/gh", "--version")]
+    assert check.details == {
+        "enabled": True,
+        "token_configured": True,
+        "probed_online": False,
+        "executable_available": True,
+        "version_probed": True,
+        "expected_version": "2.97.0",
+        "observed_version": "2.97.0",
+        "base_url_approved": True,
+        "binary_digest_matches": True,
+    }
+
+
+def test_github_pages_gh_local_version_probe_does_not_forward_ambient_tokens(monkeypatch):
+    observed: dict = {}
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github-secret")
+
+    class FakeProcess:
+        pid = 999_999
+        returncode = 0
+
+        def __init__(self):
+            self.stdout = io.BytesIO(b"gh version 2.97.0\n")
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            del timeout
+            return self.returncode
+
+    def fake_popen(argv, **kwargs):
+        observed["argv"] = tuple(argv)
+        observed["env"] = dict(kwargs["env"])
+        observed["cwd"] = Path(kwargs["cwd"])
+        return FakeProcess()
+
+    monkeypatch.setattr("ai_ops.doctor.subprocess.Popen", fake_popen)
+
+    return_code, output = _local_command_probe(("/usr/bin/gh", "--version"))
+
+    assert return_code == 0
+    assert output == "gh version 2.97.0\n"
+    assert observed["argv"] == ("/usr/bin/gh", "--version")
+    assert "GH_TOKEN" not in observed["env"]
+    assert "GITHUB_TOKEN" not in observed["env"]
+    assert observed["env"]["GH_TELEMETRY"] == "false"
+    assert observed["env"]["DO_NOT_TRACK"] == "true"
+    assert not observed["cwd"].exists()
+
+
+def test_github_pages_gh_local_probe_rejects_output_over_bound(tmp_path):
+    script = tmp_path / "flood.py"
+    script.write_text("import sys\nsys.stdout.write('x' * 100_000)\n", encoding="utf-8")
+
+    return_code, output = _local_command_probe((sys.executable, str(script)))
+
+    assert return_code == -1
+    assert output == ""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group contract")
+def test_github_pages_gh_local_probe_kills_descendant_holding_stdout(tmp_path):
+    pid_file = tmp_path / "child.pid"
+    script = tmp_path / "descendant.py"
+    script.write_text(
+        "import pathlib, subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    return_code, output = _local_command_probe((sys.executable, str(script), str(pid_file)))
+
+    assert return_code == -1
+    assert output == ""
+    child_pid = int(pid_file.read_text(encoding="utf-8"))
+    for _ in range(100):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("doctor probe descendant survived process-group termination")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_problem"),
+    [
+        ({"github_pages_repository": ""}, "repository"),
+        ({"github_pages_repository": "owner/-site"}, "repository"),
+        ({"github_pages_base_url": ""}, "base URL"),
+        ({"github_pages_base_url": "http://owner.github.io/site"}, "base URL"),
+        ({"github_pages_base_url": "https://custom.example/site"}, "base URL"),
+        ({"github_pages_base_url": " https://owner.github.io/site"}, "base URL"),
+        ({"github_pages_base_url": "https://owner.github.io/site\n"}, "base URL"),
+        ({"github_pages_base_url": "\x00https://owner.github.io/site"}, "base URL"),
+        ({"github_pages_base_url": "https://own\ter.github.io/site"}, "base URL"),
+        ({"github_pages_gh_token": ""}, "token"),
+        ({"github_pages_gh_token": "   "}, "token"),
+        ({"github_pages_gh_bin": "/tmp/gh"}, "executable contract"),
+        ({"github_pages_gh_version": "2.98.0"}, "version contract"),
+        ({"github_pages_gh_sha256": ""}, "SHA-256"),
+    ],
+)
+def test_enabled_github_pages_gh_rejects_unsafe_static_configuration(
+    tmp_path,
+    overrides,
+    expected_problem,
+):
+    values = {
+        "github_pages_gh_verify_enabled": True,
+        "github_pages_repository": "owner/site",
+        "github_pages_gh_token": "configured-secret",
+    }
+    values.update(overrides)
+    calls = 0
+
+    def command_probe(_argv):
+        nonlocal calls
+        calls += 1
+        return 0, "gh version 2.97.0"
+
+    checks = _adapter_checks(
+        _config(tmp_path, **values),
+        lambda _binary: "/usr/bin/gh",
+        command_probe,
+    )
+    check = {item.check_id: item for item in checks}["adapter.github_pages_gh"]
+
+    assert check.outcome == CheckOutcome.FAIL
+    assert any(expected_problem in problem for problem in check.details["problems"])
+    assert calls == 0
+
+
+def test_enabled_github_pages_gh_missing_or_wrong_version_fails_without_output_leak(tmp_path):
+    config = _config(
+        tmp_path,
+        github_pages_gh_verify_enabled=True,
+        github_pages_repository="owner/site",
+        github_pages_gh_token="configured-secret",
+    )
+
+    missing = _adapter_checks(config, lambda _binary: None)
+    missing_check = {item.check_id: item for item in missing}["adapter.github_pages_gh"]
+    assert missing_check.outcome == CheckOutcome.FAIL
+    assert missing_check.details["executable_available"] is False
+
+    wrong = _adapter_checks(
+        config,
+        lambda _binary: "/usr/bin/gh",
+        lambda _argv: (0, "gh version 2.98.0\ndo-not-render-this-token"),
+        lambda _binary: "a" * 64,
+    )
+    wrong_check = {item.check_id: item for item in wrong}["adapter.github_pages_gh"]
+    rendered = json.dumps(wrong_check.to_dict())
+
+    assert wrong_check.outcome == CheckOutcome.FAIL
+    assert wrong_check.details["observed_version"] == "2.98.0"
+    assert "do-not-render-this-token" not in rendered
+
+
+def test_enabled_github_pages_gh_digest_mismatch_stops_before_executing_binary(tmp_path):
+    config = _config(
+        tmp_path,
+        github_pages_gh_verify_enabled=True,
+        github_pages_repository="owner/site",
+        github_pages_gh_token="configured-secret",
+    )
+    calls = 0
+
+    def command_probe(_argv):
+        nonlocal calls
+        calls += 1
+        return 0, "gh version 2.97.0"
+
+    checks = _adapter_checks(
+        config,
+        lambda _binary: "/usr/bin/gh",
+        command_probe,
+        lambda _binary: "b" * 64,
+    )
+    check = {item.check_id: item for item in checks}["adapter.github_pages_gh"]
+
+    assert check.outcome == CheckOutcome.FAIL
+    assert check.details["binary_digest_matches"] is False
+    assert check.details["version_probed"] is False
+    assert calls == 0
 
 
 def test_local_video_adapter_requires_repository_isolated_python(tmp_path):
@@ -868,6 +1096,7 @@ def test_check_order_is_stable(tmp_path):
         "browser.runtime",
         "adapter.zhihu_cli",
         "adapter.youtube_uploader",
+        "adapter.github_pages_gh",
         "adapter.social_auto_upload",
         "adapter.xhs_skills",
         "adapter.money_printer_turbo",
