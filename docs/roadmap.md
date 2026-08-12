@@ -84,9 +84,10 @@ ingest -> review -> dry-run plan -> durable job -> fake publish -> fake metrics 
 - `review_performance`
 
 交付形态包括严格 Pydantic DTO、稳定 Python service/HTTP client、`/v1` HTTP 路由和只通过 HTTP
-工作的 CLI。修改操作使用持久幂等账本；human reviewer 能以受控二进制流下载并独立校验审批绑定
-素材，审批同时绑定内容/素材、精确账号/平台与 UTC 排期；排程前重新计算摘要并用数据库唯一约束
-防止重复扇出。
+工作的 CLI，以及通过同一 HTTP client 工作的本地 stdio MCP bridge。MCP 严格暴露 7 个
+Agent 操作，不暴露 `get_approval`、`download_approval_asset`、`decide_approval` 三个 human-only
+操作。修改操作使用持久幂等账本；human reviewer 能以受控二进制流下载并独立校验审批绑定素材，
+审批同时绑定内容/素材、精确账号/平台与 UTC 排期；排程前重新计算摘要并用数据库唯一约束防止重复扇出。
 
 精确执行边界也已纳入 v1：每个 target 绑定 Publisher kind、renderer identity、contract/adapter
 version、无宿主路径的 payload projection 和摘要，worker 执行前重算并禁止 fallback。当前只有
@@ -101,15 +102,14 @@ worker 用带过期时间和 fencing token 的 lease、有界重试/并发及窗
 metric 精确取数，不让手动采集或较晚的 7d 快照替代本次证据。缺少 post identity 或真实 collector 仍会明确失败，
 不会因账本存在而伪造平台数据。
 
-待交付：MCP 适配、审批 SSO/组织身份集成，以及随使用数据建立的
-调用成功率/状态可解释性基线。
+待交付：审批 SSO/组织身份集成，以及随使用数据建立的调用成功率/状态可解释性基线。
 
-控制面对 Agent 的交付形式优先级：稳定 Python/HTTP 契约 → CLI → MCP。平台执行层则优先选择
-有版本、结构化 post identity 和可回滚路径的官方 API/CLI。两层不要混为一谈，Agent 不能通过
-任何一层越过人工审批策略。要兑现这一目标，必须先增加独立的调用者身份、作用域/RBAC 和可验证的
-审批主体；v1 已提供应用内身份与 scope，生产仍应由外部网关/SSO 托管 human 凭证，并将 legacy
-管理 key 与 Agent 隔离。详见 [Agent contract v1](agent-contract.md) 与
-[CLI Adapter 选型](cli-adapters.md)。
+控制面对 Agent 的交付顺序已经按稳定 Python/HTTP 契约 → CLI → MCP 完成首个纵切。stdio MCP
+只是 `/v1` 的无状态 Agent 入口，不直接打开数据库或 Publisher；平台执行层则优先选择有版本、
+结构化 post identity 和可回滚路径的官方 API/CLI。两层不要混为一谈，Agent 不能通过任何一层越过
+人工审批策略。v1 已提供应用内身份与 scope，生产仍应由外部网关/SSO 托管 human 凭证，并将
+legacy 管理 key 与 Agent/MCP 隔离。详见 [Agent contract v1](agent-contract.md)、
+[MCP Agent bridge](mcp.md) 与 [CLI Adapter 选型](cli-adapters.md)。
 
 成功指标：Agent 调用成功率、审批绕过事故数、任务状态可解释率。
 

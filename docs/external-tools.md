@@ -26,6 +26,11 @@
 供应链审阅的受信任包；allowlist 不会隔离进程环境或账号数据。社区 CLI/MCP 若不满足同进程信任
 要求，必须继续使用固定 argv 的 subprocess/localhost RPC 边界，不能为了“插件化”直接 import。
 
+这里的“平台侧社区 MCP”与项目自己的 [MCP Agent bridge](mcp.md) 是两层能力。`ai-ops-mcp`
+只把现有 Agent contract v1 经本地 stdio 转成 7 个 Agent tools，再通过 HTTP 回到控制面；它不包装
+小红书等平台协议，也不会使任何外部工具获得更高成熟度。平台侧社区 MCP 仍按不可信 Adapter 的
+subprocess/localhost RPC 边界治理。
+
 ### 知乎 CLI 的隔离安装
 
 ```bash

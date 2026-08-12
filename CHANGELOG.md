@@ -71,6 +71,9 @@ once release automation is established.
   kinds across metrics and Agent exact execution, and per-construction identity validation.
 - `ai-ops plugins list` for metadata-only inventory and `ai-ops plugins doctor` for explicit
   validation of allowlisted trusted code, including stable JSON and installed-wheel fixture smoke.
+- A local `ai-ops-mcp` stdio bridge that reuses the Agent contract HTTP client and exposes exactly
+  seven Agent operations to MCP clients while keeping all human-only approval operations outside
+  the tool surface.
 
 ### Changed
 
@@ -152,6 +155,9 @@ once release automation is established.
   duplicates and built-in kind collisions, and never exposes third-party exception text in CLI JSON.
 - Plugin runtime calls freeze trusted identity before awaiting third-party code, contain plugin
   `SystemExit`, and persist only normalized metric counters rather than arbitrary plugin `raw` data.
+- The MCP bridge is configured with a scoped Agent Bearer token only through its process environment,
+  never exposes legacy administrator or human-approval capabilities, reserves stdout for protocol
+  frames, and inherits the v1 idempotency, validation, and redacted error boundaries over HTTP.
 
 ### Known limitations
 
@@ -178,3 +184,5 @@ once release automation is established.
   canary; unverified Google API projects cannot use it as evidence of public publication.
 - Publisher plugins are trusted in-process Python code, not sandboxed extensions. Untrusted
   community tools still require a future subprocess/RPC host and capability-scoped secret broker.
+- MCP is currently a local stdio bridge, not a remote, hosted, or multi-tenant MCP service; protocol
+  and mock-HTTP tests do not count as real platform publication or readback evidence.
