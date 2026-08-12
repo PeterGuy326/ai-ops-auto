@@ -161,7 +161,44 @@ npm run dev
 Vite 会把 `/api` 代理到 `http://127.0.0.1:8000`。前端不会在 API 失败时伪造成功数据；
 错误应当在界面或开发者工具中可见。
 
-## 7. 自检
+## 7. Codex MCP（可选）
+
+`ai-ops serve` 运行后，可以用本地 stdio MCP bridge 把 7 个 Agent contract 工具接入 Codex。
+先按 [Agent contract v1](agent-contract.md#principals-and-scopes) 生成独立 Agent token，并在服务端
+`AGENT_PRINCIPALS` 中配置所需 scope。不要复用 legacy `API_KEY`，也不要把 human approver token
+交给 Codex。
+
+先由本机秘密管理器把 `AI_OPS_URL` 和 `AI_OPS_TOKEN` 注入启动 Codex 的环境，再在用户级
+`~/.codex/config.toml` 中配置：
+
+```toml
+[mcp_servers."ai-ops-auto"]
+command = "ai-ops-mcp"
+env_vars = ["AI_OPS_URL", "AI_OPS_TOKEN"]
+enabled_tools = [
+  "stage_content",
+  "plan_publication",
+  "request_approval",
+  "schedule",
+  "get_job_status",
+  "collect_metrics",
+  "review_performance",
+]
+default_tools_approval_mode = "writes"
+```
+
+配置只继承变量名，不存真实 token；token 应留在当前用户或组织的秘密存储中，不能写入会提交到仓库
+的配置、脚本或文档。bridge 由 Codex 通过 stdio 拉起，经 `AgentContractClient` 访问 `/v1`；它不
+直接打开数据库，也不启动 worker。上面的允许列表固定 7 个工具，写操作默认要求 Codex 本地调用
+确认；这层确认不替代 v1 的独立 human principal 业务审批。
+
+MCP 只暴露 `stage_content`、`plan_publication`、`request_approval`、`schedule`、
+`get_job_status`、`collect_metrics`、`review_performance`。三个 human-only 审批操作仍使用独立
+HTTP/CLI 环境。`schedule` 只创建持久 job；只有 worker 运行且显式启用后台发布后才可能真发布。
+`collect_metrics` 本身可能访问外部平台，即使 `AUTO_PUBLISH_ENABLED=false` 也不是离线操作。
+完整配置和边界见 [MCP Agent bridge](mcp.md)。
+
+## 8. 自检
 
 ```bash
 bash scripts/verify.sh
@@ -170,7 +207,7 @@ bash scripts/verify.sh
 脚本对已安装的项目执行 Python 语法/导入、`pytest`、`ruff`、前端 lint/build 和打包检查。
 可选平台工具未安装时是警告，核心检查失败时脚本返回非零。
 
-## 8. 真实平台之前
+## 9. 真实平台之前
 
 1. 阅读 [平台能力矩阵](platform-capabilities.md)，不要把 Experimental/Stub 当作可用承诺。
 2. 使用专用测试账号，完成平台条款、隐私与内容合规检查。

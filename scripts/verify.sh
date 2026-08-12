@@ -269,8 +269,10 @@ print(os.pathsep.join(path for path in paths if path))
     cd "$smoke_cwd" && env \
       DATABASE_URL="sqlite:///$smoke_db" \
       DATA_DIR="$smoke_cwd/data" \
+      AI_OPS_MCP_COMMAND="$smoke_venv/bin/ai-ops-mcp" \
       PYTHONPATH="$runtime_pythonpath" \
       "$smoke_venv/bin/python" -c '
+import asyncio
 import json
 import hashlib
 import os
@@ -278,6 +280,7 @@ from pathlib import Path
 import sys
 
 import ai_ops
+from mcp import Client, StdioServerParameters, stdio_client
 from ai_ops.publishers import PublisherPluginManifest
 
 assert PublisherPluginManifest
@@ -390,6 +393,43 @@ for command in expected_agent_commands:
 download_help = Path("download-help.txt").read_text(encoding="utf-8")
 for required in {"approval_id", "asset_id", "--output"}:
     assert required in download_help
+
+expected_mcp_tools = {
+    "stage_content",
+    "plan_publication",
+    "request_approval",
+    "schedule",
+    "get_job_status",
+    "collect_metrics",
+    "review_performance",
+}
+
+
+async def verify_installed_mcp_stdio() -> None:
+    server = StdioServerParameters(
+        command=os.environ["AI_OPS_MCP_COMMAND"],
+        env={
+            "DATABASE_URL": os.environ["DATABASE_URL"],
+            "DATA_DIR": os.environ["DATA_DIR"],
+            "PYTHONPATH": os.environ["PYTHONPATH"],
+        },
+    )
+    for mode in ("auto", "legacy"):
+        async with Client(
+            stdio_client(server),
+            read_timeout_seconds=10,
+            mode=mode,
+        ) as client:
+            tools = await client.list_tools()
+        assert {tool.name for tool in tools.tools} == expected_mcp_tools
+        for tool in tools.tools:
+            assert tool.input_schema["type"] == "object"
+            assert tool.input_schema["additionalProperties"] is False
+            assert tool.output_schema["type"] == "object"
+            assert len(tool.output_schema["oneOf"]) == 2
+
+
+asyncio.run(verify_installed_mcp_stdio())
 '
   )
 }
@@ -479,7 +519,7 @@ else
   fail=$((fail + 1))
 fi
 if [[ "$package_built" == true ]]; then
-  check "installed wheel + Alembic/doctor/demo smoke" smoke_installed_wheel
+  check "installed wheel + Alembic/doctor/demo/MCP smoke" smoke_installed_wheel
 fi
 
 echo

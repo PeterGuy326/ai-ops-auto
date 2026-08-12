@@ -316,6 +316,39 @@ and returns only the latest snapshot per requested job. Equal collection
 timestamps are resolved by the later metric ID, so review IDs and totals are
 deterministic without loading a job's full metric history into service memory.
 
+## MCP tools
+
+`ai-ops-mcp` 把 `/v1` 暴露成本地 stdio MCP tools。它通过 `AgentContractClient` 访问 HTTP API，
+不直接使用 Python service 或数据库，因此 HTTP DTO、scope、幂等账本和错误语义仍是唯一契约真相。
+
+MCP 只公布 7 个 Agent 工具：
+
+| MCP tool | v1 operation |
+|---|---|
+| `stage_content` | `stage_content` |
+| `plan_publication` | `plan_publication` |
+| `request_approval` | `request_approval` |
+| `schedule` | `schedule` |
+| `get_job_status` | `get_job_status` |
+| `collect_metrics` | `collect_metrics` |
+| `review_performance` | `review_performance` |
+
+Mutating tools use `{"request": <v1 request DTO>, "idempotency_key": "..."}` and require the
+same explicit 8–128 character idempotency key as HTTP. `get_job_status` uses `{"job_id": <int>}`;
+`review_performance` uses `{"request": <PerformanceReviewRequest>}`. The bridge does not blindly
+retry writes or generate idempotency keys; durable replay and conflicts are decided by the existing
+operation ledger. Success is the corresponding v1 response DTO. Failure is marked as an MCP tool
+error while retaining the stable structured envelope
+`{"schema_version":1,"error":{"code":"...","message":"..."}}`.
+`get_approval`, `download_approval_asset`, and `decide_approval` are deliberately absent because
+they require a separate human principal. A human continues to review and decide through the
+HTTP/CLI environment described below; the Agent must not receive that token.
+
+The bridge reads `AI_OPS_URL` and the Agent Bearer `AI_OPS_TOKEN` from its process environment.
+The token is never a tool argument and the bridge does not use legacy `API_KEY`. stdout is reserved
+for MCP protocol messages. See [MCP Agent bridge](mcp.md) for Codex setup, side-effect boundaries,
+and operational limitations.
+
 ## Python and CLI clients
 
 `AgentContractClient` exposes methods with the same operation names and returns
@@ -393,7 +426,7 @@ placed in process arguments.
   give that key to an Agent, reuse it as a bearer token, or expose the legacy
   surface without TLS and an operator access boundary.
 - The Python service enforces the same scopes and approval rules as HTTP. The
-  CLI is an HTTP client and does not open the database directly.
+  CLI and stdio MCP bridge are HTTP clients and do not open the database directly.
 - `approval:read` grants access to both the redacted review bundle and its exact
   asset bytes. Treat it as sensitive human-review access, not harmless metadata
   read permission.

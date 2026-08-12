@@ -37,7 +37,9 @@ Agent contract v1 已把 Agent 与审批者拆成独立 Bearer principal，并�
 - API 与唯一 APScheduler worker 分进程，以持久化 `PublishJob` 和 `MetricsCollectionTask`
   为任务真相；当前**不支持 Celery**。
 - 版本化 Agent Python/HTTP/CLI 契约：内容暂存、精确发布计划、独立审批、幂等排程、任务状态、
-  手动指标采集和结构化复盘。详见 [Agent contract v1](docs/agent-contract.md)。
+  手动指标采集和结构化复盘；本地 `ai-ops-mcp` stdio bridge 把其中 7 个 Agent 操作复用为
+  MCP tools，同时排除 3 个 human-only 审批操作。详见 [Agent contract v1](docs/agent-contract.md)
+  和 [MCP Agent bridge](docs/mcp.md)。
 - 发布成功会持久化固定 1h/24h/7d 指标任务；worker 通过数据库扫描、带 fencing 的到期 lease、
   有界重试和窗口截止时间恢复执行。每个任务最多绑定一份 `scheduled` 指标快照，新的 24h 任务用
   自己精确绑定的快照做当次健康判断；没有真实 post identity/collector 时仍不会伪造数据。
@@ -61,7 +63,7 @@ Agent contract v1 已把 Agent 与审批者拆成独立 Bearer principal，并�
   离线契约测试，没有真实 Pages canary，仍属 Experimental。
 - 单元测试与 mock 集成证据。这些不等于当前平台 UI 上的真实发布证据。
 
-目前还不是：分布式队列、无人值守 SaaS、官方平台 API 聚合层，或已经完成的 Agent MCP 产品。
+目前还不是：分布式队列、无人值守 SaaS、官方平台 API 聚合层，或远程托管/多租户 MCP 服务。
 
 ## 五分钟离线价值演示
 
@@ -152,7 +154,7 @@ API_KEY='<与 .env 相同的管理 key>' bash scripts/seed_demo.sh
 ```text
 Codex / Claude / OpenClaw / custom agent
                     |
-              CLI / API / future MCP
+            CLI / API / stdio MCP
                     v
         ai-ops-auto control plane
    content state | approval | policy | jobs | audit
@@ -177,10 +179,10 @@ Codex / Claude / OpenClaw / custom agent
    独立身份、最小 scope 和不可自签审批已进入 v1 契约；首个 Stable 中国平台与
    真实 canary 仍在进行中；GitHub Pages 已有默认关闭的离线
    `accepted/deployed/verified` 契约纵切，但尚未获得真站 evidence。
-3. **Agent-native contract**：Python/HTTP/CLI 的十操作 v1 纵切、知乎 CLI 的目标账号/exact renderer
-   绑定，以及可恢复的 1h/24h/7d 数据库指标任务已经落地；YouTube exact 等待只读频道身份探针，
-   下一步补 MCP。平台侧继续优先复用能返回 post identity 的版本化 CLI/API，浏览器自动化作为
-   受控 fallback。
+3. **Agent-native contract**：Python/HTTP/CLI 的十操作 v1 纵切、Agent-only 七工具 stdio MCP
+   bridge、知乎 CLI 的目标账号/exact renderer 绑定，以及可恢复的 1h/24h/7d 数据库指标任务已经
+   落地；YouTube exact 等待只读频道身份探针，下一步补审批 SSO/组织身份和调用质量基线。平台侧
+   继续优先复用能返回 post identity 的版本化 CLI/API，浏览器自动化作为受控 fallback。
 4. **Evidence moat**：Publisher Plugin SDK v1 与兼容性 manifest 已落地；下一步是官方 API
    插件、平台 canary、跨平台指标归一化和实验追踪。
 

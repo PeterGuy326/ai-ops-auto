@@ -103,6 +103,7 @@ jobs:
           python -m build --no-isolation --wheel \
             --outdir fixture-plugin-dist tests/fixtures/publisher_plugin
           .package-venv/bin/python -m pip install --no-deps fixture-plugin-dist/*.whl
+          .package-venv/bin/python -m pip check
           smoke_dir="$(mktemp -d)"
           trap 'rm -rf -- "$smoke_dir"' EXIT
           cd "$smoke_dir"
@@ -122,13 +123,16 @@ jobs:
           "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" agent --help > agent-help.txt
           "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" agent download-approval-asset --help > download-help.txt
           "$GITHUB_WORKSPACE/.package-venv/bin/ai-ops" gen-principal-token > principal.json
+          export AI_OPS_MCP_COMMAND="$GITHUB_WORKSPACE/.package-venv/bin/ai-ops-mcp"
           "$GITHUB_WORKSPACE/.package-venv/bin/python" - <<'PY'
+          import asyncio
           import json
           import hashlib
           import os
           from pathlib import Path
 
           import ai_ops
+          from mcp import Client, StdioServerParameters, stdio_client
           from ai_ops.publishers import PublisherPluginManifest
 
           assert PublisherPluginManifest
@@ -273,6 +277,42 @@ jobs:
           assert download_params["asset_id"].required is True
           assert download_params["output"].required is True
           assert "--output" in download_params["output"].opts
+
+          expected_mcp_tools = {
+              "stage_content",
+              "plan_publication",
+              "request_approval",
+              "schedule",
+              "get_job_status",
+              "collect_metrics",
+              "review_performance",
+          }
+
+
+          async def verify_installed_mcp_stdio() -> None:
+              server = StdioServerParameters(
+                  command=os.environ["AI_OPS_MCP_COMMAND"],
+                  env={
+                      "DATABASE_URL": os.environ["DATABASE_URL"],
+                      "DATA_DIR": os.environ["DATA_DIR"],
+                  },
+              )
+              for mode in ("auto", "legacy"):
+                  async with Client(
+                      stdio_client(server),
+                      read_timeout_seconds=10,
+                      mode=mode,
+                  ) as client:
+                      tools = await client.list_tools()
+                  assert {tool.name for tool in tools.tools} == expected_mcp_tools
+                  for tool in tools.tools:
+                      assert tool.input_schema["type"] == "object"
+                      assert tool.input_schema["additionalProperties"] is False
+                      assert tool.output_schema["type"] == "object"
+                      assert len(tool.output_schema["oneOf"]) == 2
+
+
+          asyncio.run(verify_installed_mcp_stdio())
           PY
 
   postgres:

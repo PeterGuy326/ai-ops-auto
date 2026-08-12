@@ -5,10 +5,12 @@
 `ai-ops-auto` 是 Agent-native Creator Ops **控制面**，不是内容大模型、通用 Agent 或平台上传引擎。
 
 ```text
-Agent / operator
-      |
-      | CLI / HTTP API / future MCP
-      v
+Agent / operator ---------------- CLI / HTTP ----------------+
+      |                                                       |
+      +-- Codex/Claude -- stdio --> stateless MCP bridge      |
+                                       |                      |
+                                       +-- /v1 HTTP ----------+
+                                                              v
 +---------------------- control plane ----------------------+
 | content state | approval | accounts | policy | job ledger |
 +---------------------------+--------------------------------+
@@ -44,6 +46,22 @@ Agent / operator
 Agent contract v1 使用带最小 scope 的独立 Bearer principal，只有 `type=human` 能读取/决定审批，
 且请求者与计划创建者不能自签。后者能证明不同凭证身份参与，不能单靠软件证明凭证背后一定是真人；
 部署时仍须用 SSO、审批系统、硬件密钥或等价托管边界隔离 human token。
+
+## MCP 入口边界
+
+`ai-ops-mcp` 是本地 stdio 到 `/v1` HTTP 的无状态桥。它复用 `AgentContractClient`、严格 DTO、
+Bearer scope、领域错误和持久幂等账本，不直接打开数据库、不启动 worker、不构造 Publisher，也不
+建立第二套权限或事务语义。bridge 的 `AI_OPS_TOKEN` 只能是 Agent principal；legacy `API_KEY`
+和 human token 都不应进入同一进程。
+
+首版 tools/list 只包含 `stage_content`、`plan_publication`、`request_approval`、`schedule`、
+`get_job_status`、`collect_metrics` 和 `review_performance`。`get_approval`、
+`download_approval_asset`、`decide_approval` 继续留在独立 human 的 HTTP/CLI 审阅环境。
+这既降低模型误用 human 凭证的风险，也让 MCP 工具描述与真实权限边界一致。
+
+MCP transport 自身不改变副作用：`schedule` 只落持久 job，之后是否真发布取决于独立 worker 和
+`AUTO_PUBLISH_ENABLED`；`collect_metrics` 是显式平台读取并会持久化归一化快照。MCP 协议测试只算
+接入契约证据，不算平台 canary 或 Stable 证据。完整操作见 [MCP Agent bridge](mcp.md)。
 
 ## 核心数据
 
