@@ -56,6 +56,9 @@ Agent contract v1 已把 Agent 与审批者拆成独立 Bearer principal，并�
 - Publisher Plugin SDK v1：第三方适配器通过版本化 Python entry point 接入，默认零加载；
   `plugins list` 只读元数据，`plugins doctor` 只验证人工 allowlist 的受信任代码。详见
   [插件开发与部署](docs/publisher-plugins.md)。
+- GitHub Pages live 路径把 source branch receipt、Pages deployment 和公网 marker readback 分为
+  `accepted` / `deployed` / `verified`；后两层依赖默认关闭、固定版本的 `gh api` 验证。当前只有
+  离线契约测试，没有真实 Pages canary，仍属 Experimental。
 - 单元测试与 mock 集成证据。这些不等于当前平台 UI 上的真实发布证据。
 
 目前还不是：分布式队列、无人值守 SaaS、官方平台 API 聚合层，或已经完成的 Agent MCP 产品。
@@ -128,7 +131,13 @@ API_KEY='<与 .env 相同的管理 key>' bash scripts/seed_demo.sh
   Publisher fallback。YouTube CLI `v1.25.5` 当前仅用于 legacy canary。
 - 旧 `X-API-Key` 仍是全权限 break-glass/兼容入口，不能发给 Agent 或与 Bearer token 复用；生产及
   任何网络暴露环境必须设置独立强随机值，并限制在 TLS/操作员访问边界内。
-- GitHub Pages 默认 `GITHUB_PAGES_DRY_RUN=true`。
+- GitHub Pages 默认 `GITHUB_PAGES_DRY_RUN=true` 且 `GITHUB_PAGES_GH_VERIFY_ENABLED=false`；
+  未启用验证时，remote source SHA 只算 `accepted`。验证使用项目专用最小 Pages:read token，
+  不继承 ambient `GH_TOKEN/GITHUB_TOKEN`，也不把 token 或响应正文写入回执；首版自动 readback
+  只允许 workflow Pages、enforced HTTPS 和 owner 对应的 `<owner>.github.io`，自定义域名需人工 canary。
+  live push 固定预检时解析出的无凭证 github.com URL，以一次性 transport alias、exact lease、禁用
+  隐式 tag/submodule/push-option 与 Git hooks、dirfd/no-follow 文件能力和 commit-tree blob 指纹校验，
+  阻止 remote 重写、目录 symlink 竞态、额外 ref、并发历史夹带和 build/add 内容篡改。
 - 知乎/YouTube CLI canary 与百家号/搜狐号 Stub 默认不进入真实写主链路。
 - `PUBLISHER_PLUGIN_ALLOWLIST=[]`：未授权的第三方 entry point 不会被 import；非空 allowlist
   等同于同进程代码执行授权，不是沙箱。
@@ -166,7 +175,8 @@ Codex / Claude / OpenClaw / custom agent
    2026-08-11 的 `main@16eccb5` 通过六个 CI jobs 验收。
 2. **Five-minute value**：`doctor` / `demo` / Fake Publisher/Fake Metrics 的离线 tranche 已交付；
    独立身份、最小 scope 和不可自签审批已进入 v1 契约；首个 Stable 中国平台与
-   `accepted/deployed/verified` 结果分层仍在进行中。
+   真实 canary 仍在进行中；GitHub Pages 已有默认关闭的离线
+   `accepted/deployed/verified` 契约纵切，但尚未获得真站 evidence。
 3. **Agent-native contract**：Python/HTTP/CLI 的十操作 v1 纵切、知乎 CLI 的目标账号/exact renderer
    绑定，以及可恢复的 1h/24h/7d 数据库指标任务已经落地；YouTube exact 等待只读频道身份探针，
    下一步补 MCP。平台侧继续优先复用能返回 post identity 的版本化 CLI/API，浏览器自动化作为

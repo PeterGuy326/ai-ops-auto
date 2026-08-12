@@ -164,6 +164,17 @@ def test_github_pages_assets_and_lock_have_safe_defaults():
     assert config.github_pages_max_image_bytes == 20 * 1024 * 1024
     assert config.github_pages_max_total_image_bytes == 100 * 1024 * 1024
     assert config.github_pages_lock_timeout_seconds == 900
+    assert config.github_pages_gh_verify_enabled is False
+    assert config.github_pages_repository == ""
+    assert config.github_pages_gh_bin == "gh"
+    assert config.github_pages_gh_version == "2.97.0"
+    assert config.github_pages_gh_sha256 == ""
+    assert config.github_pages_gh_token.get_secret_value() == ""
+    assert config.github_pages_deploy_timeout_seconds == 600
+    assert config.github_pages_verify_poll_seconds == 5
+    assert config.github_pages_readback_timeout_seconds == 120
+    assert config.github_pages_readback_request_timeout_seconds == 10
+    assert config.github_pages_readback_max_response_bytes == 2 * 1024 * 1024
 
 
 @pytest.mark.parametrize(
@@ -173,8 +184,127 @@ def test_github_pages_assets_and_lock_have_safe_defaults():
         ("github_pages_max_total_image_bytes", 100),
         ("github_pages_lock_timeout_seconds", 0),
         ("github_pages_lock_timeout_seconds", 7201),
+        ("github_pages_deploy_timeout_seconds", 0),
+        ("github_pages_deploy_timeout_seconds", 3601),
+        ("github_pages_verify_poll_seconds", 0),
+        ("github_pages_verify_poll_seconds", 61),
+        ("github_pages_readback_timeout_seconds", 0),
+        ("github_pages_readback_timeout_seconds", 601),
+        ("github_pages_readback_request_timeout_seconds", 0),
+        ("github_pages_readback_request_timeout_seconds", 61),
+        ("github_pages_readback_max_response_bytes", 1023),
+        ("github_pages_readback_max_response_bytes", 10 * 1024 * 1024 + 1),
     ],
 )
 def test_github_pages_asset_and_lock_bounds_fail_fast(field, value):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: value})
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "owner",
+        "owner/repo/extra",
+        " owner/repo",
+        "owner/repo ",
+        "https://github.com/owner/repo",
+        "-owner/repo",
+        "owner-/repo",
+        "owner--name/repo",
+        "owner/..",
+        "owner/repo.git",
+        "owner/-repo",
+        "owner/.repo",
+    ],
+)
+def test_github_pages_repository_rejects_ambiguous_values(repository):
+    with pytest.raises(ValidationError, match="GITHUB_PAGES_REPOSITORY"):
+        Settings(_env_file=None, github_pages_repository=repository)
+
+
+def test_github_pages_repository_accepts_exact_owner_repo():
+    config = Settings(_env_file=None, github_pages_repository="PeterGuy326/ai-ops-auto")
+
+    assert config.github_pages_repository == "PeterGuy326/ai-ops-auto"
+
+
+def test_github_pages_gh_verification_requires_repository():
+    with pytest.raises(ValidationError, match="GITHUB_PAGES_REPOSITORY is required"):
+        Settings(_env_file=None, github_pages_gh_verify_enabled=True)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "",
+        "http://owner.github.io/site",
+        "https://custom.example/site",
+        "https://other.github.io/site",
+        "https://owner.github.io/site?preview=1",
+        " https://owner.github.io/site",
+        "https://owner.github.io/site\n",
+        "\x00https://owner.github.io/site",
+        "https://own\ter.github.io/site",
+    ],
+)
+def test_github_pages_gh_verification_requires_canonical_owner_base_url(base_url):
+    with pytest.raises(ValidationError, match="GITHUB_PAGES_BASE_URL"):
+        Settings(
+            _env_file=None,
+            github_pages_gh_verify_enabled=True,
+            github_pages_repository="owner/site",
+            github_pages_base_url=base_url,
+            github_pages_gh_sha256="a" * 64,
+        )
+
+
+def test_github_pages_gh_verification_accepts_canonical_owner_base_url():
+    config = Settings(
+        _env_file=None,
+        github_pages_gh_verify_enabled=True,
+        github_pages_repository="owner/site",
+        github_pages_base_url="https://owner.github.io/site/",
+        github_pages_gh_sha256="a" * 64,
+    )
+
+    assert config.github_pages_gh_verify_enabled is True
+
+
+def test_github_pages_gh_verification_requires_binary_digest_pin():
+    with pytest.raises(ValidationError, match="GITHUB_PAGES_GH_SHA256 is required"):
+        Settings(
+            _env_file=None,
+            github_pages_gh_verify_enabled=True,
+            github_pages_repository="owner/site",
+            github_pages_base_url="https://owner.github.io/site",
+        )
+
+
+def test_github_pages_gh_version_is_a_source_audited_exact_pin():
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            github_pages_repository="owner/repo",
+            github_pages_gh_verify_enabled=True,
+            github_pages_gh_version="2.98.0",
+        )
+
+
+def test_github_pages_gh_binary_is_a_fixed_contract():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, github_pages_gh_bin="/tmp/unreviewed-gh")
+
+
+@pytest.mark.parametrize("digest", ["A" * 64, "a" * 63, "g" * 64, "sha256:a" + "a" * 57])
+def test_github_pages_gh_digest_pin_rejects_noncanonical_values(digest):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, github_pages_gh_sha256=digest)
+
+
+def test_github_pages_token_is_secret_typed_and_not_rendered():
+    config = Settings(_env_file=None, github_pages_gh_token="do-not-render-this-token")
+
+    assert config.github_pages_gh_token.get_secret_value() == "do-not-render-this-token"
+    assert "do-not-render-this-token" not in repr(config)
+    assert "do-not-render-this-token" not in str(config.model_dump()["github_pages_gh_token"])

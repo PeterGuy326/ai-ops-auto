@@ -38,8 +38,10 @@ ai-ops demo
 数据库。运行 `init-db` 后重新检查即可。
 
 `doctor` 检查数据库、打包资源、调度器配置、浏览器与可选适配器，不会启动浏览器、
-执行登录或向内容平台发起请求。如果它报告核心阻塞项，会以非零码退出；可选浏览器/适配器
-未安装只是警告。
+执行登录或向内容平台发起请求。如果它报告核心阻塞项，会以非零码退出；未启用的可选浏览器/
+适配器缺失只是警告。GitHub Pages gh 验证一旦显式启用，缺少二进制、SHA-256 不匹配或静态
+契约不安全都会 fail closed 并返回非零；通过静态门禁后才会在临时 HOME/XDG 中运行一次无 token、
+关闭 telemetry/update 的固定 `gh --version` 本地探针。
 
 `demo` 明确标记为 **SYNTHETIC / OFFLINE / NO EXTERNAL ACTION**：它在隔离的 SQLite 中跑完
 下列链路，不需要、不使用、也不会发送 LLM key、cookie、OAuth 或平台账号，不访问真实平台，

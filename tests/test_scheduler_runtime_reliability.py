@@ -853,6 +853,94 @@ def test_publish_timeout_is_terminal_unknown_outcome(runtime_db, monkeypatch):
         assert job.raw_response["outcome_uncertain"] is True
 
 
+def test_publish_timeout_recovers_accepted_receipt_before_cleanup(
+    runtime_db,
+    tmp_path,
+    monkeypatch,
+):
+    """A timeout after source acceptance must not erase the exact receipt."""
+
+    _, (job_id,) = _create_article_and_jobs(runtime_db, max_attempts=3)
+    commit_sha = "a" * 40
+    receipt_paths = []
+
+    async def accepted_then_never_finishes(platform, account_id, credential, content):
+        del platform, account_id, credential
+        path = receipt_mod.write_publish_receipt(
+            job_id=content.job_id,
+            operation_id=content.operation_id,
+            publisher_kind="hexo",
+            result=PublishResult(
+                success=False,
+                effect_applied=True,
+                retryable=False,
+                outcome_uncertain=False,
+                platform_post_id=commit_sha,
+                platform_url="https://owner.github.io/site/accepted-post/",
+                raw_response={
+                    "state": "accepted",
+                    "commit_sha": commit_sha,
+                    "branch": "main",
+                },
+            ),
+        )
+        assert path is not None
+        receipt_paths.append(path)
+        await asyncio.Event().wait()
+
+    cleanup_observations = []
+
+    def remove_after_database_commit(receipt_job_id, operation_id):
+        with runtime_db() as session:
+            persisted = session.get(PublishJob, receipt_job_id)
+            cleanup_observations.append(
+                (
+                    persisted.status,
+                    persisted.platform_post_id,
+                    persisted.raw_response.get("state"),
+                )
+            )
+        receipt_mod.remove_publish_receipt(receipt_job_id, operation_id)
+
+    monkeypatch.setattr(receipt_mod.settings, "data_dir", tmp_path)
+    monkeypatch.setattr(worker_mod, "_try_publishers", accepted_then_never_finishes)
+    monkeypatch.setattr(worker_mod, "remove_publish_receipt", remove_after_database_commit)
+    monkeypatch.setattr(
+        worker_mod,
+        "settings",
+        SimpleNamespace(job_execution_timeout_seconds=0.02),
+    )
+
+    result = asyncio.run(worker_mod.execute_job(job_id))
+
+    assert result.success is False
+    assert result.effect_applied is True
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert result.platform_post_id == commit_sha
+    assert result.raw_response["state"] == "accepted"
+    assert result.raw_response["receipt_recovered"] is True
+    assert result.raw_response["reconciliation_required"] is True
+    assert cleanup_observations == [(JobStatus.FAILED, commit_sha, "accepted")]
+    assert len(receipt_paths) == 1
+    assert receipt_paths[0].exists() is False
+
+    with runtime_db() as session:
+        job = session.get(PublishJob, job_id)
+        assert job.status == JobStatus.FAILED
+        assert job.scheduled_at is None
+        assert job.platform_post_id == commit_sha
+        assert job.platform_url == "https://owner.github.io/site/accepted-post/"
+        assert job.publisher_kind == "hexo"
+        assert job.raw_response["state"] == "accepted"
+        assert job.raw_response["commit_sha"] == commit_sha
+        assert job.raw_response["receipt_recovered"] is True
+        assert job.raw_response["effect_applied"] is True
+        assert job.raw_response["outcome_uncertain"] is True
+        assert job.raw_response["reconciliation_required"] is True
+        assert "平台结果未知" in job.error
+
+
 def test_busy_account_operation_lease_retries_without_entering_publisher(runtime_db, monkeypatch):
     """Profile contention is a known no-write failure, never an unknown effect."""
     _, (job_id,) = _create_article_and_jobs(runtime_db, max_attempts=3)

@@ -28,7 +28,7 @@ Experimental 对外呈现。
 | 视频号 | **Experimental** | social-auto-upload HTTP wrapper | wrapper/mock 契约；HTTP 能力受上游约束 | 未实现 | — |
 | TikTok | **Stub** | 当前无注册 Publisher；官方 Content Posting API 是后续候选 | 无发布契约 | 未实现 | — |
 | YouTube | **Experimental** | `youtubeuploader v1.25.5` gated canary；无 SAU fallback | 固定 tag 源码审计；fake CLI/OAuth 隔离/receipt/partial/unknown 契约 | 未实现 | CLI：2026-08-10 E2 源码审计；真发未测 |
-| GitHub Pages / 静态站点 | **Experimental** | Hexo + 固定 `pnpm|npx`/git argv；尚未集成 `gh` | dry-run 无副作用；受控图片解码/大小；仓库锁；source-branch SHA/read-after-push/unknown 契约，不含 Pages 部署/live URL 验证 | 未实现 | 2026-08-10 离线契约；未连真实 remote/Pages |
+| GitHub Pages / 静态站点 | **Experimental** | Hexo + 固定 `pnpm|npx`/git argv；default-off `gh 2.97.0` Pages 验证 | dry-run 无副作用；受控图片/仓库锁/remote baseline；source SHA `accepted`、精确 commit deployment `deployed`、公网 marker `verified` 的离线契约；无真站验证 | 未实现 | 2026-08-11 离线契约；未连真实 remote/Pages |
 | 微信公众号 | **Stub** | persistent-context draft-only publisher；后续优先官方草稿/发布 API | mock 草稿/unknown 契约；官方能力受账号类型与认证资格限制，尚未实现 API 插件 | 未实现 | 2026-08-11 E1 官方文档审计；未调用 |
 | 百家号 | **Stub** | default-off Playwright publisher（`BAIJIAHAO_PUBLISHER_ENABLED`） | mock 契约；selector 待首次真发校准 | 代码路径已有，未真平台验证 | — |
 | 搜狐号 | **Stub** | default-off Playwright publisher（`SOHUHAO_PUBLISHER_ENABLED`） | mock 契约；selector 待首次真发校准 | 代码路径已有，未真平台验证 | — |
@@ -49,6 +49,18 @@ YouTube CLI 当前也默认关闭。审计对象是
 返回失败并转人工对账；无 ID 而子进程已启动时禁止 fallback/自动重传。上游没有 auth-only 命令，
 首次 OAuth 需由人在可信终端预置，可能与第一次 private canary 上传绑定。
 专用频道 private canary 前不得升级 Beta 或默认开启。
+
+GitHub Pages 的 `gh` 验证也默认关闭，并固定自报版本契约 2.97.0；运行时从同一已打开来源复制并
+核对 SHA-256，只执行本轮私有的只读副本，版本探针本身不接收项目 token。GitHub CLI 没有 Pages
+专用子命令；
+实现只使用固定 `gh api` argv，先读取站点配置，再按本轮精确 commit SHA 查询 Pages deployment，
+最后仅在站点 `public=true` 时，以禁压缩、raw 分块有界 HTTP 请求回读公开页面中的非秘密 marker。
+source branch 接受 commit、Pages deployment
+成功、公开 URL 可见分别记为 `accepted`、`deployed`、`verified`，不得相互冒充。当前只有 fake CLI/
+HTTP 契约测试，没有使用真实 token、remote 或 Pages 站点执行 canary，因此成熟度仍是 Experimental，
+也不构成“已经稳定部署”的产品承诺。
+自动 `verified` 的首版边界仅覆盖 workflow Pages、enforced HTTPS 和仓库 owner 对应的
+`<owner>.github.io` origin；自定义域名仍需人工 canary，不在当前自动回读承诺内。
 
 Publisher Plugin SDK 的 manifest/doctor 只证明 Python 兼容性和自描述一致性，不改变本表成熟度。
 插件只有提交精确上游版本、结构化回执/readback 和下面要求的真平台 evidence card，才可能推动

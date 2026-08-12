@@ -59,7 +59,9 @@ ingest -> review -> dry-run plan -> durable job -> fake publish -> fake metrics 
 - 把**首个 Stable 中国平台**作为本阶段发布主目标：优先验证知乎文章，其次验证 B 站视频；
   必须先获得结构化 post identity/readback，并连续 30 天跑专用账号 canary，未达标继续标 Experimental。
 - 将写入结果拆成 `accepted`（执行后端接受）、`deployed`（平台部署完成）、`verified`
-  （目标 URL/平台后台可回查）；GitHub source branch SHA 目前只能到 `accepted`。
+  （目标 URL/平台后台可回查）。GitHub Pages 已提供默认关闭的 `gh 2.97.0` 离线契约纵切：source
+  branch SHA、精确 commit deployment 与公网 marker 分别对应三层；尚未跑真实 remote/Pages
+  canary，不能据此升级成熟度或默认开启。
 - 其他平台保持保守标记，不为平台数量降低证据门槛。
 
 成功指标：新用户首次 demo 中位时间、安装成功率、首个待审内容建立率。

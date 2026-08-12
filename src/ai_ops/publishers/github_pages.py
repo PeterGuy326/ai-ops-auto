@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import tempfile
@@ -28,7 +29,14 @@ from PIL import Image
 from ..config import settings
 from ..core.enums import AccountHealth, Platform, PublisherKind
 from ..core.schemas import PublishContent, PublishResult
+from ..runtime.receipts import write_publish_receipt
 from .base import PublisherBase
+from .github_pages_gh import (
+    GhPagesConfig,
+    GitHubPagesGhVerifier,
+    approved_gh_api_argv,
+    github_repository_from_push_url,
+)
 from .subprocess_utils import communicate_bounded, stop_process_group
 
 
@@ -49,6 +57,7 @@ _BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
 _MAX_CAPTURE_BYTES = 256 * 1024
 _PROCESS_STOP_GRACE_SECONDS = 3.0
 _LOCK_POLL_SECONDS = 0.05
+_PUBLICATION_MARKER_ATTRIBUTE = "data-ai-ops-publication"
 _ALLOWED_IMAGE_FORMATS = {
     ".gif": "GIF",
     ".jpeg": "JPEG",
@@ -119,6 +128,17 @@ class _GitPublishResult:
     outcome_uncertain: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class _RepositoryLeaf:
+    relative: str
+    parent_device: int
+    parent_inode: int
+    device: int
+    inode: int
+    digest: str
+    size: int
+
+
 @dataclass(slots=True)
 class _RollbackPath:
     path: Path
@@ -128,12 +148,413 @@ class _RollbackPath:
     original_mode: int | None
     written_digest: str | None = None
     written_size: int | None = None
+    written_git_mode: str | None = None
+    approved_leaf: _RepositoryLeaf | None = None
 
 
 @dataclass(slots=True, frozen=True)
 class _RollbackResult:
     success: bool
     error: str | None = None
+
+
+class _RepositoryFiles:
+    """No-follow file capability rooted at one already-approved repository.
+
+    Every mutable leaf operation is resolved component-by-component from the
+    repository directory descriptor.  A parent replaced by a symlink between
+    preflight and mutation is therefore rejected by ``O_NOFOLLOW`` instead of
+    redirecting a write, replace, or unlink outside the repository.
+    """
+
+    def __init__(self, repo: Path) -> None:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        required_dir_fd = {os.open, os.mkdir, os.stat, os.unlink}
+        if (
+            os.name != "posix"
+            or not nofollow
+            or not directory
+            or not required_dir_fd.issubset(os.supports_dir_fd)
+            or os.rename not in os.supports_dir_fd
+        ):
+            raise OSError("当前操作系统不支持安全的仓库内文件能力")
+
+        self.root = repo.resolve(strict=True)
+        flags = os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0)
+        self._directory_flags = flags
+        self._file_read_flags = (
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+        )
+        self._root_fd = os.open(self.root, flags)
+        if not stat.S_ISDIR(os.fstat(self._root_fd).st_mode):
+            os.close(self._root_fd)
+            raise OSError("博客仓库根路径不是目录")
+
+    def close(self) -> None:
+        if self._root_fd >= 0:
+            os.close(self._root_fd)
+            self._root_fd = -1
+
+    def __enter__(self) -> _RepositoryFiles:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def relative_path(self, path: Path) -> str:
+        lexical = Path(os.path.abspath(path))
+        try:
+            relative = lexical.relative_to(self.root)
+        except ValueError as exc:
+            raise ValueError("文件目标越出博客仓库") from exc
+        return self._validated_parts(relative.as_posix())[1]
+
+    @staticmethod
+    def _validated_parts(relative: str) -> tuple[tuple[str, ...], str]:
+        candidate = Path(relative)
+        parts = candidate.parts
+        if (
+            not relative
+            or candidate.is_absolute()
+            or not parts
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("仓库内文件路径不安全")
+        return parts, candidate.as_posix()
+
+    def _open_parent(self, relative: str, *, create: bool) -> tuple[int, str]:
+        parts, _ = self._validated_parts(relative)
+        current = os.dup(self._root_fd)
+        try:
+            for component in parts[:-1]:
+                if create:
+                    try:
+                        os.mkdir(component, 0o755, dir_fd=current)
+                    except FileExistsError:
+                        pass
+                child = os.open(component, self._directory_flags, dir_fd=current)
+                if not stat.S_ISDIR(os.fstat(child).st_mode):
+                    os.close(child)
+                    raise OSError("仓库内父路径不是目录")
+                os.close(current)
+                current = child
+            return current, parts[-1]
+        except BaseException:
+            os.close(current)
+            raise
+
+    def lstat(self, relative: str) -> os.stat_result | None:
+        try:
+            parent, name = self._open_parent(relative, create=False)
+        except FileNotFoundError:
+            return None
+        try:
+            try:
+                return os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+        finally:
+            os.close(parent)
+
+    def _open_regular(self, relative: str) -> tuple[int, os.stat_result]:
+        parent, name = self._open_parent(relative, create=False)
+        try:
+            fd = os.open(name, self._file_read_flags, dir_fd=parent)
+        finally:
+            os.close(parent)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(fd)
+            raise OSError("仓库内目标不是普通文件")
+        return fd, metadata
+
+    def read_regular(self, relative: str) -> tuple[bytes, os.stat_result]:
+        fd, metadata = self._open_regular(relative)
+        try:
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                return handle.read(), metadata
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _same_parent(parent_fd: int, approved: _RepositoryLeaf) -> bool:
+        metadata = os.fstat(parent_fd)
+        return (metadata.st_dev, metadata.st_ino) == (
+            approved.parent_device,
+            approved.parent_inode,
+        )
+
+    @staticmethod
+    def _same_leaf(metadata: os.stat_result, approved: _RepositoryLeaf) -> bool:
+        return (metadata.st_dev, metadata.st_ino) == (
+            approved.device,
+            approved.inode,
+        )
+
+    @staticmethod
+    def _digest_fd(fd: int) -> str:
+        os.lseek(fd, 0, os.SEEK_SET)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+
+    def fingerprint(
+        self,
+        relative: str,
+        *,
+        approved: _RepositoryLeaf | None = None,
+    ) -> tuple[str, int, int, _RepositoryLeaf]:
+        parent, name = self._open_parent(relative, create=False)
+        try:
+            if approved is not None and not self._same_parent(parent, approved):
+                raise OSError("仓库内父目录已被替换")
+            fd = os.open(name, self._file_read_flags, dir_fd=parent)
+            try:
+                metadata = os.fstat(fd)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError("仓库内目标不是普通文件")
+                if approved is not None and not self._same_leaf(metadata, approved):
+                    raise OSError("仓库内文件已被替换")
+                digest = self._digest_fd(fd)
+                if approved is not None and (
+                    digest != approved.digest or metadata.st_size != approved.size
+                ):
+                    raise OSError("仓库内文件内容已被替换")
+                parent_metadata = os.fstat(parent)
+                captured = _RepositoryLeaf(
+                    relative=relative,
+                    parent_device=parent_metadata.st_dev,
+                    parent_inode=parent_metadata.st_ino,
+                    device=metadata.st_dev,
+                    inode=metadata.st_ino,
+                    digest=digest,
+                    size=metadata.st_size,
+                )
+            finally:
+                os.close(fd)
+        finally:
+            os.close(parent)
+        return digest, metadata.st_size, stat.S_IMODE(metadata.st_mode), captured
+
+    def create_bytes(self, relative: str, content: bytes) -> _RepositoryLeaf:
+        parent, name = self._open_parent(relative, create=True)
+        fd: int | None = None
+        created = False
+        try:
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
+            fd = os.open(name, flags, 0o644, dir_fd=parent)
+            created = True
+            with os.fdopen(fd, "wb", closefd=False) as handle:
+                handle.write(content)
+            metadata = os.fstat(fd)
+            parent_metadata = os.fstat(parent)
+            return _RepositoryLeaf(
+                relative=relative,
+                parent_device=parent_metadata.st_dev,
+                parent_inode=parent_metadata.st_ino,
+                device=metadata.st_dev,
+                inode=metadata.st_ino,
+                digest=hashlib.sha256(content).hexdigest(),
+                size=len(content),
+            )
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+                fd = None
+            if created:
+                try:
+                    os.unlink(name, dir_fd=parent)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if fd is not None:
+                os.close(fd)
+            os.close(parent)
+
+    def copy_from_fd(
+        self,
+        relative: str,
+        source_fd: int,
+        *,
+        digest: str,
+        size: int,
+    ) -> _RepositoryLeaf:
+        parent, name = self._open_parent(relative, create=True)
+        destination_fd: int | None = None
+        created = False
+        try:
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
+            destination_fd = os.open(name, flags, 0o644, dir_fd=parent)
+            created = True
+            with (
+                os.fdopen(source_fd, "rb", closefd=False) as source,
+                os.fdopen(destination_fd, "wb", closefd=False) as destination,
+            ):
+                shutil.copyfileobj(source, destination)
+            metadata = os.fstat(destination_fd)
+            if metadata.st_size != size:
+                raise OSError("GitHub Pages 图片写入大小不一致")
+            parent_metadata = os.fstat(parent)
+            return _RepositoryLeaf(
+                relative=relative,
+                parent_device=parent_metadata.st_dev,
+                parent_inode=parent_metadata.st_ino,
+                device=metadata.st_dev,
+                inode=metadata.st_ino,
+                digest=digest,
+                size=size,
+            )
+        except BaseException:
+            if destination_fd is not None:
+                os.close(destination_fd)
+                destination_fd = None
+            if created:
+                try:
+                    os.unlink(name, dir_fd=parent)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if destination_fd is not None:
+                os.close(destination_fd)
+            os.close(parent)
+
+    def unlink(self, relative: str, *, missing_ok: bool = False) -> None:
+        try:
+            parent, name = self._open_parent(relative, create=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return
+            raise
+        try:
+            try:
+                os.unlink(name, dir_fd=parent)
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
+        finally:
+            os.close(parent)
+
+    def _approved_leaf_fd(
+        self,
+        approved: _RepositoryLeaf,
+    ) -> tuple[int, str, int]:
+        parent, name = self._open_parent(approved.relative, create=False)
+        fd: int | None = None
+        try:
+            if not self._same_parent(parent, approved):
+                raise OSError("仓库内父目录已被替换")
+            fd = os.open(name, self._file_read_flags, dir_fd=parent)
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or not self._same_leaf(metadata, approved):
+                raise OSError("仓库内文件已被替换")
+            digest = self._digest_fd(fd)
+            if digest != approved.digest or metadata.st_size != approved.size:
+                raise OSError("仓库内文件内容已被替换")
+            return parent, name, fd
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            os.close(parent)
+            raise
+
+    def unlink_approved(self, approved: _RepositoryLeaf) -> None:
+        parent, name, fd = self._approved_leaf_fd(approved)
+        try:
+            os.close(fd)
+            fd = -1
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if not self._same_leaf(current, approved):
+                raise OSError("仓库内文件在删除前被替换")
+            os.unlink(name, dir_fd=parent)
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            raise OSError("仓库内文件删除后仍存在")
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            os.close(parent)
+
+    def atomic_restore(
+        self,
+        approved: _RepositoryLeaf,
+        content: bytes,
+        mode: int,
+    ) -> None:
+        parent, name, approved_fd = self._approved_leaf_fd(approved)
+        temporary_name = f".{name}.ai-ops-rollback-{secrets.token_hex(16)}"
+        temporary_fd: int | None = None
+        temporary_exists = False
+        try:
+            os.close(approved_fd)
+            approved_fd = -1
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if not self._same_leaf(current, approved):
+                raise OSError("仓库内文件在恢复前被替换")
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
+            temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=parent)
+            temporary_exists = True
+            with os.fdopen(temporary_fd, "wb", closefd=False) as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.fchmod(temporary_fd, mode)
+            os.close(temporary_fd)
+            temporary_fd = None
+            os.replace(
+                temporary_name,
+                name,
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+            )
+            temporary_exists = False
+            restored_fd = os.open(name, self._file_read_flags, dir_fd=parent)
+            try:
+                restored_metadata = os.fstat(restored_fd)
+                restored_digest = self._digest_fd(restored_fd)
+                if (
+                    restored_digest != hashlib.sha256(content).hexdigest()
+                    or restored_metadata.st_size != len(content)
+                    or stat.S_IMODE(restored_metadata.st_mode) != mode
+                ):
+                    raise OSError("仓库内文件恢复后校验失败")
+            finally:
+                os.close(restored_fd)
+        finally:
+            if approved_fd >= 0:
+                os.close(approved_fd)
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+            if temporary_exists:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent)
+                except OSError:
+                    pass
+            os.close(parent)
 
 
 class _RepositoryLockTimeout(TimeoutError):
@@ -278,15 +699,121 @@ def _valid_branch(branch: str) -> bool:
     )
 
 
+def _stage_verified_executable(
+    source: Path,
+) -> tuple[tempfile.TemporaryDirectory[str], Path, str]:
+    """Copy one opened executable into a private runtime while hashing its bytes."""
+
+    runtime = tempfile.TemporaryDirectory(prefix="ai-ops-gh-binary-")
+    root = Path(runtime.name)
+    destination = root / "gh"
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    destination_flags |= getattr(os, "O_CLOEXEC", 0)
+    digest = hashlib.sha256()
+    copied = 0
+    try:
+        os.chmod(root, 0o700)
+        source_fd = os.open(source, source_flags)
+        try:
+            before = os.fstat(source_fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > 512 * 1024 * 1024:
+                raise OSError("invalid executable")
+            destination_fd = os.open(destination, destination_flags, 0o500)
+            try:
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > 512 * 1024 * 1024:
+                        raise OSError("executable exceeds size contract")
+                    digest.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(destination_fd, view)
+                        if written <= 0:
+                            raise OSError("short executable write")
+                        view = view[written:]
+                after = os.fstat(source_fd)
+                if copied != before.st_size or (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                ) != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+                    raise OSError("executable changed while being copied")
+                os.fchmod(destination_fd, 0o500)
+                os.fsync(destination_fd)
+            finally:
+                os.close(destination_fd)
+        finally:
+            os.close(source_fd)
+        return runtime, destination, digest.hexdigest()
+    except Exception:
+        runtime.cleanup()
+        raise
+
+
+def _verified_executable_digest(path: Path) -> str | None:
+    """Hash one no-follow regular executable and reject concurrent mutation."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > 512 * 1024 * 1024:
+                return None
+            digest = hashlib.sha256()
+            copied = 0
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > 512 * 1024 * 1024:
+                    return None
+                digest.update(chunk)
+            after = os.fstat(fd)
+            if copied != before.st_size or (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+                return None
+            return digest.hexdigest()
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+
+
 class GitHubPagesPublisher(PublisherBase):
     """Publish Markdown through fixed Hexo and git CLI contracts."""
 
     platform = Platform.GITHUB_PAGES
     kind = PublisherKind.HEXO
 
+    def _cleanup_gh_runtime(self) -> None:
+        runtime = getattr(self, "_github_pages_gh_runtime", None)
+        if runtime is not None:
+            runtime.cleanup()
+            del self._github_pages_gh_runtime
+        for attribute in (
+            "_github_pages_gh_binary_path",
+            "_github_pages_gh_binary_digest",
+        ):
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+
     async def login(self, account_id: int, credential: dict) -> bool:
         """Probe configured remote/ref readability without mutating the remote."""
         del account_id, credential
+        self._cleanup_gh_runtime()
         repo = settings.github_pages_path.expanduser().resolve()
         remote = settings.github_pages_remote
         branch = settings.github_pages_branch
@@ -294,12 +821,49 @@ class GitHubPagesPublisher(PublisherBase):
             return False
         if not await self._remote_exists(repo, remote):
             return False
+        remote_url, _ = await self._push_url(repo, remote)
+        if remote_url is None:
+            return False
+        transport_pin, transport_target = self._transport_url_pin(remote_url)
         result = await self._run_argv(
-            ["git", "ls-remote", "--exit-code", remote, f"refs/heads/{branch}"],
+            [
+                "git",
+                *transport_pin,
+                "ls-remote",
+                "--exit-code",
+                "--",
+                transport_target,
+                f"refs/heads/{branch}",
+            ],
             cwd=repo,
             timeout_seconds=settings.github_pages_git_timeout_seconds,
         )
-        return result.ok
+        if not result.ok:
+            return False
+        if not bool(getattr(settings, "github_pages_gh_verify_enabled", False)):
+            return True
+        head = await self._run_argv(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=repo,
+            timeout_seconds=settings.github_pages_git_timeout_seconds,
+        )
+        local_sha = self._verified_sha(head)
+        remote_sha = self._verified_remote_sha(result, branch)
+        if local_sha is None or remote_sha is None or local_sha.lower() != remote_sha.lower():
+            return False
+        verifier, _, _ = await self._prepare_gh_verifier(
+            repo,
+            remote,
+            branch,
+            remote_url=remote_url,
+        )
+        if verifier is None:
+            return False
+        try:
+            preflight = await verifier.preflight(remote_url=remote_url)
+            return preflight.success
+        finally:
+            self._cleanup_gh_runtime()
 
     async def health_check(self, account_id: int, credential: dict) -> AccountHealth:
         return (
@@ -315,11 +879,12 @@ class GitHubPagesPublisher(PublisherBase):
         content: PublishContent,
     ) -> PublishResult:
         del account_id, credential
+        self._cleanup_gh_runtime()
         repo = settings.github_pages_path.expanduser().resolve()
         if not repo.is_dir():
-            return self._failure("preflight", f"博客仓库不存在或不是目录: {repo}")
+            return self._failure("preflight", "配置的博客仓库不存在或不是目录")
         if not self._is_git_repo(repo):
-            return self._failure("preflight", f"{repo} 不是可用的 git 仓库")
+            return self._failure("preflight", "配置的博客仓库不是可用的 git 仓库")
         if settings.github_pages_engine != "hexo":
             return self._failure(
                 "preflight",
@@ -371,6 +936,8 @@ class GitHubPagesPublisher(PublisherBase):
             except (OSError, ValueError) as exc:
                 return self._failure("preflight", str(exc))
             rendered = self._render(content, categories, body)
+            marker = self._publication_marker(rendered)
+            rendered = self._embed_publication_marker(rendered, marker)
             return PublishResult(
                 success=True,
                 effect_applied=False,
@@ -411,6 +978,8 @@ class GitHubPagesPublisher(PublisherBase):
             return self._failure("preflight", str(exc))
         except OSError as exc:
             return self._failure("preflight", f"博客仓库发布锁不可用: {type(exc).__name__}")
+        finally:
+            self._cleanup_gh_runtime()
 
     async def _publish_live(
         self,
@@ -443,9 +1012,17 @@ class GitHubPagesPublisher(PublisherBase):
         except (OSError, ValueError) as exc:
             return self._failure("preflight", str(exc))
         rendered = self._render(content, categories, body)
+        marker = self._publication_marker(rendered)
+        rendered = self._embed_publication_marker(rendered, marker)
 
         if not await self._remote_exists(repo, remote):
             return self._failure("preflight", "配置的 git remote 不存在")
+        remote_url, remote_url_error = await self._push_url(repo, remote)
+        if remote_url is None:
+            return self._failure(
+                "preflight",
+                remote_url_error or "无法确认 git push remote identity",
+            )
 
         clean = await self._run_argv(
             ["git", "status", "--porcelain=v1", "--untracked-files=all"],
@@ -466,28 +1043,92 @@ class GitHubPagesPublisher(PublisherBase):
         if preflight_head is None:
             return self._command_failure("preflight", "无法确认发布前 HEAD", head)
 
+        transport_pin, transport_target = self._transport_url_pin(remote_url)
+        remote_head_result = await self._run_argv(
+            [
+                "git",
+                *transport_pin,
+                "ls-remote",
+                "--exit-code",
+                "--",
+                transport_target,
+                f"refs/heads/{branch}",
+            ],
+            cwd=repo,
+            timeout_seconds=settings.github_pages_git_timeout_seconds,
+        )
+        remote_head = self._verified_remote_sha(remote_head_result, branch)
+        if remote_head is None:
+            return self._command_failure(
+                "preflight",
+                "无法确认发布前远端分支基线",
+                remote_head_result,
+            )
+        if remote_head.lower() != preflight_head.lower():
+            return self._failure(
+                "preflight",
+                "本地 HEAD 与远端发布分支不一致，拒绝携带未审核 commit 发布",
+            )
+
+        verifier: GitHubPagesGhVerifier | None = None
+        if bool(getattr(settings, "github_pages_gh_verify_enabled", False)):
+            verifier, remote_url, verifier_error = await self._prepare_gh_verifier(
+                repo,
+                remote,
+                branch,
+                remote_url=remote_url,
+            )
+            if verifier is None or remote_url is None:
+                return self._failure(
+                    "preflight",
+                    verifier_error or "GitHub Pages gh verification preflight is unavailable",
+                )
+            gh_preflight = await verifier.preflight(remote_url=remote_url)
+            if not gh_preflight.success:
+                return self._failure(
+                    "preflight",
+                    gh_preflight.error or "GitHub Pages gh verification preflight failed",
+                )
+
         publish_paths = [post_path, *(plan.destination for plan in image_plans)]
+        rendered_bytes = rendered.encode("utf-8")
+        expected_artifacts = {
+            post_relative.as_posix(): (
+                hashlib.sha256(rendered_bytes).hexdigest(),
+                len(rendered_bytes),
+            ),
+            **{
+                plan.destination.relative_to(repo).as_posix(): (plan.digest, plan.size)
+                for plan in image_plans
+            },
+        }
         try:
             rollback_paths = self._snapshot_rollback_paths(repo, publish_paths)
         except (OSError, ValueError) as exc:
             return self._failure("preflight", f"无法建立发布回滚快照: {exc}")
 
-        created_paths: list[Path] = []
+        created_paths: list[_RepositoryLeaf] = []
         try:
-            posts_dir.mkdir(parents=True, exist_ok=True)
-            with post_path.open("x", encoding="utf-8") as handle:
-                handle.write(rendered)
-            created_paths.append(post_path)
-            for plan in image_plans:
-                plan.destination.parent.mkdir(parents=True, exist_ok=True)
-                self._copy_planned_image(plan)
-                created_paths.append(plan.destination)
+            with _RepositoryFiles(repo) as repository_files:
+                created_paths.append(
+                    repository_files.create_bytes(post_relative.as_posix(), rendered_bytes)
+                )
+                for plan in image_plans:
+                    image_relative = repository_files.relative_path(plan.destination)
+                    created_paths.append(
+                        self._copy_planned_image(plan, repository_files, image_relative)
+                    )
         except (FileExistsError, OSError, ValueError) as exc:
             self._remove_created_paths(created_paths, repo)
             return self._failure("write", f"写入发布产物失败: {type(exc).__name__}")
 
         try:
-            self._seal_rollback_paths(rollback_paths, repo)
+            self._seal_rollback_paths(
+                rollback_paths,
+                repo,
+                expected_artifacts=expected_artifacts,
+                created_artifacts={item.relative: item for item in created_paths},
+            )
         except (OSError, ValueError) as exc:
             self._remove_created_paths(created_paths, repo)
             return self._failure("write", f"无法确认本轮发布产物: {exc}")
@@ -509,13 +1150,26 @@ class GitHubPagesPublisher(PublisherBase):
                     unstage=False,
                 )
 
+        sealed_error = self._sealed_paths_error(rollback_paths, repo)
+        if sealed_error is not None:
+            return await self._rollback_or_report(
+                self._failure("build", sealed_error),
+                repo=repo,
+                preflight_head=preflight_head,
+                preflight_status=clean.stdout,
+                paths=rollback_paths,
+                unstage=False,
+            )
+
         git_result = await self._git_publish(
             repo=repo,
             paths=publish_paths,
             slug=slug,
             title=content.title,
-            remote=remote,
+            push_target=remote_url,
             branch=branch,
+            preflight_head=preflight_head,
+            sealed_paths=rollback_paths,
         )
         if not git_result.success:
             failure = PublishResult(
@@ -541,13 +1195,15 @@ class GitHubPagesPublisher(PublisherBase):
             return failure
 
         commit_sha = git_result.commit_sha
-        return PublishResult(
-            success=True,
+        assert commit_sha is not None
+        accepted = PublishResult(
+            success=verifier is None,
             effect_applied=True,
             retryable=False,
             platform_post_id=commit_sha,
             platform_url=article_url,
             raw_response={
+                "state": "accepted",
                 "slug": slug,
                 "commit_sha": commit_sha,
                 "remote": remote,
@@ -555,6 +1211,123 @@ class GitHubPagesPublisher(PublisherBase):
                 "post_path": post_relative.as_posix(),
             },
         )
+        accepted = self._journal_result(content, accepted, required=True)
+        if accepted.error is not None:
+            return accepted
+        if verifier is None:
+            return accepted
+
+        try:
+            deployment = await verifier.wait_for_deployment(commit_sha)
+        except Exception:
+            return self._journal_result(
+                content,
+                PublishResult(
+                    success=False,
+                    effect_applied=True,
+                    retryable=False,
+                    outcome_uncertain=True,
+                    platform_post_id=commit_sha,
+                    platform_url=article_url,
+                    error="GitHub Pages deployment verification failed unexpectedly",
+                    raw_response={**accepted.raw_response, "state": "accepted"},
+                ),
+            )
+        if not deployment.success:
+            return self._journal_result(
+                content,
+                PublishResult(
+                    success=False,
+                    effect_applied=True,
+                    retryable=False,
+                    outcome_uncertain=deployment.outcome_uncertain,
+                    platform_post_id=commit_sha,
+                    platform_url=article_url,
+                    error=deployment.error or "GitHub Pages deployment was not confirmed",
+                    raw_response={**accepted.raw_response, "state": "accepted"},
+                ),
+            )
+
+        deployed = accepted.model_copy(
+            update={
+                "raw_response": {**accepted.raw_response, "state": "deployed"},
+            }
+        )
+        self._journal_result(content, deployed)
+
+        try:
+            site = await verifier.confirm_site()
+        except Exception:
+            return self._journal_result(
+                content,
+                PublishResult(
+                    success=False,
+                    effect_applied=True,
+                    retryable=False,
+                    outcome_uncertain=True,
+                    platform_post_id=commit_sha,
+                    platform_url=article_url,
+                    error="GitHub Pages deployed site verification failed unexpectedly",
+                    raw_response={**accepted.raw_response, "state": "deployed"},
+                ),
+            )
+        if not site.success:
+            return self._journal_result(
+                content,
+                PublishResult(
+                    success=False,
+                    effect_applied=True,
+                    retryable=False,
+                    outcome_uncertain=True,
+                    platform_post_id=commit_sha,
+                    platform_url=article_url,
+                    error=site.error or "GitHub Pages deployed site metadata was not confirmed",
+                    raw_response={**accepted.raw_response, "state": "deployed"},
+                ),
+            )
+
+        try:
+            readback = await verifier.wait_for_readback(article_url=article_url, marker=marker)
+        except Exception:
+            return self._journal_result(
+                content,
+                PublishResult(
+                    success=False,
+                    effect_applied=True,
+                    retryable=False,
+                    outcome_uncertain=True,
+                    platform_post_id=commit_sha,
+                    platform_url=article_url,
+                    error="GitHub Pages public readback failed unexpectedly",
+                    raw_response={**accepted.raw_response, "state": "deployed"},
+                ),
+            )
+        if not readback.success:
+            return self._journal_result(
+                content,
+                PublishResult(
+                    success=False,
+                    effect_applied=True,
+                    retryable=False,
+                    outcome_uncertain=True,
+                    platform_post_id=commit_sha,
+                    platform_url=article_url,
+                    error=readback.error or "GitHub Pages public marker was not confirmed",
+                    raw_response={**accepted.raw_response, "state": "deployed"},
+                ),
+            )
+
+        verified = accepted.model_copy(
+            update={
+                "success": True,
+                "raw_response": {
+                    **accepted.raw_response,
+                    "state": "verified",
+                    "marker_sha256": marker,
+                },
+            }
+        )
+        return self._journal_result(content, verified)
 
     @staticmethod
     def _is_git_repo(repo: Path) -> bool:
@@ -580,6 +1353,137 @@ class GitHubPagesPublisher(PublisherBase):
             timeout_seconds=settings.github_pages_git_timeout_seconds,
         )
         return result.ok and remote in set(result.stdout.splitlines())
+
+    async def _prepare_gh_verifier(
+        self,
+        repo: Path,
+        remote: str,
+        branch: str,
+        *,
+        remote_url: str,
+    ) -> tuple[GitHubPagesGhVerifier | None, str | None, str | None]:
+        """Bind one configured repository to one exact push URL before writes."""
+
+        secret = getattr(settings, "github_pages_gh_token", "")
+        reveal = getattr(secret, "get_secret_value", None)
+        token = reveal() if callable(reveal) else str(secret)
+        configured_binary = str(getattr(settings, "github_pages_gh_bin", "gh"))
+        discovered_binary = shutil.which(configured_binary)
+        if discovered_binary is None:
+            return None, None, "GitHub CLI executable is unavailable"
+        runtime: tempfile.TemporaryDirectory[str] | None = None
+        try:
+            binary_path = Path(discovered_binary).resolve(strict=True)
+            runtime, staged_binary, binary_digest = await asyncio.to_thread(
+                _stage_verified_executable,
+                binary_path,
+            )
+        except OSError:
+            return None, None, "GitHub CLI executable identity cannot be verified"
+        expected_binary_digest = str(getattr(settings, "github_pages_gh_sha256", ""))
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", expected_binary_digest) is None
+            or binary_digest != expected_binary_digest
+        ):
+            assert runtime is not None
+            runtime.cleanup()
+            return None, None, "GitHub CLI executable does not match the approved SHA-256"
+        assert runtime is not None
+        self._cleanup_gh_runtime()
+        self._github_pages_gh_runtime = runtime
+        self._github_pages_gh_binary_path = str(staged_binary)
+        self._github_pages_gh_binary_digest = expected_binary_digest
+
+        config = GhPagesConfig(
+            repository=str(getattr(settings, "github_pages_repository", "")),
+            branch=branch,
+            base_url=settings.github_pages_base_url,
+            expected_version=str(getattr(settings, "github_pages_gh_version", "2.97.0")),
+            token_configured=bool(token.strip()),
+            command_timeout_seconds=settings.github_pages_git_timeout_seconds,
+            deploy_timeout_seconds=int(
+                getattr(settings, "github_pages_deploy_timeout_seconds", 600)
+            ),
+            poll_seconds=int(getattr(settings, "github_pages_verify_poll_seconds", 5)),
+            readback_timeout_seconds=int(
+                getattr(settings, "github_pages_readback_timeout_seconds", 120)
+            ),
+            readback_request_timeout_seconds=int(
+                getattr(settings, "github_pages_readback_request_timeout_seconds", 10)
+            ),
+            readback_max_bytes=int(
+                getattr(settings, "github_pages_readback_max_response_bytes", 2 * 1024 * 1024)
+            ),
+            binary=str(staged_binary),
+        )
+        return GitHubPagesGhVerifier(config, cwd=repo, runner=self._run_argv), remote_url, None
+
+    async def _push_url(self, repo: Path, remote: str) -> tuple[str | None, str | None]:
+        result = await self._run_argv(
+            ["git", "remote", "get-url", "--push", "--all", remote],
+            cwd=repo,
+            timeout_seconds=settings.github_pages_git_timeout_seconds,
+        )
+        if not result.ok:
+            return None, "无法确认 git push remote identity"
+        values = result.stdout.splitlines()
+        if len(values) != 1 or not values[0] or values[0] != values[0].strip():
+            return None, "GitHub Pages publishing requires exactly one push URL"
+        value = values[0]
+        if (
+            not value
+            or value.startswith("-")
+            or len(value) > 4096
+            or "=" in value
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+        ):
+            return None, "git push URL does not satisfy the safe target contract"
+        # Production network writes are restricted to ordinary, credential-free
+        # github.com HTTPS/SSH URLs. Absolute paths remain available for isolated
+        # local/bare-repository tests without enabling Git remote helpers.
+        if github_repository_from_push_url(value) is None and not Path(value).is_absolute():
+            return None, "git push URL is not an approved github.com or local target"
+
+        # Git applies url.*.insteadOf/pushInsteadOf even when a concrete URL is
+        # passed to a transport command.  Pin the longest possible (exact) URL
+        # mapping and prove the resulting transport identity before any write.
+        transport_pin, transport_target = self._transport_url_pin(value)
+        resolved = await self._run_argv(
+            [
+                "git",
+                *transport_pin,
+                "ls-remote",
+                "--get-url",
+                "--",
+                transport_target,
+            ],
+            cwd=repo,
+            timeout_seconds=settings.github_pages_git_timeout_seconds,
+        )
+        if not resolved.ok or resolved.stdout.splitlines() != [value]:
+            return None, "git push URL could not be pinned against Git URL rewrites"
+        return value, None
+
+    @staticmethod
+    def _transport_url_pin(target: str) -> tuple[list[str], str]:
+        """Return a one-use unguessable alias that rewrites exactly once to ``target``.
+
+        Git chooses the longest ``insteadOf`` prefix and does not recursively
+        rewrite the replacement.  A random full-length alias therefore wins
+        over ambient rules while preventing a later exact-target rule from
+        retargeting the already-approved destination.
+        """
+
+        alias = f"ai-ops-transport-{secrets.token_hex(32)}://repository"
+        return (
+            [
+                "-c",
+                f"url.{target}.insteadOf={alias}",
+                "-c",
+                f"url.{target}.pushInsteadOf={alias}",
+            ],
+            alias,
+        )
 
     @staticmethod
     def _repo_subdirectory(repo: Path, configured: str, label: str) -> tuple[Path, Path]:
@@ -776,10 +1680,14 @@ class GitHubPagesPublisher(PublisherBase):
             raise ValueError("GitHub Pages 图片路径含符号链接或越出受控目录")
         return source, metadata, digest
 
-    @classmethod
-    def _copy_planned_image(cls, plan: _ImagePlan) -> None:
+    def _copy_planned_image(
+        self,
+        plan: _ImagePlan,
+        repository_files: _RepositoryFiles,
+        relative: str,
+    ) -> _RepositoryLeaf:
         """Re-open with no-follow and reject source replacement after validation."""
-        fd = os.open(plan.source, cls._source_open_flags())
+        fd = os.open(plan.source, self._source_open_flags())
         try:
             metadata = os.fstat(fd)
             identity = (metadata.st_dev, metadata.st_ino, metadata.st_size)
@@ -792,8 +1700,12 @@ class GitHubPagesPublisher(PublisherBase):
                 if digest != plan.digest:
                     raise ValueError("GitHub Pages 图片在校验后发生变化")
                 source.seek(0)
-                with plan.destination.open("xb") as destination:
-                    shutil.copyfileobj(source, destination)
+                return repository_files.copy_from_fd(
+                    relative,
+                    fd,
+                    digest=plan.digest,
+                    size=plan.size,
+                )
         finally:
             os.close(fd)
 
@@ -808,6 +1720,45 @@ class GitHubPagesPublisher(PublisherBase):
             )
             + body
         )
+
+    @staticmethod
+    def _publication_marker(rendered: str) -> str:
+        """Bind public readback to the exact bytes approved for this source file."""
+
+        return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _embed_publication_marker(rendered: str, marker: str) -> str:
+        return (
+            rendered.rstrip()
+            + f'\n\n<span hidden {_PUBLICATION_MARKER_ATTRIBUTE}="{marker}"></span>\n'
+        )
+
+    def _journal_result(
+        self,
+        content: PublishContent,
+        result: PublishResult,
+        *,
+        required: bool = False,
+    ) -> PublishResult:
+        """Persist each monotonic delivery state before waiting for the next proof."""
+
+        path = write_publish_receipt(
+            job_id=content.job_id,
+            operation_id=content.operation_id,
+            publisher_kind=self.kind.value,
+            result=result,
+        )
+        has_runtime_identity = content.job_id is not None or content.operation_id is not None
+        if required and has_runtime_identity and path is None:
+            return result.model_copy(
+                update={
+                    "success": False,
+                    "retryable": False,
+                    "error": "远端 source commit 已接受，但本地 durable receipt 写入失败",
+                }
+            )
+        return result
 
     @staticmethod
     def _extra_frontmatter(content: PublishContent) -> str:
@@ -857,22 +1808,63 @@ class GitHubPagesPublisher(PublisherBase):
         return self._failure(stage, f"{message}: {detail}")
 
     @staticmethod
-    def _remove_created_paths(paths: list[Path], repo: Path) -> None:
+    def _remove_created_paths(paths: list[_RepositoryLeaf], repo: Path) -> None:
         """Remove only files this invocation created; never reset user git state."""
-        resolved_repo = repo.resolve()
-        for path in reversed(paths):
-            try:
-                if path.resolve(strict=False).is_relative_to(resolved_repo):
-                    path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        try:
+            with _RepositoryFiles(repo) as repository_files:
+                for approved in reversed(paths):
+                    try:
+                        repository_files.unlink_approved(approved)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
     @staticmethod
     def _verified_sha(result: _CommandResult) -> str | None:
-        if not result.ok or not result.stdout.strip():
+        if not result.ok:
             return None
-        candidate = result.stdout.strip().splitlines()[0]
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if len(lines) != 1:
+            return None
+        candidate = lines[0]
         return candidate if re.fullmatch(r"[0-9a-fA-F]{40,64}", candidate) else None
+
+    @staticmethod
+    def _commit_has_exact_parent(
+        result: _CommandResult,
+        *,
+        commit_sha: str,
+        expected_parent: str,
+    ) -> bool:
+        """Accept only one non-merge commit rooted at the preflight HEAD."""
+
+        if not result.ok:
+            return False
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if len(lines) != 1:
+            return False
+        fields = lines[0].split()
+        if len(fields) != 2 or not all(
+            re.fullmatch(r"[0-9a-fA-F]{40,64}", field) for field in fields
+        ):
+            return False
+        return (
+            fields[0].lower() == commit_sha.lower() and fields[1].lower() == expected_parent.lower()
+        )
+
+    @staticmethod
+    def _verified_remote_sha(result: _CommandResult, branch: str) -> str | None:
+        if not result.ok:
+            return None
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if len(lines) != 1:
+            return None
+        fields = lines[0].split()
+        expected_ref = f"refs/heads/{branch}"
+        if len(fields) != 2 or fields[1] != expected_ref:
+            return None
+        return fields[0] if re.fullmatch(r"[0-9a-fA-F]{40,64}", fields[0]) else None
 
     @classmethod
     def _snapshot_rollback_paths(
@@ -881,74 +1873,113 @@ class GitHubPagesPublisher(PublisherBase):
         paths: list[Path],
     ) -> list[_RollbackPath]:
         """Capture only paths this invocation is authorized to mutate."""
-        resolved_repo = repo.resolve(strict=True)
         snapshots: list[_RollbackPath] = []
         seen: set[str] = set()
-        for raw_path in paths:
-            path = Path(os.path.abspath(raw_path))
-            try:
-                relative = path.relative_to(resolved_repo).as_posix()
-            except ValueError as exc:
-                raise ValueError("回滚目标越出博客仓库") from exc
-            if relative in seen:
-                raise ValueError("回滚目标路径重复")
-            seen.add(relative)
-            if path.is_symlink() or not path.resolve(strict=False).is_relative_to(resolved_repo):
-                raise ValueError(f"回滚目标路径不安全: {relative}")
-            if path.exists():
-                metadata = path.stat(follow_symlinks=False)
+        with _RepositoryFiles(repo) as repository_files:
+            for raw_path in paths:
+                path = Path(os.path.abspath(raw_path))
+                relative = repository_files.relative_path(path)
+                if relative in seen:
+                    raise ValueError("回滚目标路径重复")
+                seen.add(relative)
+                metadata = repository_files.lstat(relative)
+                if metadata is None:
+                    snapshots.append(
+                        _RollbackPath(
+                            path=path,
+                            relative=relative,
+                            existed=False,
+                            original_content=None,
+                            original_mode=None,
+                        )
+                    )
+                    continue
                 if not stat.S_ISREG(metadata.st_mode):
                     raise ValueError(f"回滚目标不是普通文件: {relative}")
+                content, opened_metadata = repository_files.read_regular(relative)
                 snapshots.append(
                     _RollbackPath(
                         path=path,
                         relative=relative,
                         existed=True,
-                        original_content=path.read_bytes(),
-                        original_mode=stat.S_IMODE(metadata.st_mode),
-                    )
-                )
-            else:
-                snapshots.append(
-                    _RollbackPath(
-                        path=path,
-                        relative=relative,
-                        existed=False,
-                        original_content=None,
-                        original_mode=None,
+                        original_content=content,
+                        original_mode=stat.S_IMODE(opened_metadata.st_mode),
                     )
                 )
         return snapshots
 
     @classmethod
-    def _seal_rollback_paths(cls, paths: list[_RollbackPath], repo: Path) -> None:
+    def _seal_rollback_paths(
+        cls,
+        paths: list[_RollbackPath],
+        repo: Path,
+        *,
+        expected_artifacts: dict[str, tuple[str, int]] | None = None,
+        created_artifacts: dict[str, _RepositoryLeaf] | None = None,
+    ) -> None:
         """Record the exact bytes written by this invocation before build/git."""
-        resolved_repo = repo.resolve(strict=True)
-        for snapshot in paths:
-            digest, size = cls._artifact_fingerprint(
-                snapshot.path,
-                resolved_repo,
-                snapshot.relative,
-            )
-            snapshot.written_digest = digest
-            snapshot.written_size = size
+        with _RepositoryFiles(repo) as repository_files:
+            for snapshot in paths:
+                digest, size, mode, captured = cls._artifact_fingerprint(
+                    repository_files,
+                    snapshot.relative,
+                    approved=(created_artifacts or {}).get(snapshot.relative),
+                )
+                if expected_artifacts is not None:
+                    expected = expected_artifacts.get(snapshot.relative)
+                    if expected is None or (digest, size) != expected:
+                        raise ValueError(f"本轮路径与批准内容不一致: {snapshot.relative}")
+                    digest, size = expected
+                snapshot.written_digest = digest
+                snapshot.written_size = size
+                snapshot.written_git_mode = "100755" if mode & 0o111 else "100644"
+                snapshot.approved_leaf = captured
+
+    @classmethod
+    def _sealed_paths_error(cls, paths: list[_RollbackPath], repo: Path) -> str | None:
+        """Detect build hooks or lock-ignoring writers before staging."""
+
+        try:
+            repository_files = _RepositoryFiles(repo)
+        except OSError as exc:
+            return f"无法安全打开博客仓库: {type(exc).__name__}"
+        with repository_files:
+            for snapshot in paths:
+                if (
+                    snapshot.written_digest is None
+                    or snapshot.written_size is None
+                    or snapshot.written_git_mode is None
+                    or snapshot.approved_leaf is None
+                ):
+                    return f"缺少本轮路径批准指纹: {snapshot.relative}"
+                try:
+                    digest, size, mode, _ = cls._artifact_fingerprint(
+                        repository_files,
+                        snapshot.relative,
+                        approved=snapshot.approved_leaf,
+                    )
+                except (OSError, ValueError):
+                    return f"本轮路径在 build 后发生变化: {snapshot.relative}"
+                git_mode = "100755" if mode & 0o111 else "100644"
+                if (digest, size, git_mode) != (
+                    snapshot.written_digest,
+                    snapshot.written_size,
+                    snapshot.written_git_mode,
+                ):
+                    return f"本轮路径在 build 后发生变化: {snapshot.relative}"
+        return None
 
     @staticmethod
     def _artifact_fingerprint(
-        path: Path,
-        resolved_repo: Path,
+        repository_files: _RepositoryFiles,
         relative: str,
-    ) -> tuple[str, int]:
-        if path.is_symlink() or not path.resolve(strict=False).is_relative_to(resolved_repo):
-            raise ValueError(f"本轮路径已被替换或越界: {relative}")
+        *,
+        approved: _RepositoryLeaf | None = None,
+    ) -> tuple[str, int, int, _RepositoryLeaf]:
         try:
-            metadata = path.stat(follow_symlinks=False)
+            return repository_files.fingerprint(relative, approved=approved)
         except OSError as exc:
             raise ValueError(f"本轮路径缺失或不可读: {relative}") from exc
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"本轮路径不再是普通文件: {relative}")
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        return digest, metadata.st_size
 
     async def _rollback_or_report(
         self,
@@ -1004,76 +2035,89 @@ class GitHubPagesPublisher(PublisherBase):
         if current_head.lower() != preflight_head.lower():
             return _RollbackResult(False, "HEAD 已变化，可能已生成本地 commit，未执行文件恢复")
 
-        resolved_repo = repo.resolve(strict=True)
-        for snapshot in paths:
-            if snapshot.written_digest is None or snapshot.written_size is None:
-                return _RollbackResult(False, f"缺少本轮文件指纹: {snapshot.relative}")
-            if not self._path_exists(snapshot.path):
-                if snapshot.existed:
-                    return _RollbackResult(False, f"已有文件已消失: {snapshot.relative}")
-                continue
-            try:
-                digest, size = self._artifact_fingerprint(
-                    snapshot.path,
-                    resolved_repo,
-                    snapshot.relative,
-                )
-            except ValueError as exc:
-                return _RollbackResult(False, str(exc))
-            if (digest, size) != (snapshot.written_digest, snapshot.written_size):
-                return _RollbackResult(False, f"本轮路径内容已被其他操作修改: {snapshot.relative}")
-
-        relative_paths = [snapshot.relative for snapshot in paths]
-        if unstage and relative_paths:
-            staged = await self._staged_publish_paths(repo, relative_paths, timeout)
-            if isinstance(staged, str):
-                return _RollbackResult(False, staged)
-            if staged:
-                restore = await self._run_argv(
-                    [
-                        "git",
-                        "restore",
-                        "--staged",
-                        f"--source={preflight_head}",
-                        "--",
-                        *sorted(staged),
-                    ],
-                    cwd=repo,
-                    timeout_seconds=timeout,
-                )
-                if not restore.ok:
-                    return _RollbackResult(False, "无法精确取消暂存，本轮文件未删除")
-                remaining = await self._staged_publish_paths(repo, relative_paths, timeout)
-                if isinstance(remaining, str):
-                    return _RollbackResult(False, remaining)
-                if remaining:
-                    return _RollbackResult(False, "本轮路径仍有暂存内容，本轮文件未删除")
-
         try:
-            for snapshot in paths:
-                if snapshot.existed:
-                    assert snapshot.original_content is not None
-                    assert snapshot.original_mode is not None
-                    self._atomic_restore_file(
-                        snapshot.path,
-                        snapshot.original_content,
-                        snapshot.original_mode,
-                    )
-                else:
-                    snapshot.path.unlink(missing_ok=True)
+            repository_files = _RepositoryFiles(repo)
         except OSError as exc:
-            return _RollbackResult(False, f"恢复本轮路径失败: {type(exc).__name__}")
-
-        for snapshot in paths:
-            if snapshot.existed:
+            return _RollbackResult(False, f"无法安全打开博客仓库: {type(exc).__name__}")
+        with repository_files:
+            for snapshot in paths:
+                if (
+                    snapshot.written_digest is None
+                    or snapshot.written_size is None
+                    or snapshot.approved_leaf is None
+                ):
+                    return _RollbackResult(False, f"缺少本轮文件指纹: {snapshot.relative}")
                 try:
-                    restored = snapshot.path.read_bytes()
-                except OSError:
-                    return _RollbackResult(False, f"无法验证已恢复文件: {snapshot.relative}")
-                if restored != snapshot.original_content:
-                    return _RollbackResult(False, f"已有文件恢复校验失败: {snapshot.relative}")
-            elif self._path_exists(snapshot.path):
-                return _RollbackResult(False, f"本轮新文件删除校验失败: {snapshot.relative}")
+                    metadata = repository_files.lstat(snapshot.relative)
+                except OSError as exc:
+                    return _RollbackResult(
+                        False,
+                        f"本轮路径缺失或不可读: {snapshot.relative}: {type(exc).__name__}",
+                    )
+                if metadata is None:
+                    if snapshot.existed:
+                        return _RollbackResult(False, f"已有文件已消失: {snapshot.relative}")
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    return _RollbackResult(False, f"本轮路径不再是普通文件: {snapshot.relative}")
+                try:
+                    digest, size, _, _ = self._artifact_fingerprint(
+                        repository_files,
+                        snapshot.relative,
+                        approved=snapshot.approved_leaf,
+                    )
+                except ValueError as exc:
+                    return _RollbackResult(False, str(exc))
+                if (digest, size) != (snapshot.written_digest, snapshot.written_size):
+                    return _RollbackResult(
+                        False,
+                        f"本轮路径内容已被其他操作修改: {snapshot.relative}",
+                    )
+
+            relative_paths = [snapshot.relative for snapshot in paths]
+            if unstage and relative_paths:
+                staged = await self._staged_publish_paths(repo, relative_paths, timeout)
+                if isinstance(staged, str):
+                    return _RollbackResult(False, staged)
+                if staged:
+                    restore = await self._run_argv(
+                        [
+                            "git",
+                            "restore",
+                            "--staged",
+                            f"--source={preflight_head}",
+                            "--",
+                            *sorted(staged),
+                        ],
+                        cwd=repo,
+                        timeout_seconds=timeout,
+                    )
+                    if not restore.ok:
+                        return _RollbackResult(False, "无法精确取消暂存，本轮文件未删除")
+                    remaining = await self._staged_publish_paths(repo, relative_paths, timeout)
+                    if isinstance(remaining, str):
+                        return _RollbackResult(False, remaining)
+                    if remaining:
+                        return _RollbackResult(False, "本轮路径仍有暂存内容，本轮文件未删除")
+
+            try:
+                for snapshot in paths:
+                    if snapshot.existed:
+                        assert snapshot.original_content is not None
+                        assert snapshot.original_mode is not None
+                        self._atomic_restore_file(
+                            repository_files,
+                            snapshot.approved_leaf,
+                            snapshot.original_content,
+                            snapshot.original_mode,
+                        )
+                    else:
+                        self._unlink_rollback_file(
+                            repository_files,
+                            snapshot.approved_leaf,
+                        )
+            except OSError as exc:
+                return _RollbackResult(False, f"恢复本轮路径失败: {type(exc).__name__}")
 
         status = await self._run_argv(
             ["git", "status", "--porcelain=v1", "--untracked-files=all"],
@@ -1105,27 +2149,160 @@ class GitHubPagesPublisher(PublisherBase):
             return "暂存查询返回非本任务路径，本轮文件未删除"
         return staged
 
+    def _unlink_rollback_file(
+        self,
+        repository_files: _RepositoryFiles,
+        approved: _RepositoryLeaf,
+    ) -> None:
+        repository_files.unlink_approved(approved)
+
+    def _atomic_restore_file(
+        self,
+        repository_files: _RepositoryFiles,
+        approved: _RepositoryLeaf,
+        content: bytes,
+        mode: int,
+    ) -> None:
+        repository_files.atomic_restore(approved, content, mode)
+
     @staticmethod
-    def _atomic_restore_file(path: Path, content: bytes, mode: int) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary: Path | None = None
+    def _verified_tree_entries(
+        result: _CommandResult,
+    ) -> dict[str, tuple[str, str]] | None:
+        if not result.ok or not result.stdout or not result.stdout.endswith("\0"):
+            return None
+        entries: dict[str, tuple[str, str]] = {}
+        for record in result.stdout[:-1].split("\0"):
+            try:
+                header, path = record.split("\t", 1)
+            except ValueError:
+                return None
+            fields = header.split()
+            if (
+                len(fields) != 3
+                or fields[1] != "blob"
+                or fields[0] not in {"100644", "100755"}
+                or re.fullmatch(r"[0-9a-fA-F]{40,64}", fields[2]) is None
+                or not path
+                or path in entries
+            ):
+                return None
+            entries[path] = (fields[0], fields[2])
+        return entries
+
+    async def _git_blob_matches(
+        self,
+        *,
+        repo: Path,
+        object_id: str,
+        expected_digest: str,
+        expected_size: int,
+        timeout_seconds: int,
+    ) -> bool:
+        """Stream one committed blob into a bounded SHA-256 comparison."""
+
+        env = {key: value for key, value in os.environ.items() if key in _SUBPROCESS_ENV_ALLOWLIST}
+        env.update(
+            {
+                "GIT_ALLOW_PROTOCOL": "file:https:ssh",
+                "GIT_GRAFT_FILE": os.devnull,
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "NO_COLOR": "1",
+            }
+        )
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                prefix=f".{path.name}.ai-ops-rollback-",
-                dir=path.parent,
-                delete=False,
-            ) as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-                temporary = Path(handle.name)
-            temporary.chmod(mode)
-            os.replace(temporary, path)
-            temporary = None
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            process = await asyncio.create_subprocess_exec(
+                "git",
+                "cat-file",
+                "blob",
+                object_id,
+                cwd=str(repo),
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=os.name == "posix",
+            )
+        except (FileNotFoundError, PermissionError, OSError):
+            return False
+
+        async def consume() -> tuple[str, int] | None:
+            assert process.stdout is not None
+            digest = hashlib.sha256()
+            size = 0
+            while chunk := await process.stdout.read(64 * 1024):
+                size += len(chunk)
+                if size > expected_size:
+                    return None
+                digest.update(chunk)
+            return digest.hexdigest(), size
+
+        try:
+            fingerprint = await asyncio.wait_for(
+                consume(),
+                timeout=float(timeout_seconds),
+            )
+            if fingerprint is None:
+                await self._stop_process(process)
+                return False
+            try:
+                await asyncio.wait_for(process.wait(), timeout=float(timeout_seconds))
+            except TimeoutError:
+                await self._stop_process(process)
+                return False
+        except asyncio.CancelledError:
+            await self._stop_process(process)
+            raise
+        except Exception:
+            await self._stop_process(process)
+            return False
+        return process.returncode == 0 and fingerprint == (expected_digest, expected_size)
+
+    async def _committed_artifacts_match(
+        self,
+        *,
+        repo: Path,
+        commit_sha: str,
+        sealed_paths: list[_RollbackPath],
+        timeout_seconds: int,
+    ) -> bool:
+        relative_paths = [snapshot.relative for snapshot in sealed_paths]
+        tree = await self._run_argv(
+            [
+                "git",
+                "ls-tree",
+                "--full-tree",
+                "-rz",
+                commit_sha,
+                "--",
+                *relative_paths,
+            ],
+            cwd=repo,
+            timeout_seconds=timeout_seconds,
+        )
+        entries = self._verified_tree_entries(tree)
+        if entries is None or set(entries) != set(relative_paths):
+            return False
+        for snapshot in sealed_paths:
+            if (
+                snapshot.written_digest is None
+                or snapshot.written_size is None
+                or snapshot.written_git_mode is None
+            ):
+                return False
+            mode, object_id = entries[snapshot.relative]
+            if mode != snapshot.written_git_mode:
+                return False
+            if not await self._git_blob_matches(
+                repo=repo,
+                object_id=object_id,
+                expected_digest=snapshot.written_digest,
+                expected_size=snapshot.written_size,
+                timeout_seconds=timeout_seconds,
+            ):
+                return False
+        return True
 
     async def _git_publish(
         self,
@@ -1134,8 +2311,10 @@ class GitHubPagesPublisher(PublisherBase):
         paths: list[Path],
         slug: str,
         title: str,
-        remote: str,
+        push_target: str,
         branch: str,
+        preflight_head: str,
+        sealed_paths: list[_RollbackPath],
     ) -> _GitPublishResult:
         relative_paths = [path.relative_to(repo).as_posix() for path in paths]
         timeout = settings.github_pages_git_timeout_seconds
@@ -1204,13 +2383,65 @@ class GitHubPagesPublisher(PublisherBase):
                 error="本地 commit 包含非本任务路径，拒绝 push",
             )
 
+        if not await self._committed_artifacts_match(
+            repo=repo,
+            commit_sha=commit_sha,
+            sealed_paths=sealed_paths,
+            timeout_seconds=timeout,
+        ):
+            return _GitPublishResult(
+                success=False,
+                commit_sha=commit_sha,
+                error="本地 commit 内容或文件模式与批准产物不一致，拒绝 push",
+            )
+
+        ancestry = await self._run_argv(
+            ["git", "rev-list", "--parents", "-n", "1", commit_sha],
+            cwd=repo,
+            timeout_seconds=timeout,
+        )
+        if not self._commit_has_exact_parent(
+            ancestry,
+            commit_sha=commit_sha,
+            expected_parent=preflight_head,
+        ):
+            return _GitPublishResult(
+                success=False,
+                commit_sha=commit_sha,
+                error="本地 commit 的父提交不是发布前 HEAD，拒绝 push",
+            )
+
+        current_head_result = await self._run_argv(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=repo,
+            timeout_seconds=timeout,
+        )
+        current_head = self._verified_sha(current_head_result)
+        if current_head is None or current_head.lower() != commit_sha.lower():
+            return _GitPublishResult(
+                success=False,
+                commit_sha=commit_sha,
+                error="本地 HEAD 在 push 前发生变化，拒绝 push",
+            )
+
         try:
+            transport_pin, transport_target = self._transport_url_pin(push_target)
             push = await self._run_argv(
                 [
                     "git",
+                    *transport_pin,
+                    "-c",
+                    f"core.hooksPath={os.devnull}",
+                    "-c",
+                    "push.pushOption=",
                     "push",
                     "--porcelain",
-                    remote,
+                    "--no-follow-tags",
+                    "--no-recurse-submodules",
+                    "--no-signed",
+                    f"--force-with-lease=refs/heads/{branch}:{preflight_head}",
+                    "--",
+                    transport_target,
                     f"{commit_sha}:refs/heads/{branch}",
                 ],
                 cwd=repo,
@@ -1232,12 +2463,15 @@ class GitHubPagesPublisher(PublisherBase):
             )
 
         try:
+            transport_pin, transport_target = self._transport_url_pin(push_target)
             verification = await self._run_argv(
                 [
                     "git",
+                    *transport_pin,
                     "ls-remote",
                     "--exit-code",
-                    remote,
+                    "--",
+                    transport_target,
                     f"refs/heads/{branch}",
                 ],
                 cwd=repo,
@@ -1251,30 +2485,16 @@ class GitHubPagesPublisher(PublisherBase):
                 outcome_uncertain=True,
             )
 
-        remote_sha = ""
-        if verification.returncode == 0 and verification.stdout.strip():
-            remote_sha = verification.stdout.splitlines()[0].split()[0]
-        if remote_sha.lower() == commit_sha.lower():
+        remote_sha = self._verified_remote_sha(verification, branch)
+        if remote_sha is not None and remote_sha.lower() == commit_sha.lower():
             return _GitPublishResult(success=True, commit_sha=commit_sha)
 
-        verification_confirmed = (
-            verification.started
-            and not verification.timed_out
-            and verification.returncode in {0, 2}
+        return _GitPublishResult(
+            success=False,
+            commit_sha=commit_sha,
+            error="git push 已启动，但远端 commit 无法唯一归因于本次发布",
+            outcome_uncertain=True,
         )
-        if not verification_confirmed:
-            return _GitPublishResult(
-                success=False,
-                commit_sha=commit_sha,
-                error="git push 已启动，但远端 commit 无法确认",
-                outcome_uncertain=True,
-            )
-
-        if push.ok:
-            error = "git push 返回成功，但目标分支未指向本次 commit"
-        else:
-            error = self._git_error("git push", push)
-        return _GitPublishResult(success=False, commit_sha=commit_sha, error=error)
 
     @staticmethod
     def _git_error(stage: str, result: _CommandResult) -> str:
@@ -1295,10 +2515,116 @@ class GitHubPagesPublisher(PublisherBase):
         env = {key: value for key, value in os.environ.items() if key in _SUBPROCESS_ENV_ALLOWLIST}
         env.update(
             {
+                "GIT_ALLOW_PROTOCOL": "file:https:ssh",
+                "GIT_GRAFT_FILE": os.devnull,
+                "GIT_NO_REPLACE_OBJECTS": "1",
                 "GIT_TERMINAL_PROMPT": "0",
                 "NO_COLOR": "1",
             }
         )
+        configured_gh = str(getattr(settings, "github_pages_gh_bin", "gh"))
+        approved_gh = getattr(self, "_github_pages_gh_binary_path", None)
+        if argv and argv[0] in {configured_gh, approved_gh}:
+            binary = argv[0]
+            repository = str(getattr(settings, "github_pages_repository", ""))
+            is_version_probe = argv == [binary, "--version"]
+            is_api_call = approved_gh_api_argv(
+                argv,
+                repository=repository,
+                binary=binary,
+            )
+            if not is_version_probe and not is_api_call:
+                return _CommandResult(started=False, error="unapproved_gh_command")
+            if is_api_call and (approved_gh is None or binary != approved_gh):
+                return _CommandResult(started=False, error="unapproved_gh_binary")
+            if is_api_call:
+                approved_digest = getattr(self, "_github_pages_gh_binary_digest", None)
+                current_digest = await asyncio.to_thread(
+                    _verified_executable_digest,
+                    Path(binary),
+                )
+                if not isinstance(approved_digest, str) or current_digest != approved_digest:
+                    return _CommandResult(started=False, error="unapproved_gh_binary")
+            for ambient_transport in (
+                "ALL_PROXY",
+                "CURL_CA_BUNDLE",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "NO_PROXY",
+                "REQUESTS_CA_BUNDLE",
+                "GIT_SSH",
+                "GIT_SSH_COMMAND",
+                "SSH_AUTH_SOCK",
+                "SSL_CERT_DIR",
+                "SSL_CERT_FILE",
+            ):
+                env.pop(ambient_transport, None)
+            secret = getattr(settings, "github_pages_gh_token", "")
+            reveal = getattr(secret, "get_secret_value", None)
+            token = reveal() if callable(reveal) else str(secret)
+            env.update(
+                {
+                    "DO_NOT_TRACK": "true",
+                    "GH_PROMPT_DISABLED": "1",
+                    "GH_NO_UPDATE_NOTIFIER": "1",
+                    "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
+                    "GH_SPINNER_DISABLED": "1",
+                    "GH_PAGER": "cat",
+                    "GH_TELEMETRY": "false",
+                }
+            )
+            if is_api_call and token.strip():
+                env["GH_TOKEN"] = token
+            # Isolate credentials, telemetry state, caches, and any incidental
+            # files from the daemon user's real home. The project token above
+            # is the command's only authentication source.
+            with tempfile.TemporaryDirectory(prefix="ai-ops-gh-runtime-") as gh_root:
+                root = Path(gh_root)
+                for directory in (
+                    root / "gh-config",
+                    root / "home",
+                    root / "tmp",
+                    root / "xdg-cache",
+                    root / "xdg-config",
+                    root / "xdg-data",
+                    root / "xdg-state",
+                ):
+                    directory.mkdir()
+                env.update(
+                    {
+                        "GH_CONFIG_DIR": str(root / "gh-config"),
+                        "HOME": str(root / "home"),
+                        "TMP": str(root / "tmp"),
+                        "TEMP": str(root / "tmp"),
+                        "TMPDIR": str(root / "tmp"),
+                        "USERPROFILE": str(root / "home"),
+                        "XDG_CACHE_HOME": str(root / "xdg-cache"),
+                        "XDG_CONFIG_HOME": str(root / "xdg-config"),
+                        "XDG_DATA_HOME": str(root / "xdg-data"),
+                        "XDG_STATE_HOME": str(root / "xdg-state"),
+                    }
+                )
+                return await self._execute_argv(
+                    argv,
+                    cwd=cwd,
+                    timeout_seconds=timeout_seconds,
+                    env=env,
+                )
+        return await self._execute_argv(
+            argv,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            env=env,
+        )
+
+    async def _execute_argv(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        timeout_seconds: int,
+        env: dict[str, str],
+    ) -> _CommandResult:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
