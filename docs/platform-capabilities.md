@@ -29,7 +29,7 @@ Experimental 对外呈现。
 | TikTok | **Stub** | 当前无注册 Publisher；官方 Content Posting API 是后续候选 | 无发布契约 | 未实现 | — |
 | YouTube | **Experimental** | `youtubeuploader v1.25.5` gated canary；无 SAU fallback | 固定 tag 源码审计；fake CLI/OAuth 隔离/receipt/partial/unknown 契约 | 未实现 | CLI：2026-08-10 E2 源码审计；真发未测 |
 | GitHub Pages / 静态站点 | **Experimental** | Hexo + 固定 `pnpm|npx`/git argv；default-off `gh 2.97.0` Pages 验证 | dry-run 无副作用；受控图片/仓库锁/remote baseline；source SHA `accepted`、精确 commit deployment `deployed`、公网 marker `verified` 的离线契约；无真站验证 | 未实现 | 2026-08-11 离线契约；未连真实 remote/Pages |
-| 微信公众号 | **Stub** | persistent-context draft-only publisher；后续优先官方草稿/发布 API | mock 草稿/unknown 契约；官方能力受账号类型与认证资格限制，尚未实现 API 插件 | 未实现 | 2026-08-11 E1 官方文档审计；未调用 |
+| 微信公众号 | **Stub** | persistent-context draft-only publisher；官方草稿/发布 API adapter（`wechat_mp_api`，默认关闭 `WECHAT_MP_API_PUBLISHER_ENABLED`） | mock 草稿/unknown 契约；官方 API 的 token/封面素材/草稿/发布/有界回查/unknown 契约测试；能力受账号类型与认证资格限制，未真平台验证 | 未实现 | 2026-08-11 E1 官方文档审计；API adapter 2026-10-31 离线契约；未调用 |
 | 百家号 | **Stub** | default-off Playwright publisher（`BAIJIAHAO_PUBLISHER_ENABLED`） | mock 契约；selector 待首次真发校准 | 代码路径已有，未真平台验证 | — |
 | 搜狐号 | **Stub** | default-off Playwright publisher（`SOHUHAO_PUBLISHER_ENABLED`） | mock 契约；selector 待首次真发校准 | 代码路径已有，未真平台验证 | — |
 
@@ -61,6 +61,13 @@ HTTP 契约测试，没有使用真实 token、remote 或 Pages 站点执行 can
 也不构成“已经稳定部署”的产品承诺。
 自动 `verified` 的首版边界仅覆盖 workflow Pages、enforced HTTPS 和仓库 owner 对应的
 `<owner>.github.io` origin；自定义域名仍需人工 canary，不在当前自动回读承诺内。
+
+微信公众号官方 API adapter 只使用文档化接口（`stable_token`、`material/add_material`、
+`draft/add`、`freepublish/submit`、`freepublish/get`），绝不调用群发（masssend）；
+发布（freepublish）会生成公开文章 URL 但不推送粉丝。发布提交发出后结果未知时按
+outcome_uncertain 处理，禁止 fallback 与自动重试；appid/secret/access_token 永不进入
+日志或回执。当前只有离线契约测试，未使用真实 appid/secret 调用，成熟度保持 Stub；
+首次真发须使用专用账号 canary，且发布接口能力受公众号认证资格约束。
 
 Publisher Plugin SDK 的 manifest/doctor 只证明 Python 兼容性和自描述一致性，不改变本表成熟度。
 插件只有提交精确上游版本、结构化回执/readback 和下面要求的真平台 evidence card，才可能推动

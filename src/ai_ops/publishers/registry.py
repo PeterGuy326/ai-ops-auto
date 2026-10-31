@@ -232,6 +232,19 @@ def build_default_registry(
         registration_id="builtin:wechat_mp_browser",
     )
 
+    # 公众号官方 API（draft + freepublish）canary：文档化接口、无浏览器依赖，
+    # 但发布是公开副作用且未经真实账号 canary，只有显式开启才装配，
+    # 并优先于仅保存草稿的浏览器适配器（那是部分副作用路径，不是发布）。
+    if getattr(active_config, "wechat_mp_api_publisher_enabled", False):
+        from .wechat_mp_api import WechatMpApiPublisher
+
+        reg.register(
+            Platform.WECHAT_MP,
+            WechatMpApiPublisher,
+            priority=5,
+            registration_id="builtin:wechat_mp_api",
+        )
+
     # 自有博客（GitHub Pages / Hexo）
     reg.register(
         Platform.GITHUB_PAGES,

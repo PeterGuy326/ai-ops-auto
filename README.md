@@ -140,7 +140,8 @@ API_KEY='<与 .env 相同的管理 key>' bash scripts/seed_demo.sh
   live push 固定预检时解析出的无凭证 github.com URL，以一次性 transport alias、exact lease、禁用
   隐式 tag/submodule/push-option 与 Git hooks、dirfd/no-follow 文件能力和 commit-tree blob 指纹校验，
   阻止 remote 重写、目录 symlink 竞态、额外 ref、并发历史夹带和 build/add 内容篡改。
-- 知乎/YouTube CLI canary 与百家号/搜狐号 Stub 默认不进入真实写主链路。
+- 知乎/YouTube CLI canary、微信公众号官方 API adapter（`WECHAT_MP_API_PUBLISHER_ENABLED`）
+  与百家号/搜狐号 Stub 默认不进入真实写主链路。
 - `PUBLISHER_PLUGIN_ALLOWLIST=[]`：未授权的第三方 entry point 不会被 import；非空 allowlist
   等同于同进程代码执行授权，不是沙箱。
 - 开源配置不包含内网端点、个人路径、固定通知群或任何凭证。

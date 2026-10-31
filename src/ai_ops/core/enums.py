@@ -81,6 +81,7 @@ class PublisherKind(str, Enum):
     SOCIAL_AUTO_UPLOAD = "social_auto_upload"
     ZHIHU_CLI = "zhihu_cli"
     YOUTUBE_UPLOADER = "youtube_uploader"
+    WECHAT_MP_API = "wechat_mp_api"  # 公众号官方草稿/发布 API（默认关闭 canary）
     XHS_TOOLKIT = "xhs_toolkit"
     XHS_AI_PUBLISHER = "xhs_ai_publisher"
     SHORT_VIDEO_AUTO = "short_video_auto"

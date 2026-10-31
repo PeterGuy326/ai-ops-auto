@@ -345,6 +345,21 @@ class Settings(BaseSettings):
     baijiahao_publisher_enabled: bool = False
     sohuhao_publisher_enabled: bool = False
 
+    # ====== 微信公众号官方 API（草稿箱 draft + 发布 freepublish）======
+    # 官方文档化接口（api.weixin.qq.com），无浏览器/cookie 依赖。
+    # 默认关闭：发布（freepublish）会生成公开文章 URL，完成专用账号 canary
+    # 前不得进入真实写主链路。启用前须在公众号后台配置服务器 IP 白名单，
+    # 凭证（appid/secret）写入账号 credential 字段，由 CredentialStore 加密落库。
+    wechat_mp_api_publisher_enabled: bool = False
+    wechat_mp_api_timeout_seconds: int = Field(default=60, ge=5, le=600)
+    # freepublish 是异步发布；发布成功后回查 article_url 的有界轮询参数。
+    wechat_mp_api_publish_poll_attempts: int = Field(default=5, ge=1, le=30)
+    wechat_mp_api_publish_poll_interval_seconds: float = Field(
+        default=2.0, ge=0.5, le=60
+    )
+    # 渲染后正文（HTML）字节上限；公众号服务端另有约 2 万字限制。
+    wechat_mp_api_max_content_bytes: int = Field(default=1_000_000, ge=1024)
+
     # ====== GitHub Pages / 自有博客 ======
     # 本地 Hexo/Jekyll/Hugo 仓库路径（用户的博客源码）
     github_pages_path: Path = Path("./external/site")
