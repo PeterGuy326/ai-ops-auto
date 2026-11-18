@@ -13,6 +13,7 @@ fail-closed，任何异常返回 None，绝不伪造读回结果。
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 _META_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _FENCE_RE = re.compile(r"^(```|~~~)")
@@ -48,6 +49,8 @@ def split_paragraphs(md: str) -> list[str]:
                 buf = []
             continue
         # 围栏外剥离行首 markdown 标记（标题/列表/引用），保留正文文字。
+        line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
+        line = line.replace("**", "")
         buf.append(re.sub(r"^\s*(#{1,6}\s+|[-*+]\s+|>\s?|\d+\.\s+)", "", line))
     if buf:
         paras.append("\n".join(buf))
@@ -85,47 +88,75 @@ def compare_article(
 
 
 # ---------------- 浏览器提取（fail-closed，须真实会话）----------------
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
 TITLE_SELECTOR = "#title"
 DIGEST_SELECTOR = "textarea[name=digest]"
 BODY_SELECTOR = "#ueditor_0 .ProseMirror"
 
 
 async def readback_draft(profile_dir: str, draft_id: str) -> dict | None:
-    """UI 导航进草稿编辑器提取标题/摘要/正文。任何异常返回 None（fail-closed）。
+    """UI 导航读回草稿标题/摘要/正文（fail-closed）。复用 Easel 持久化会话。
 
-    复用 Easel 持久化 profile（~/.easel-browser-profiles/WeixinMpProfile）。
-    导航路径：home → 草稿箱 → 编辑按钮（图标 tooltip），不直拼编辑器 URL。
+    导航路径（Phase 1 实测）：首页→「草稿箱」链接→点 tooltip「编辑」→编辑器在新标签页→
+    正文 ``#ueditor_0 .ProseMirror``。不直拼编辑器 URL（token 每会话刷新须重取）。
     """
-    try:
-        from ..runtime.playwright_factory import get_async_playwright, get_launch_kwargs
+    import asyncio
 
-        async_playwright = get_async_playwright()
-        kwargs = get_launch_kwargs()
-        channel = kwargs.pop("channel", None)
-        proxy = kwargs.pop("proxy", None)
-        async with async_playwright() as p:
-            ctx = await p.chromium.launch_persistent_context(
-                user_data_dir=profile_dir, channel=channel, proxy=proxy,
-                viewport={"width": 1440, "height": 900}, **kwargs,
+    return await asyncio.to_thread(_readback_sync, draft_id)
+
+
+def _readback_sync(draft_id: str) -> dict | None:
+    try:
+        import sys
+
+        from playwright.sync_api import sync_playwright
+
+        sys.path.insert(0, str(_repo_root() / "vendor/easel/skills/shared/scripts"))
+        import weixin_mp_stats as w
+
+        with sync_playwright() as p:
+            ctx = w._launch(p, False, None, None)
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto(w.MP_HOME, wait_until="commit", timeout=60000)
+            page.wait_for_timeout(5000)
+            href = page.eval_on_selector_all(
+                "a[href]",
+                "els => { const a = els.find(e => (e.innerText||'').includes('草稿箱')); return a ? a.href : ''; }",
             )
+            if not href:
+                return None
+            page.goto(href, wait_until="commit", timeout=60000)
+            page.wait_for_timeout(9000)
+            clicked = page.evaluate(
+                """() => {
+                    const tips=[...document.querySelectorAll('.weui-desktop-card__action .weui-desktop-tooltip')];
+                    const t=tips.find(e=>(e.textContent||'').trim()==='编辑'); if(!t) return false;
+                    const wrp=t.closest('.weui-desktop-tooltip__wrp')||t.parentElement;
+                    (wrp.querySelector('a')||wrp).click(); return true; }"""
+            )
+            if not clicked:
+                return None
+            page.wait_for_timeout(3000)
+            ed = ctx.pages[-1]
             try:
-                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                await page.goto("https://mp.weixin.qq.com/", timeout=60000)
-                # 草稿箱 → 编辑（UI 导航，token 由会话自带）
-                await page.goto(
-                    "https://mp.weixin.qq.com/cgi-bin/appmsgpublish?sub=list&search_field=null"
-                    "&begin=0&count=5&query=&type=77&token=[REDACTED]",
-                    timeout=60000,
-                )
-                await page.wait_for_selector(".weui-desktop-card", timeout=30000)
-                edit = page.locator("[title='编辑'], a:has-text('编辑')").first
-                await edit.click()
-                await page.wait_for_selector(BODY_SELECTOR, timeout=30000)
-                title = await page.locator(TITLE_SELECTOR).input_value()
-                digest = await page.locator(DIGEST_SELECTOR).input_value()
-                body = await page.locator(BODY_SELECTOR).inner_text()
-                return {"title": title, "digest": digest, "body": body, "draft_id": draft_id}
-            finally:
-                await ctx.close()
+                ed.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            ed.wait_for_timeout(12000)
+            ce = ed.query_selector(BODY_SELECTOR) or ed.query_selector("[contenteditable='true']")
+            body = ce.inner_text() if ce else ""
+            ti = ed.query_selector(TITLE_SELECTOR)
+            di = ed.query_selector(DIGEST_SELECTOR)
+            result = {
+                "title": ti.input_value() if ti else "",
+                "digest": di.input_value() if di else "",
+                "body": body,
+                "draft_id": draft_id,
+            }
+            ctx.close()
+            return result
     except Exception:
         return None
