@@ -351,6 +351,8 @@ class Settings(BaseSettings):
     # 前不得进入真实写主链路。启用前须在公众号后台配置服务器 IP 白名单，
     # 凭证（appid/secret）写入账号 credential 字段，由 CredentialStore 加密落库。
     wechat_mp_api_publisher_enabled: bool = False
+    # Easel 会话版公众号草稿适配器（vendored Easel，免 AppID/未认证号可用），默认关闭。
+    easel_wechat_publisher_enabled: bool = False
     wechat_mp_api_timeout_seconds: int = Field(default=60, ge=5, le=600)
     # freepublish 是异步发布；发布成功后回查 article_url 的有界轮询参数。
     wechat_mp_api_publish_poll_attempts: int = Field(default=5, ge=1, le=30)

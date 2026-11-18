@@ -1,0 +1,2183 @@
+#!/usr/bin/env python3
+"""web_publisher.py — 通用浏览器发布框架（Playwright + 登录态持久化，配置驱动）。
+
+为"无开放 API、只能靠网页操作"的平台（快手 / 视频号 / 知乎 等）提供统一发布引擎：
+每个平台是一份「步骤配置」（登录页 / 发布页 / 选择器步骤），共用同一套 Playwright 引擎。
+登录态用持久化 user-data-dir 保存，扫码/登录一次后复用。
+
+发布结果判定：界面信号（URL/toast）只作旁证——已接入读回对账的平台（快手），发布后回作品
+管理页读本人作品列表对账（标题+时间窗），`verified` 才算成功，其余档位绝不冒报（先别重发）。
+
+⚠️ 环境依赖（真实发布需具备，缺则不可用——同 skill-xhs-publisher 定位）：
+    - playwright（`pip install playwright`）+ 浏览器内核（`playwright install chromium`）
+    - 目标平台已登录（首次 `login` 打开有头浏览器扫码/登录，持久化到 profile 目录）
+    - 有图形/远程显示或平台支持无头（登录一般需有头）
+  无头/无内核环境仍可用 `platforms` / `plan`（dry-run 步骤预览）/ `check`。
+
+⚠️ 选择器时效性：各平台网页改版频繁，内置选择器为**最佳努力**，**首次使用需人工校验/更新**
+   （见各平台 config 的 selector_caveat 与 SKILL 文档）。发布前务必先 `plan` 预览、`login` 目视确认。
+
+子命令：
+    platforms  列出支持平台
+    plan       解析并打印某平台的发布步骤（dry-run，不开浏览器）
+    check      检查 playwright / 浏览器内核
+    login      打开有头浏览器登录并持久化登录态
+    publish    执行网页发布（按步骤自动化）
+    selftest   自检（配置完整性 + 步骤解析，离线）
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import login_state  # noqa: E402
+import login_qr
+import login_transport
+import content_guard  # noqa: E402  出站内容安全闸门
+import platform_readback  # noqa: E402  发布读回对账（快手已接入，注册表见 _READBACK_VERIFIERS）
+import human_pace  # noqa: E402  人类节奏（提交前双停顿；EASEL_PACE_SKIP=1 跳过）
+
+# ── 平台配置注册表 ────────────────────────────────────────────────────
+# 每个步骤：{"action": goto|upload|fill|click|wait|press|waitfor, "selector"?, "value"?}
+# value 支持占位符：{media} {title} {desc} {tags} {cover}
+# 注：小红书**不在此**——其发布流程复杂（切 tab/逐图等上传/话题联想/成功校验），
+#     用独立脚本 skills/shared/scripts/xhs_publish.py（移植自 xiaohongshu-mcp）。
+PLATFORMS: dict[str, dict] = {
+    "kuaishou": {
+        "name": "快手",
+        "login_url": "https://cp.kuaishou.com",
+        "publish_url": "https://cp.kuaishou.com/article/publish/video",
+        "profile": "KuaishouProfile",
+        "media_kind": "video",  # 快手走视频发布流程（publish/video），只收视频；图片会晦涩超时
+        # 已登录标志（2026-07 实测：快手创作者中心改版，旧 .cp-header .user-name 已失效）
+        "login_check": ".user-info-avatar, .user-line, .vertical-menu, .setting-container",
+        # 严格判定：未登录会重定向到同域营销落地页（URL≠首页但其实未登录）→ 必须命中上面强选择器才算登录
+        "login_strict": True,
+        # 发布子系统鉴权探针：快手创作者中心「外壳」token（api_st/api_ph，+14d）比发布上传用的
+        # onvideo token（+0d，常在数小时内过期）活得久 → 外壳 DOM 仍显示已登录、昵称头像都在，
+        # 但真去发布时上传子系统 401 失败（用户实测「外壳正常但发不出去」）。DOM 外壳判定看不到这层，
+        # 故登录判定后再探一次发布/作品模块自己的 current/user（同源、无签名可直接 fetch）：
+        # result==1 表示发布鉴权正常；仅在「明确失效」信号（跳登录/401·403/未登录 result·文案）时才判未登录，
+        # 瞬时错误（如 result:500002「请稍后重试」/网络错误）保持外壳判定，避免把有效会话误翻成未登录。
+        "login_probe": {
+            "url": "https://cp.kuaishou.com/rest/cp/works/v2/common/pc/current/user",
+            "method": "POST",
+            "ok_result": [1],
+        },
+        # 收紧：去掉泛 [class*=login]（会误命中营销页/已登录页的 login 相关元素 → 假未登录）；
+        # 快手真扫码在 passport 域（URL 已判），cp 站已登录靠 login_check
+        "logged_out_selector": ".login-container, [class*=qrcode] img[src^='data:image']",
+        # 快手登录页是营销落地页，需点『立即登录』跳 passport 再切『扫码登录』才出二维码
+        "login_prep": [{"click": "text=立即登录"}, {"wait": 3000},
+                       {"click": "text=扫码登录"}, {"wait": 2500}],
+        # 二维码本体优先（passport 扫码码多为 base64 img / canvas，异步渲染）
+        "login_qr_selector": "[class*=qrcode] img[src^='data:image'], [class*=qrcode] canvas, "
+                             "[class*=qrcode] img, [class*=qr-login] img, [class*=qrcode]",
+        # 截图前等这个真正渲染出来（固定 wait 不够——快手 passport 二维码异步画）
+        "qr_loaded": "[class*=qrcode] img[src^='data:image'], [class*=qrcode] canvas, "
+                     "[class*=qrcode] img[src], canvas",
+        "me_name_selector": ".user-info-name, .user-line .name, .username, .user-name",
+        "me_avatar_selector": ".user-info-avatar img[src], .user-line img[src^='http']",
+        "publish_success": {"url_not_contains": "publish/video"},
+        "steps": [
+            # 先导航到管理页再回来，彻底清理草稿/页面状态
+            {"action": "goto", "value": "https://cp.kuaishou.com/article/manage/video"},
+            {"action": "wait", "value": "2000"},
+            {"action": "goto", "value": "https://cp.kuaishou.com/article/publish/video"},
+            # 等 SPA 渲染上传区（goto 后立即操作太早，input[type=file] 未就绪 → set_input_files 塞了不触发上传）
+            {"action": "wait", "value": "4000"},
+            # 上次未发布的草稿会弹「继续编辑/放弃」横条挡住上传——先点『放弃』清理（没有则跳过）
+            {"action": "click", "selector": "text=放弃, button:has-text('放弃'), [class*=abandon]", "optional": True},
+            {"action": "wait", "value": "2000"},
+            {"action": "upload", "selector": "input[type=file]", "value": "{media}"},
+            # 快手上传后需转码才出编辑表单（可能 1-3min），等久点；描述框标签未定死，放宽多候选
+            {"action": "waitfor",
+             "selector": "textarea, [contenteditable=true], input[placeholder*=描述], "
+                         "[placeholder*=描述], [placeholder*=作品], [class*=editor][contenteditable]",
+             "value": "180000"},
+            # 快手新手引导（react-joyride）有时会挡住描述框，headless 下无法手动关闭；
+            # 只移除引导浮层，不触碰业务表单内容。
+            {"action": "js_eval",
+             "value": """() => {
+                 for (const sel of ['#react-joyride-portal','.react-joyride__overlay','.react-joyride__spotlight']) {
+                     document.querySelectorAll(sel).forEach(el => el.remove());
+                 }
+                 document.querySelectorAll('[style*=pointer-events]').forEach(el => {
+                     const cls = (el.className || '').toString();
+                     if (cls.includes('joyride')) el.remove();
+                 });
+             }"""},
+            {"action": "fill",
+             "selector": "textarea, [contenteditable=true], input[placeholder*=描述], [placeholder*=描述]",
+             "value": "{title}\n{desc}\n{tags}"},
+            {"action": "wait", "value": "3000"},
+            # 截图：记录表单填写后状态
+            {"action": "screenshot", "value": "outputs/_login/ks-prefill.png"},
+            # 等发布按钮就绪（转码完成后才可点）
+            {"action": "waitfor", "selector": "[class*=_edit-section-btns]", "value": "60000"},
+            # 等封面缩略图加载完毕（_recommend-cover-item loading 消失后才能发布，否则点击无效）
+            {"action": "wait", "value": "25000"},
+            # 发布前再次清除 react-joyride 遮罩（有时在等待过程中再次出现拦截点击）
+            {"action": "js_eval",
+             "value": """() => {
+                 for (const sel of ['#react-joyride-portal','.react-joyride__overlay','.react-joyride__spotlight']) {
+                     document.querySelectorAll(sel).forEach(el => el.remove());
+                 }
+                 document.querySelectorAll('[style*=pointer-events]').forEach(el => {
+                     const cls = (el.className || '').toString();
+                     if (cls.includes('joyride')) el.remove();
+                 });
+             }"""},
+            {"action": "wait", "value": "1000"},
+            # 真发布按钮：表单底部『发布』，class 含 _button-primary_<hash>，在 _edit-section-btns_ 容器内。
+            # 用 js_click（scrollIntoView + JS dispatchEvent）触发——标准 click() 与 :has-text 对该按钮不可靠；
+            # 选择器多候选逐一尝试：优先容器内 button-primary，回退到非导航栏（非 publish-button 容器）的 button-primary。
+            # 勿点右上角『发布作品』（class=publish-button，是下拉菜单不是提交按钮）。
+            # 另：快手话题标签最多 4 个，超限报错 '话题标签数量超过上限：4'。
+            # commit=True：读回对账的时间窗基准——执行到本步时记录「提交动作」时间戳
+            {"action": "js_click", "commit": True,
+             "selector": "[class*=_edit-section-btns] [class*=button-primary], [class*=button-primary]:not([class*=publish-button] *)"},
+            {"action": "wait", "value": "8000"},
+            # 点发布后可能弹二次确认弹窗——optional
+            {"action": "click",
+             "selector": "[class*=dialog] [class*=button-primary], [class*=dialog] button:has-text('确认'), "
+                         "[class*=dialog] button:has-text('确定'), text=确认发布, text=确定发布",
+             "optional": True},
+            {"action": "wait", "value": "4000"},
+        ],
+        # 图文发布流程（media 是图片时走这套）：切「上传图文」tab + filechooser 上传图片
+        # （图文的图片 input 用 set_input_files 不触发上传，必须点『上传图片』走 filechooser——真机 dump 确认）
+        "steps_image": [
+            {"action": "goto", "value": "https://cp.kuaishou.com/article/publish/video"},
+            {"action": "wait", "value": "4000"},
+            {"action": "click", "selector": "text=放弃, button:has-text('放弃'), [class*=abandon]", "optional": True},
+            {"action": "wait", "value": "1500"},
+            # 切「上传图文」tab
+            {"action": "click", "selector": ".ant-tabs-tab-btn:has-text('上传图文'), text=上传图文"},
+            {"action": "wait", "value": "3000"},
+            # filechooser 上传图片（点『上传图片』按钮拦截文件选择器）
+            {"action": "filechooser_upload",
+             "selector": "text=上传图片, [class*=upload] button:has-text('上传图片'), button:has-text('上传图片')",
+             "value": "{media}"},
+            # 等图片上传完成（CDN 预览就绪）——否则点发布会弹「请在图片上传完成后再点击发布」
+            {"action": "waitfor", "selector": "[class*=preview-cover], img[src*='ssrcdn']", "value": "90000"},
+            {"action": "wait", "value": "2500"},
+            # 图文编辑表单：描述框 div[class*=_description]（占位『添加合适的话题和描述…』）
+            {"action": "waitfor",
+             "selector": "[class*=_description], [placeholder*=描述], [contenteditable=true]", "value": "60000"},
+            {"action": "fill",
+             "selector": "[class*=_description], [placeholder*=描述], [contenteditable=true]",
+             "value": "{title}\n{desc}\n{tags}"},
+            {"action": "wait", "value": "1500"},
+            {"action": "click",
+             "selector": "[class*=button-primary]:has-text('发布'), "
+                         "div[class*=_button]:has-text('发布'):not(:has-text('作品'))"},
+            {"action": "wait", "value": "2500"},
+            {"action": "click",
+             "selector": "[class*=dialog] [class*=button-primary], [class*=dialog] button:has-text('确认'), "
+                         "[class*=dialog] button:has-text('确定'), text=确认发布, text=确定发布",
+             "optional": True},
+            {"action": "wait", "value": "4000"},
+        ],
+        # 发布成功校验：成功后离开发布页 / 出现成功 toast（避免"点了发布=成功"的假阳性）
+        "publish_success": {"url_not_contains": "publish/video", "selector": "text=发布成功"},
+        # 读回对账（权威判定）：发布后回作品管理页读本人作品列表，标题+时间窗对上才算成功
+        "readback": True,
+        "selector_caveat": "快手创作者中心发布页；上传后转码才出编辑表单（描述框 DIV，占位『作品描述…』）；"
+                           "真发布按钮在表单底部：div[class*=button-primary]『发布』（品牌红，非 <button>；"
+                           "注意别点左侧导航的『发布作品』菜单）。点发布后可能弹二次确认（已加 optional）。"
+                           "若仍未成功，看 outputs/_publish.log dump 的可点元素更新选择器。",
+    },
+    "weixin-channels": {
+        "name": "微信视频号",
+        "login_url": "https://channels.weixin.qq.com",
+        "publish_url": "https://channels.weixin.qq.com/platform/post/create",
+        "profile": "ChannelsProfile",
+        "media_kind": "video",  # 视频号也走视频发布流程
+        # 登录判定靠 URL：未登录一律重定向到 channels.weixin.qq.com/login.html（含 login 标记 → _is_logged_in 判未登录）；
+        # login_check 为已登录主页的正向兜底（真机 2026-08 校准：登录后主页才有 finder-nickname/唯一ID/桌面导航）
+        "login_check": ".finder-nickname, .finder-uniq-id, .finder-ui-desktop-menu",
+        "login_strict": True,
+        # ⚠️ 二维码在跨域 iframe 内（open.weixin.qq.com 的微信标准扫码组件 connect/qrconnect），
+        # 主页面 query_selector 根本找不到——必须截 <iframe> 元素本体（真机 2026-08 验证：得 208×208 清晰码；
+        # iframe 内 img.js_qrcode_img 的 src 是相对 URL /connect/qrcode/<ticket>，非 base64，故打分裁剪那套不适用）
+        "login_qr_iframe": "iframe[src*='open.weixin.qq.com/connect/qrconnect']",
+        "login_navigation_timeout_ms": 30000,
+        "login_qr_iframe_timeout_ms": 30000,
+        # 登录页出现该扫码 iframe = 未登录的可靠信号
+        "logged_out_selector": "iframe[src*='open.weixin.qq.com/connect/qrconnect'], .login-mask",
+        "whoami_url": "https://channels.weixin.qq.com",
+        "me_name_selector": ".finder-info .finder-nickname",
+        "me_avatar_selector": ".finder-info img.avatar[src]",
+        "steps": [
+            {"action": "goto", "value": "https://channels.weixin.qq.com/platform/post/create"},
+            {"action": "upload", "selector": "input[type=file]", "value": "{media}"},
+            {"action": "waitfor", "selector": "textarea,.input-editor", "value": "60000"},
+            {"action": "fill", "selector": ".input-editor,textarea", "value": "{title}"},
+            {"action": "wait", "value": "3000"},
+            {"action": "click", "selector": "button:has-text('发表')"},
+        ],
+        # 发布成功校验：成功后离开创作页（/platform/post/create → 作品列表）——避免"点了发表=成功"假阳性
+        "publish_success": {"url_not_contains": "post/create", "selector": "text=发表成功"},
+        "selector_caveat": "视频号需微信扫码登录，二维码在跨域 iframe（open.weixin.qq.com/connect/qrconnect）内，"
+                           "已配 login_qr_iframe 直接截 iframe 元素本体（真机 2026-08 验证有效）。"
+                           "登录判定/whoami 已真机校准（login_check=finder-nickname/唯一ID/桌面导航；昵称 .finder-nickname、头像 img.avatar）。"
+                           "发布走专用函数 _publish_weixin_channels（真机 2026-08 打通）：goto /platform/post/list 点『发表视频』进创作页"
+                           "（直接 goto create 会重定向回首页）→ 上传 → 等转码出创作器（在 OOPIF iframe /micro/content/post/create 内，"
+                           "Playwright locator 解析不到、合成点击不被信任）→ evaluate 填描述(div.input-editor,execCommand) + 聚焦发表按钮 "
+                           "→ page.keyboard 按 Enter 可信提交，URL 跳 /post/list 即成功。下方 steps 已弃用（占位）。",
+    },
+    "zhihu": {
+        "name": "知乎",
+        "login_url": "https://www.zhihu.com/signin",
+        "login_probe_url": "https://www.zhihu.com/",
+        "publish_url": "https://zhuanlan.zhihu.com/write",
+        "profile": "ZhihuProfile",
+        "login_check": ".AppHeader-profile, .AppHeader-userInfo",
+        "login_strict": True,
+        "logged_out_selector": ".SignContainer, .Login-content, button:has-text('登录')",
+        "login_qr_switch": "button:has-text('扫码登录'), [role='tab']:has-text('扫码登录'), "
+                           ".SignFlow-qrcodeTab, .SignFlow-tab--qrcode, .SignFlow-switch:has-text('扫码')",
+        "login_qr_selector": ".Qrcode-img, .SignFlow-qrcode, .SignFlowQRCode, "
+                             "[class*='qrcode' i], img[src*='qr' i], canvas",
+        "qr_loaded": ".Qrcode-img, [class*='qrcode' i] img, [class*='qrcode' i] canvas, canvas",
+        "strict_login_qr": True,
+        "me_name_selector": ".AppHeader-profile .name, .AppHeader-userInfo .name",
+        "me_avatar_selector": ".AppHeader-profile img[src], .AppHeader-userInfo img[src]",
+        "steps": [
+            {"action": "goto", "value": "https://zhuanlan.zhihu.com/write"},
+            {"action": "waitfor", "selector": "textarea,.WriteIndex-titleInput,input", "value": "30000"},
+            {"action": "fill", "selector": ".WriteIndex-titleInput textarea,textarea[placeholder*='标题']", "value": "{title}"},
+            {"action": "type", "selector": ".public-DraftEditor-content,[contenteditable=true]", "value": "{desc}"},
+            {"action": "wait", "value": "2000"},
+            {"action": "click", "selector": "button:text-is('发布')"},
+        ],
+        # 发布成功校验：知乎发成功后跳到文章页 zhuanlan.zhihu.com/p/<id>（草稿是 /p/<id>/edit，需排除）
+        "publish_success": {"url_contains": "/p/", "url_not_contains": "/edit"},
+        "selector_caveat": "知乎专栏写文章页；正文为 Draft.js contenteditable。『发布』按钮须精确匹配"
+                           "（避免误点『发布设置』）。首次需核对标题输入框与发布流程。",
+        "media_optional": True,  # 知乎文章可纯文字（cmd_publish 的 --media 必填检查按此放行）
+    },
+    "juejin": {
+        "name": "掘金",
+        "login_url": "https://juejin.cn/login",
+        "login_probe_url": "https://juejin.cn/editor/drafts/new?v=2",
+        "publish_url": "https://juejin.cn/editor/drafts/new?v=2",
+        "profile": "JuejinProfile",
+        "media_optional": True,  # 文章以 Markdown 正文为主，封面可选
+        # 登录判定：用户接口 err_no==0（_authenticated_account 走 JuejinProfile 分支）；
+        # DOM 只作兜底——登录后顶部出现头像 .avatar。
+        "login_check": ".avatar, .user-info, [class*=avatar-wrapper], .login-button-wrap",
+        # 用显式接口判定，不许靠 URL 启发式（掘金未登录会 302 到 /login?to=...，但首页可匿名浏览）
+        "login_strict": True,
+        "logged_out_selector": ".login-button, .login-button-wrap, .top-login-guide",
+        # 掘金登录弹窗直接就有扫码码（img.qrcode-img，base64 PNG，150×150），无需切 tab
+        "login_prep": [{"click": ".login-button, .login-btn, text=登录"}, {"wait": 2500}],
+        "login_qr_selector": "img.qrcode-img, [class*=qrcode] img, [class*=qr-code] img, canvas",
+        "qr_loaded": "img.qrcode-img[src^='data:image'], img.qrcode-img[src]",
+        "strict_login_qr": True,
+        "me_name_selector": ".user-info .name, .username, .avatar-wrapper .name",
+        "me_avatar_selector": ".avatar img[src], img.avatar[src], .avatar-wrapper img[src]",
+        "steps": [
+            {"action": "goto", "value": "https://juejin.cn/editor/drafts/new?v=2"},
+            # ByteMD/CodeMirror 编辑器初始化慢，等标题框
+            {"action": "waitfor", "value": "45000",
+             "selector": "input[placeholder*='标题'], .title-input input, input.title-input"},
+            {"action": "fill", "value": "{title}",
+             "selector": "input[placeholder*='标题'], .title-input input, input.title-input"},
+            # 正文走 CodeMirror 底层 textarea（ByteMD 不认 page.fill 到 contenteditable）
+            {"action": "waitfor", "value": "30000", "selector": ".CodeMirror textarea, .CodeMirror"},
+            {"action": "fill", "selector": ".CodeMirror textarea, .CodeMirror",
+             "value": "{desc}"},
+            # 补一次回车触发编辑器内部状态同步（否则自动保存/发布读到空正文）
+            {"action": "press", "value": "Enter"},
+            {"action": "wait", "value": "2500"},
+            {"action": "screenshot", "value": "outputs/_login/juejin-prefill.png"},
+            # 点顶部「发布」→ 右侧弹出 .publish-popup 发布面板（分类/标签/封面/专栏/摘要）
+            {"action": "click",
+             "selector": "button:has-text('发布'), .publish-btn"},
+            {"action": "waitfor", "value": "15000", "selector": ".publish-popup.active, .publish-popup"},
+            # 分类必选：.category-list .item 是 div（不是 button）；默认投「人工智能」，
+            # 可用 --tags 的第一个标签或默认值覆盖。选不到就点第一个可选分类兜底。
+            {"action": "click",
+             "selector": ".publish-popup .category-list .item:has-text('人工智能'), .publish-popup .category-list .item"},
+            {"action": "wait", "value": "800"},
+            # 标签必填：点 placeholder 展开下拉（input 被 placeholder 遮挡，直接点 input 会超时）
+            {"action": "click", "optional": True, "selector": ".publish-popup .byte-select__placeholder"},
+            {"action": "wait", "value": "1200"},
+            {"action": "press", "optional": True, "value": "ArrowDown"},
+            {"action": "press", "optional": True, "value": "Enter"},
+            {"action": "wait", "value": "1200"},
+            # 标签选中后下拉仍展开会盖住「确定并发布」→ 点面板空白处收起（Esc 也行）
+            {"action": "press", "optional": True, "value": "Escape"},
+            {"action": "wait", "value": "600"},
+            {"action": "click", "optional": True, "selector": ".publish-popup .publish-title, .publish-popup h3"},
+            {"action": "wait", "value": "500"},
+            # 摘要必填且**至少 50 字**（平台校验："摘要不满足最低50字的要求"）。
+            # 点开摘要输入框 → 用 fill 写入拼到 ≥50 字的文本（{summary} 由 cmd_publish 预备）。
+            {"action": "click", "optional": True,
+             "selector": ".publish-popup textarea, .publish-popup [class*=summary] textarea"},
+            {"action": "fill", "optional": True,
+             "selector": ".publish-popup textarea, .publish-popup [class*=summary] textarea",
+             "value": "{summary}"},
+            {"action": "wait", "value": "800"},
+            {"action": "screenshot", "value": "outputs/_login/juejin-publish-panel.png"},
+            # 确认发布：面板底部 primary 按钮 =「确定并发布」。
+            # 用 js_click（JS 派发事件）：掘金是自定义 UI 组件，标准 click 常被判不可点而静默无效。
+            {"action": "js_click", "commit": True,
+             "selector": ".publish-popup .ui-btn.primary, .publish-popup button:has-text('确定并发布')"},
+            {"action": "wait", "value": "8000"},
+        ],
+        # 成功判定要「弹窗真的关掉」：服务端拒绝（如账号受限）时 .publish-popup 不会关闭，
+        # 只靠 URL 变化会假报成功（实测掘金「账户目前受到限制」正是这样被漏掉的）。
+        "publish_success": {"gone_selector": ".publish-popup.active, .publish-popup",
+                            "url_not_contains": "editor/drafts/new"},
+        "selector_caveat": "掘金编辑器 juejin.cn/editor/drafts/new?v=2（ByteMD + CodeMirror5）：标题 "
+                           "input[placeholder*=标题]；正文 .CodeMirror textarea（fill 后须补 Enter 触发状态同步）。"
+                           "点『发布』弹分类/标签/摘要面板，标签只支持掘金已有标签库（搜不到会失败，故标签步 optional）。"
+                           "登录判定走用户接口 err_no（_authenticated_account），比 DOM 可靠；二维码为登录弹窗内 "
+                           "img.qrcode-img（base64，无需切 tab）。首次使用先 plan 预览、小流量试发核对选择器。",
+    },
+    "twitter-x": {
+        "name": "推特 X",
+        "login_url": "https://x.com/i/flow/login",
+        "login_probe_url": "https://x.com/home",
+        "publish_url": "https://x.com/compose/post",
+        "profile": "TwitterXProfile",
+        # X 没有扫码登录（账号密码 + 可能的 2FA）→ login-qr 走窗口模式（--headed），
+        # 用户在本机弹出的浏览器窗口里手动完成登录，脚本轮询登录态后持久化。
+        "login_mode": "window",
+        # 国际站要外网可达：needs_proxy → 优先 EASEL_PROXY/TWITTER_X_PROXY/https_proxy 显式代理，
+        # 没配则不加 --no-proxy-server，让 Chromium 回退系统代理（TUN/系统级 VPN 用户）。
+        "needs_proxy": True,
+        # 代理链路冷启动 + X 首页重，默认 10s 导航超时太短
+        "login_navigation_timeout_ms": 30000,
+        "media_optional": True,  # 纯文字推文合法；图/视频可选（取第一个媒体文件）
+        # 已登录标志：左侧导航底部账号切换按钮只在登录后渲染；data-testid 是 X 上最稳定的锚点
+        "login_check": "[data-testid='SideNav_AccountSwitcher_Button']",
+        "login_strict": True,
+        "logged_out_selector": "[data-testid='loginButton'], a[href='/i/flow/login'], a[href='/login']",
+        "whoami_url": "https://x.com/home",
+        # 账号切换按钮里第一个 div[dir] 是显示名（第二个是 @handle）；头像是按钮内 img
+        "me_name_selector": "[data-testid='SideNav_AccountSwitcher_Button'] div[dir] span",
+        "me_avatar_selector": "[data-testid='SideNav_AccountSwitcher_Button'] img[src]",
+        "steps": [
+            {"action": "goto", "value": "https://x.com/compose/post"},
+            {"action": "waitfor", "value": "45000",
+             "selector": "[data-testid='tweetTextarea_0'], .public-DraftEditor-content"},
+            # 媒体可选：无媒体时引擎自动跳过 upload 步与 needs_media 等待步（纯文字推文）
+            {"action": "upload", "value": "{media}",
+             "selector": "input[type=file][data-testid='fileInput'], input[type=file]"},
+            # 附件处理（图片秒级/视频转码慢）完成前点发布会报错
+            {"action": "waitfor", "value": "120000", "needs_media": True,
+             "selector": "[data-testid='attachments']"},
+            # X 编辑器是 Draft.js contenteditable → 走 type（剪贴板注入，逐字键入兜底）
+            {"action": "type", "value": "{title}\n{desc}",
+             "selector": "[data-testid='tweetTextarea_0'], .public-DraftEditor-content"},
+            {"action": "wait", "value": "2000"},
+            # 推文按钮无文字时不可用；commit 标记 = 读回时间窗基准 + 提交前人类节奏双停顿
+            {"action": "click", "commit": True,
+             "selector": "[data-testid='tweetButton'], [data-testid='tweetButtonInline']"},
+            {"action": "wait", "value": "6000"},
+        ],
+        # 发推成功后离开 compose 页回 /home；[data-testid='toast']「Your post was sent.」作旁证
+        "publish_success": {"url_not_contains": "compose", "selector": "[data-testid='toast']"},
+        "selector_caveat": "X 发文页 x.com/compose/post；编辑器 [data-testid='tweetTextarea_0']（Draft.js）；"
+                           "发布钮 [data-testid='tweetButton']。X 风控对自动化敏感：登录务必走弹窗手动完成；"
+                           "首次使用先 plan 预览再小流量试发。推文=标题+正文合并（≤280 字符，超限按钮置灰）。",
+    },
+}
+
+_ACTIONS = {"goto", "upload", "filechooser_upload", "fill", "type", "click", "js_click", "js_eval", "wait", "press", "waitfor", "screenshot"}
+
+# Chromium 启动性能参数（提速冷启动；勿禁用图片——二维码是图片）
+# 国内平台一律直连：下方各 launch 处统一附 --no-proxy-server（Chromium 级屏蔽系统/环境代理，开 VPN 也能用）
+LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+    "--disable-extensions", "--disable-background-networking",
+    "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+    "--disable-features=TranslateUI,BackForwardCache",
+    "--mute-audio", "--no-first-run", "--no-default-browser-check",
+]
+
+
+def _make_summary(title: str, desc: str, minimum: int = 60, limit: int = 100) -> str:
+    """生成平台摘要（掘金要求 ≥50 字、≤100 字）。标题+正文拼接，不足用中性句补足。"""
+    import re as _re
+    base = _re.sub(r"\s+", " ", f"{title}：{desc}").strip()
+    pad = " 本文记录相关实践与经验总结，供参考交流。"
+    text = base
+    while len(text) < minimum:
+        text += pad
+    return text[:limit]
+
+
+def _env_file_value(key: str, env_file: Path | None = None) -> str:
+    """读项目根 .env 里的单个键（standalone CLI 直跑时不经 web 服务进程，
+    环境变量之外再查设置页持久化下来的配置）。读不到/没有该键返回 ''。"""
+    path = env_file or (Path(__file__).resolve().parents[3] / ".env")
+    try:
+        result = ""
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and "=" in s:
+                k, _, v = s.partition("=")
+                if k.strip() == key:
+                    result = v.strip().strip("\"'")
+        return result
+    except (OSError, UnicodeError):
+        pass
+    return ""
+
+
+def _publish_receipt(platform: str, url: str, status: int, payload: object) -> dict | None:
+    """Accept only the matching platform's submission response, never a URL or toast."""
+    from urllib.parse import urlsplit
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if platform == "juejin":
+        matches = parsed.scheme == "https" and parsed.hostname == "api.juejin.cn" and parsed.path == "/content_api/v1/article/publish"
+    elif platform == "twitter-x":
+        matches = (parsed.scheme == "https" and parsed.hostname in {"x.com", "api.x.com", "twitter.com", "api.twitter.com"}
+                   and "/graphql/" in parsed.path and parsed.path.endswith("/CreateTweet"))
+    else:
+        return None
+    if not matches:
+        return None
+    if not 200 <= status < 300 or not isinstance(payload, dict):
+        return {"outcome": "unknown"}
+    if platform == "juejin":
+        if type(payload.get("err_no")) is int and payload["err_no"] != 0:
+            return {"outcome": "rejected"}
+        if type(payload.get("err_no")) is not int or payload["err_no"] != 0:
+            return {"outcome": "unknown"}
+        data = payload.get("data")
+        identifier = data.get("article_id") if isinstance(data, dict) else None
+    else:
+        if payload.get("errors"):
+            return {"outcome": "rejected"}
+        try:
+            identifier = payload["data"]["create_tweet"]["tweet_results"]["result"]["rest_id"]
+        except (KeyError, TypeError):
+            identifier = None
+    if (type(identifier) not in (str, int) or len(str(identifier)) > 32
+            or not re.fullmatch(r"[0-9]+", str(identifier)) or int(identifier) <= 0):
+        return {"outcome": "unknown"}
+    link = f"https://juejin.cn/post/{identifier}" if platform == "juejin" else f"https://x.com/i/status/{identifier}"
+    return {"outcome": "accepted", "id": str(identifier), "url": link}
+
+
+def _observe_publish_receipt(page, platform: str) -> dict:
+    state = {"submitted": False, "outcome": "unknown"}
+    def receive(response):
+        if not state["submitted"] or state["outcome"] == "accepted":
+            return
+        try:
+            if response.request.method != "POST":
+                return
+            result = _publish_receipt(platform, response.url, response.status, response.json())
+            if result is not None:
+                state.update(result)
+        except Exception:
+            pass  # A missing/unreadable receipt leaves the outcome unknown.
+    page.on("response", receive)
+    return state
+
+
+# headless 校验国际站时的 UA 伪装：headless Chromium 默认 UA 含 "HeadlessChrome"，
+# Google/X 风控看到同一会话被 HeadlessChrome 客户端使用会**服务端直接作废会话**
+# （实测：X 窗口登录成功 → headless whoami 跑一次 → 会话 cookie 被清空 → 账号页翻未登录）。
+# 伪装成同版本正常 Chrome UA 即可避免。版本号跟随 playwright 内核，升级时同步改。
+_HEADLESS_SAFE_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
+
+
+def _launch_kwargs(cfg: dict, platform: str = "", headless: bool = False) -> dict:
+    """launch_persistent_context 的 kwargs（args + 可选 proxy + headless UA 伪装）。
+
+    国内平台维持原状：args 追加 --no-proxy-server，Chromium 级屏蔽系统/环境代理（开 VPN 也直连）。
+    needs_proxy 的国际站（如 X）相反：
+    - 按优先级取显式代理：EASEL_PROXY → 平台专属变量（如 TWITTER_X_PROXY）
+      → .env 里持久化的 EASEL_PROXY（设置页「网络代理」）→ https_proxy/HTTPS_PROXY
+      → all_proxy/ALL_PROXY，传给 Playwright proxy 参数；
+    - 都没配 → **不加** --no-proxy-server，让 Chromium 回退系统代理（TUN/系统级 VPN 用户）；
+    - headless 运行时伪装 UA（_HEADLESS_SAFE_UA）——防 Google/X 风控因 HeadlessChrome UA 踢会话。
+    """
+    kwargs: dict = {"args": list(LAUNCH_ARGS)}
+    if cfg.get("needs_proxy"):
+        slug = platform.upper().replace("-", "_")
+        proxy = (os.environ.get("EASEL_PROXY") or (os.environ.get(f"{slug}_PROXY") if slug else "")
+                 or (_env_file_value("EASEL_PROXY") if "EASEL_PROXY" not in os.environ else "")
+                 or os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+                 or os.environ.get("all_proxy") or os.environ.get("ALL_PROXY") or "").strip()
+        if proxy:
+            kwargs["proxy"] = {"server": proxy}
+        if headless:
+            kwargs["user_agent"] = _HEADLESS_SAFE_UA
+    else:
+        kwargs["args"] = kwargs["args"] + ["--no-proxy-server"]
+    return kwargs
+
+
+def _block_heavy(context, platform: str, login_assets: bool = True) -> None:
+    if platform != "weixin-channels":
+        return
+
+    def handle_route(route, request):
+        if request.resource_type in {"media", "font"}:
+            route.abort()
+        else:
+            route.fallback()
+
+    if login_assets:
+        login_transport.install(context, platform)
+    context.route("**/*", handle_route)
+
+
+def _die(msg: str, code: int = 1) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _resolve_steps(platform: str, ctx: dict, steps_key: str = "steps") -> list[dict]:
+    cfg = PLATFORMS.get(platform)
+    if not cfg:
+        _die(f"未知平台：{platform}（支持：{', '.join(PLATFORMS)}）")
+    src = cfg.get(steps_key) or cfg["steps"]
+    steps = []
+    for st in src:
+        s = dict(st)
+        if "value" in s and isinstance(s["value"], str):
+            for k, v in ctx.items():
+                s["value"] = s["value"].replace("{" + k + "}", str(v))
+        if s["action"] not in _ACTIONS:
+            _die(f"配置错误：未知 action {s['action']}")
+        steps.append(s)
+    return steps
+
+
+def _steps_key_for(cfg: dict, media: str | None) -> str:
+    """按媒体类型选步骤集：图片且平台有图文流程 → steps_image；否则默认 steps。"""
+    ext = Path(media).suffix.lower() if media else ""
+    if ext and ext not in VIDEO_EXTS and cfg.get("steps_image"):
+        return "steps_image"
+    return "steps"
+
+
+def _profile_dir(platform: str, base: str | None) -> Path:
+    root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
+    return root / PLATFORMS[platform]["profile"]
+
+
+def cmd_platforms(_a) -> int:
+    print(f"支持 {len(PLATFORMS)} 个网页发布平台：\n")
+    for k, c in PLATFORMS.items():
+        print(f"  {k:18s} {c['name']}  → 发布页 {c['publish_url']}")
+    print("\n真实发布需 playwright + 浏览器内核 + 已登录（见 check / login）。")
+    return 0
+
+
+def cmd_plan(a) -> int:
+    ctx = {"media": a.media or "<media>", "title": a.title or "<title>",
+           "desc": a.desc or "<desc>", "tags": a.tags or "", "cover": a.cover or ""}
+    steps = _resolve_steps(a.platform, ctx, _steps_key_for(PLATFORMS.get(a.platform, {}), a.media))
+    cfg = PLATFORMS[a.platform]
+    print(f"平台：{cfg['name']}（{a.platform}）")
+    print(f"登录页：{cfg['login_url']}")
+    print(f"⚠️ 选择器提示：{cfg['selector_caveat']}\n")
+    print("发布步骤（dry-run）：")
+    for i, s in enumerate(steps, 1):
+        detail = s.get("selector", "")
+        val = s.get("value", "")
+        print(f"  {i}. {s['action']:8s} {detail}  {('= ' + val) if val else ''}")
+    return 0
+
+
+def cmd_check(_a) -> int:
+    ok = True
+    try:
+        import playwright  # noqa
+        from playwright.sync_api import sync_playwright  # noqa
+        print("✅ playwright 已安装")
+    except Exception as e:
+        print(f"❌ playwright 未安装：{e}（pip install playwright）"); ok = False
+    # 浏览器内核
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            path = p.chromium.executable_path
+            if path and Path(path).exists():
+                print(f"✅ chromium 内核：{path}")
+            else:
+                print("❌ 未安装浏览器内核（playwright install chromium）"); ok = False
+    except Exception as e:
+        print(f"❌ 无法检查内核：{e}（playwright install chromium）"); ok = False
+    print("登录态目录：~/.easel-browser-profiles/<平台>Profile")
+    return 0 if ok else 3
+
+
+def _split_sels(sel: str) -> list[str]:
+    """逗号分隔的多候选选择器 → 列表（去空）。修掉旧代码 sel.split(',')[0] 丢兜底的坑。"""
+    return [s.strip() for s in (sel or "").split(",") if s.strip()]
+
+
+def _first_visible_el(page, sel: str):
+    """多候选里挑第一个可见元素；都不可见则退回第一个存在的。"""
+    for want_visible in (True, False):
+        for s in _split_sels(sel):
+            try:
+                el = page.query_selector(s)
+                if el and (el.is_visible() if want_visible else True):
+                    return el
+            except Exception:
+                pass
+    return None
+
+
+def _fill_first_visible(page, sel: str, val: str) -> None:
+    """填写多候选目标，自动兼容 contenteditable（富文本用键入，input/textarea 用 fill）。"""
+    el = _first_visible_el(page, sel)
+    if el is None:
+        raise RuntimeError(f"填写目标未找到：{sel}")
+    editable = False
+    try:
+        editable = bool(el.evaluate("e => e.isContentEditable"))
+    except Exception:
+        pass
+    if editable:
+        el.click()
+        page.keyboard.type(val)
+    else:
+        el.fill(val)
+
+
+def _publish_weixin_channels(page, ctx: dict) -> None:
+    """视频号发布专用流程（与通用 steps 不同，真机 2026-08 校准）：
+    - 直接 goto /platform/post/create 会被重定向回首页 → 必须 SPA 导航（首页→内容管理→发表视频）。
+    - 创作器在同源 iframe /micro/content/post/create：描述框 div.input-editor、发表按钮
+      button.weui-desktop-btn_primary 都在该 frame 内，主页面选择器够不到。"""
+    media = ctx.get("media")
+    if not media:
+        raise RuntimeError("视频号发布需要视频文件（--media）")
+    cfg = PLATFORMS["weixin-channels"]
+    # 1) 进创作页：goto 列表页（会回跳首页但 SPA 会渲染「发表视频」入口）→ 点它进 create
+    page.goto("https://channels.weixin.qq.com/platform/post/list", wait_until="domcontentloaded")
+    _settle_login(page, cfg)
+    if not _is_logged_in(page, cfg):
+        raise RuntimeError("视频号未登录，请先在账号页扫码登录")
+    page.wait_for_timeout(3000)
+    page.wait_for_selector("text=发表视频", timeout=15000)
+    # 点第一个「可见」的发表视频（避开同名但不可见的帮助文字 <p>，那会导致点击超时）
+    loc = page.locator("text=发表视频")
+    clicked = False
+    for i in range(min(loc.count(), 8)):
+        try:
+            el = loc.nth(i)
+            if el.is_visible():
+                el.click()
+                clicked = True
+                break
+        except Exception:
+            pass
+    if not clicked:
+        raise RuntimeError("找不到可点的『发表视频』按钮")
+    page.wait_for_url("**/post/create", timeout=15000)
+    # 2) 上传视频：先等上传 input 就绪再塞（否则塞到未就绪的 input，转码不触发 → 创作器不出现）
+    print("  视频号：上传视频…", file=sys.stderr)
+    page.wait_for_timeout(5000)
+    page.wait_for_selector("input[type=file]", state="attached", timeout=30000)
+    page.set_input_files("input[type=file]", media, timeout=30000)
+    # 3-5) 等创作器就绪并发表。真机踩坑：转码完成时 composer iframe（/micro/content/post/create，
+    #      嵌套在另一 iframe 内 → frame_locator 的 iframe[src] 解析不到）会重载，持有的 frame 句柄立即失效
+    #      （evaluate 刚确认元素存在、下一步 locator 就报找不到）。故每轮从 page.frames 重取最新 frame，
+    #      同一轮内立即填描述+发表；若中途 frame 重载报错，等一下换新 frame 重试。填描述先 Ctrl+A 清空保证幂等。
+    print("  视频号：等转码 + 创作表单…", file=sys.stderr)
+    desc = "\n".join(x for x in (ctx.get("title"), ctx.get("desc"), ctx.get("tags")) if x)
+    deadline = time.time() + 300
+    published = False
+    last_err = None
+    while time.time() < deadline and not published:
+        fr = next((f for f in page.frames if "micro/content/post/create" in (f.url or "")), None)
+        if fr is None:
+            page.wait_for_timeout(3000)
+            continue
+        try:
+            ready = fr.evaluate("() => !!document.querySelector('div.input-editor') && "
+                                "[...document.querySelectorAll('button')].some(b => (b.innerText||'').trim() === '发表')")
+        except Exception:
+            page.wait_for_timeout(3000)   # frame 正在重载
+            continue
+        if not ready:
+            page.wait_for_timeout(3000)
+            continue
+        try:
+            if desc:
+                fr.evaluate("""(t) => {
+                    const ed = document.querySelector('div.input-editor');
+                    if (ed) {
+                        ed.focus();
+                        document.execCommand('selectAll', false, null);
+                        document.execCommand('insertText', false, t);
+                    }
+                }""", desc)
+                page.wait_for_timeout(1200)
+            # 真机 2026-08 验证的可靠提交法：该 composer 是 OOPIF——Playwright locator 解析不到、
+            # evaluate 合成点击不被视频号信任（校验 isTrusted）。故 evaluate 聚焦发表按钮 →
+            # page.keyboard 按 Enter（CDP 系统级注入的可信键盘事件，路由到聚焦元素触发真实提交）。
+            # 成功标志：约 6s 后 URL 从 /post/create 跳到 /post/list。切勿在 Enter 后再点其它「确认」按钮（会打断提交）。
+            print("  视频号：聚焦发表并按 Enter…", file=sys.stderr)
+            status = fr.evaluate("""() => {
+                const b = [...document.querySelectorAll('button')].find(x => (x.innerText||'').trim() === '发表');
+                if (!b) return 'no-btn';
+                if (b.disabled || b.getAttribute('disabled') !== null) return 'disabled';
+                b.scrollIntoView({block: 'center'});
+                b.focus();
+                return document.activeElement === b ? 'focused' : 'not-focused';
+            }""")
+            print(f"  视频号：发表按钮状态={status}", file=sys.stderr)
+            if status == 'disabled':
+                last_err = "发表按钮 disabled（视频可能还在处理）"
+                page.wait_for_timeout(5000)
+                continue
+            if status == 'no-btn':
+                last_err = "未找到发表按钮"
+                page.wait_for_timeout(3000)
+                continue
+            page.keyboard.press("Enter")   # 可信提交
+            # 等 URL 离开创作页 = 提交成功（真机 ~6s 跳 /post/list）
+            for _ in range(12):
+                page.wait_for_timeout(2000)
+                if "post/create" not in (page.url or "").lower():
+                    published = True
+                    break
+            if not published:
+                last_err = "发表后未跳转（可能未提交），换新 frame 重试"
+        except Exception as e:
+            last_err = e
+            page.wait_for_timeout(3000)   # 多半是 frame 刚重载，换新 frame 重试
+    if not published:
+        raise RuntimeError(f"视频号发表未成功（创作器反复重载或选择器失效）：{last_err}")
+    page.wait_for_timeout(3000)
+
+
+# ── 发布读回对账（platform_readback）──────────────────────────────────
+# 配 readback 的平台：发布后回创作者后台读本人作品列表对账（标题+时间窗）——
+# 平台侧证据才是权威成功判定，界面判定（URL/toast）只作旁证。
+# 新增平台：实现 platform_readback 的 capture_<平台>_snapshot / verify_<平台>_publish 后在此登记。
+_READBACK_VERIFIERS: dict[str, tuple[str, str]] = {
+    "kuaishou": ("capture_kuaishou_snapshot", "verify_kuaishou_publish"),
+}
+
+_READBACK_FAIL_HINTS = {
+    "unverified": "读回未核实（多轮读作品列表未见本次作品，可能索引延迟/审核队列）——先别重发，"
+                  "到创作者中心确认是否已发出",
+    "login_required": "读回时登录态已失效——发布结果未知，请重新登录后到创作者中心核对（先别重发）",
+    "readback_error": "读回通道失败——发布结果未确认，请到创作者中心人工核对（先别重发）",
+}
+
+
+def _readback_fn(platform: str, which: int):  # noqa: ANN001
+    """取平台读回函数：which=0 发前快照 / 1 发布后核验；未登记返回 None。"""
+    entry = _READBACK_VERIFIERS.get(platform)
+    if not entry:
+        return None
+    return getattr(platform_readback, entry[which], None)
+
+
+def _readback_capture(platform: str, page) -> set[str]:  # noqa: ANN001
+    """发前快照：读当前作品 id 集（读回时排除旧作品）。失败返回空集（退化为标题+时间窗）。"""
+    fn = _readback_fn(platform, 0)
+    if fn is None:
+        return set()
+    try:
+        return set(fn(page) or set())
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 发前快照失败（读回将只用标题+时间窗）：{e}", file=sys.stderr)
+        return set()
+
+
+def _readback_verify(platform: str, page, *, title: str, since_ms: int | None,  # noqa: ANN001
+                     snapshot_ids: set[str] | None):
+    """发布后读回核验（权威判定）。返回 platform_readback.ReadbackResult；不抛异常。"""
+    fn = _readback_fn(platform, 1)
+    if fn is None:
+        return platform_readback.ReadbackResult(
+            outcome="readback_error", error=f"{platform} 未登记读回核验函数")
+    try:
+        return fn(page, title=title, since_ms=since_ms, limit=20,
+                  attempts=3, delay_s=10, snapshot_ids=snapshot_ids)
+    except Exception as e:  # noqa: BLE001
+        return platform_readback.ReadbackResult(outcome="readback_error", error=str(e))
+
+
+def _readback_evidence_summary(verdict) -> str:  # noqa: ANN001
+    ev = getattr(verdict, "evidence", None) or {}
+    parts = []
+    if ev.get("attempts"):
+        parts.append(f"轮数 {ev.get('attempts')}")
+    if ev.get("count") is not None:
+        parts.append(f"最近列表 {ev.get('count')} 条")
+    return f"（读回证据：{'，'.join(parts)}）" if parts else ""
+
+
+def _run_browser(a, headed: bool, do_publish: bool) -> int:
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except Exception as e:
+        _die(f"需要 playwright：{e}（pip install playwright && playwright install chromium）", 3)
+    profile = _profile_dir(a.platform, a.profile_base)
+    profile.mkdir(parents=True, exist_ok=True)
+    cfg = PLATFORMS[a.platform]
+    ctx = {"media": a.media or "", "title": a.title or "", "desc": a.desc or "",
+           "tags": a.tags or "", "cover": a.cover or "",
+           # summary：摘要占位符（掘金要求 ≥50 字），标题+正文拼够长度
+           "summary": _make_summary(a.title or "", a.desc or "")}
+    with sync_playwright() as p:
+        browser = p.chromium.launch_persistent_context(
+            str(profile), headless=not headed,
+            viewport={"width": 1440, "height": 900}, **_launch_kwargs(cfg, a.platform, headless=not headed))
+        page = browser.pages[0] if browser.pages else browser.new_page()
+        receipt = _observe_publish_receipt(page, a.platform) if a.platform in {"juejin", "twitter-x"} else None
+        # 收集页面 console 错误：平台把「账号受限/风控」这类拒绝只打在控制台、UI 不给提示
+        # （掘金实测："抱歉，您的账户目前受到限制，暂时无法发布文章"）。失败时据此给出真实原因。
+        console_errors: list[str] = []
+        page.on("console", lambda m: console_errors.append(m.text[:200])
+                if m.type == "error" else None)
+        page.on("pageerror", lambda e: console_errors.append(str(e)[:200]))
+        if not do_publish:
+            page.goto(cfg["login_url"])
+            print(f"已打开 {cfg['name']} 登录页，请在浏览器完成登录（扫码等），登录态保存在 {profile}。",
+                  file=sys.stderr)
+            print("登录完成后按 Enter 关闭 ...", file=sys.stderr)
+            try:
+                input()
+            except EOFError:
+                pass
+            browser.close()
+            return 0
+        # publish：按媒体类型选步骤——图片且平台有图文流程走 steps_image，否则默认 steps
+        steps = _resolve_steps(a.platform, ctx, _steps_key_for(cfg, a.media))
+        # 发布前登录预检：未登录时发布页会被重定向到落地页，后续 upload 找不到 input 会晦涩超时——提前明确报错
+        try:
+            page.goto(cfg["publish_url"], wait_until="domcontentloaded")
+        except Exception:
+            pass
+        # 快手等 SPA 发布页外壳（login_check 选择器）渲染偏慢，实测 5–10s+- 不等；
+        # 单次 _settle_login(7s) 输给渲染会误判未登录（strict 模式下选择器不命中即未登录）→
+        # 重复 settle + 判定数轮，给慢渲染的登录外壳足够时间，绝不因竞态把有效会话判成未登录。
+        #
+        # 再叠一层权威判定：有账号接口的平台（知乎 /api/v4/me、掘金 user/get、视频号 auth_data）
+        # 直接问后端「我是谁」。编辑器/发布页的 DOM 外壳常常没有登录后标志元素（掘金编辑器页实测
+        # 无 .avatar/.user-info），只靠 DOM 会把有效会话判成未登录 → 误报「未登录」挡住发布。
+        logged = _authenticated_account(browser, cfg) is not None
+        for _i in range(0 if logged else 4):
+            try:
+                _settle_login(page, cfg)  # 等客户端跳转/登录外壳渲染落定
+            except Exception:
+                pass
+            if _is_logged_in(page, cfg) or _authenticated_account(browser, cfg) is not None:
+                logged = True
+                break
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                break
+        if not logged:
+            _die(f"{cfg['name']}未登录：发布页被重定向到登录/落地页。请先在账号页扫码登录后重试。", 6)
+        # 外壳已登录但发布子系统鉴权可能已失效（快手 onvideo token 短命）→ 提前明确报错，
+        # 避免后续 upload 因发布态失效而晦涩超时。仅明确失效才拦，瞬时错误放行。
+        if cfg.get("login_probe") and _probe_publish_auth(page, cfg) == "expired":
+            _die(f"{cfg['name']}登录态已失效（发布子系统未授权）：外壳虽显示已登录，但发布上传鉴权已过期。请在账号页重新扫码登录后重试。", 6)
+        # 读回平台：发前快照（读回时排除旧作品的硬证据；失败不影响发布）
+        snapshot_ids: set[str] = set()
+        if cfg.get("readback"):
+            snapshot_ids = _readback_capture(a.platform, page)
+        submitted_at_ms: int | None = None   # 「提交动作」时间戳（commit 标记步记录，读回时间窗基准）
+        flow_started_ms = int(time.time() * 1000)
+        try:
+            if a.platform == "weixin-channels":
+                # 视频号走专用流程（SPA 导航 + iframe 创作器），通用 steps 不适用 → 跳过
+                _publish_weixin_channels(page, ctx)
+                steps = []
+            for i, s in enumerate(steps, 1):
+                act = s["action"]
+                sel = s.get("selector", "")
+                val = s.get("value", "")
+                opt = s.get("optional", False)  # 可选步骤失败不中断（如清理旧草稿弹窗）
+                # 可选媒体：无媒体时跳过上传步与标记 needs_media 的等待步（如 X 的纯文字推文）
+                if not ctx["media"] and (act in ("upload", "filechooser_upload") or s.get("needs_media")):
+                    print(f"  步骤 {i}/{len(steps)}: {act}（无媒体，跳过）", file=sys.stderr)
+                    continue
+                print(f"  步骤 {i}/{len(steps)}: {act} {sel}", file=sys.stderr)
+                if s.get("commit") and submitted_at_ms is None:
+                    submitted_at_ms = int(time.time() * 1000)
+                    print("  ⏱ 提交步（读回时间窗基准已记录）", file=sys.stderr)
+                    # 单次提交契约 × 人类节奏：提交前「复核 + 反应」双停顿（human_pace）
+                    human_pace.pause_before_commit(
+                        len(str(ctx.get("title") or "")) + len(str(ctx.get("desc") or "")))
+                    if receipt is not None:
+                        receipt["submitted"] = True
+                try:
+                    if act == "goto":
+                        # 用 domcontentloaded 而非默认的 load：重 SPA（如掘金编辑器、Studio 类后台）
+                        # 有持续长连接/资源请求，load 事件长期不到 → goto 超时但其实页面已可用
+                        # （实测 Studio 超时那刻搜索框已渲染）。步骤内自带的 waitfor/wait 负责等就绪。
+                        page.goto(val, wait_until="domcontentloaded", timeout=60000)
+                    elif act == "upload":
+                        page.set_input_files(sel, val)
+                    elif act == "filechooser_upload":
+                        # 点上传按钮拦截文件选择器再塞文件（快手图文的图片 input 直接 set 不触发上传）
+                        with page.expect_file_chooser(timeout=15000) as fc:
+                            el = _first_visible_el(page, sel)
+                            if el is None:
+                                raise RuntimeError(f"上传按钮未找到：{sel}")
+                            el.click()
+                        fc.value.set_files(val)
+                    elif act == "fill":
+                        _fill_first_visible(page, sel, val)
+                    elif act == "type":
+                        # 富文本编辑器（如知乎 Draft.js）：page.fill 不生效，须点聚焦后真实键入
+                        # 长文用剪贴板粘贴，避免逐字 type 超时
+                        el = _first_visible_el(page, sel)
+                        if el:
+                            el.click()
+                            try:
+                                page.evaluate("""(text) => {
+                                    const dt = new DataTransfer();
+                                    dt.setData('text/plain', text);
+                                    document.activeElement.dispatchEvent(
+                                        new ClipboardEvent('paste', {clipboardData: dt, bubbles: true})
+                                    );
+                                }""", val)
+                                page.wait_for_timeout(1000)
+                                # 验证内容是否注入成功（Draft.js 可能拒绝）
+                                inner = el.inner_text()
+                                if not inner or len(inner.strip()) < 10:
+                                    raise RuntimeError("clipboard inject failed")
+                            except Exception:
+                                # 降级：键盘逐字输入（慢但兼容）
+                                page.keyboard.type(val)
+                    elif act == "js_click":
+                        # JS dispatchEvent 点击（快手等框架按钮 Playwright click() 无效）
+                        el = _first_visible_el(page, sel)
+                        if el is None:
+                            raise RuntimeError(f"点击目标未找到：{sel}")
+                        try:
+                            el_info = page.evaluate("el => ({tag:el.tagName,cls:el.className,txt:(el.innerText||'').trim().slice(0,30)})", el)
+                            print(f"  [js_click debug] 找到元素: {el_info}")
+                        except Exception:
+                            pass
+                        try:
+                            el.scroll_into_view_if_needed()
+                        except Exception:
+                            pass
+                        # 先尝试 Playwright 原生 force click（React/Vue 合成事件能感知）
+                        try:
+                            el.click(force=True, timeout=5000)
+                        except Exception:
+                            if receipt is not None and s.get("commit"):
+                                _die("提交结果未知，请到平台后台核对，先别重发。", 5)
+                            # 回退：完整指针事件链（pointerdown→mousedown→mouseup→click）
+                            page.evaluate("""
+                                el => {
+                                    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
+                                        el.dispatchEvent(new MouseEvent(type, {bubbles:true,cancelable:true,view:window}));
+                                    });
+                                }
+                            """, el)
+                    elif act == "screenshot":
+                        # 截图到指定路径（相对工作目录）
+                        import pathlib as _pl
+                        _cwd = _pl.Path.cwd()
+                        _sp = _cwd / val if val else _cwd / "outputs/_login/debug-screenshot.png"
+                        _sp.parent.mkdir(parents=True, exist_ok=True)
+                        page.screenshot(path=str(_sp))
+                    elif act == "js_eval":
+                        # 直接执行 JS 代码（用于快手等框架按钮，CSS选择器/has-text 匹配不稳定）
+                        page.evaluate(val)
+                    elif act == "click":
+                        # 多候选（快手『发布作品』是 div.publish-button 非 <button>）+ 滚动到可点
+                        el = _first_visible_el(page, sel)
+                        if el is None:
+                            raise RuntimeError(f"点击目标未找到：{sel}")
+                        try:
+                            el.scroll_into_view_if_needed()
+                        except Exception:
+                            pass
+                        try:
+                            el.click()
+                        except Exception:
+                            if receipt is not None and s.get("commit"):
+                                _die("提交结果未知，请到平台后台核对，先别重发。", 5)
+                            raise
+                    elif act == "wait":
+                        page.wait_for_timeout(int(val or 1000))
+                    elif act == "press":
+                        page.keyboard.press(val)
+                    elif act == "waitfor":
+                        # att=True → 只等元素挂到 DOM（state="attached"），不等可见。
+                        # 文件上传 input 几乎都是 aria-hidden 的隐藏元素，等 visible 必超时
+                        # （实测：文件上传 input 普遍 aria-hidden）。
+                        state = "attached" if s.get("att") else "visible"
+                        page.wait_for_selector(sel, timeout=int(val or 30000), state=state)  # 逗号=CSS group
+                except Exception as e:
+                    if opt:
+                        print(f"    (可选步骤跳过：{e})", file=sys.stderr)
+                        continue
+                    raise
+            # 发布结果校验（界面层，旁证）：配置了 publish_success 才验；未配的平台沿用"跑完即报"
+            chk = cfg.get("publish_success")
+            ui_ok = False
+            if chk and receipt is None:
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    url = (page.url or "").lower()
+                    uc, unc = chk.get("url_contains"), chk.get("url_not_contains")
+                    gone = chk.get("gone_selector")
+                    # gone_selector：成功后该元素（如发布弹窗）必须消失。服务端拒绝时弹窗不会关，
+                    # 只靠 URL 会假报成功（掘金「账户目前受到限制」实测就是这样被漏掉的）。
+                    if gone and page.query_selector(gone):
+                        page.wait_for_timeout(500)
+                        continue
+                    if uc or unc:  # 支持纯 url_not_contains（发布成功后离开发布页）
+                        if (uc in url if uc else True) and (unc not in url if unc else True):
+                            ui_ok = True
+                            break
+                    if chk.get("selector") and page.query_selector(chk["selector"]):
+                        ui_ok = True
+                        break
+                    page.wait_for_timeout(500)
+            # 读回对账（权威判定）：回到作品管理页读本人作品列表，标题+时间窗对上才算成功。
+            # 界面判定只作旁证；四档结算（verified 才成功），未核实绝不冒报成功、不许盲目重发。
+            if receipt is not None:
+                deadline = time.monotonic() + 30
+                while receipt["outcome"] == "unknown" and time.monotonic() < deadline:
+                    page.wait_for_timeout(250)
+                if receipt["outcome"] == "rejected":
+                    _die(f"{cfg['name']}拒绝本次提交，请到平台后台查看原因。", 5)
+                if receipt["outcome"] != "accepted":
+                    _die(f"{cfg['name']}发布结果未核实，请到平台后台核对，先别重发。", 5)
+                print(f"✅ {cfg['name']}发布提交已确认（平台响应作品 {receipt['id']}）：{receipt['url']}")
+            elif cfg.get("readback") and a.platform in _READBACK_VERIFIERS:
+                verdict = _readback_verify(a.platform, page, title=ctx.get("title") or "",
+                                           since_ms=submitted_at_ms or flow_started_ms,
+                                           snapshot_ids=snapshot_ids)
+                if verdict.outcome != "verified":
+                    try:  # 失败留现场，供排错
+                        fp = Path(__file__).resolve().parents[3] / "outputs" / "_login" / f"{a.platform}-publish-fail.png"
+                        fp.parent.mkdir(parents=True, exist_ok=True)
+                        page.screenshot(path=str(fp))
+                    except Exception:
+                        pass
+                    _ui = "界面判定通过" if ui_ok else "界面判定未通过"
+                    _ev = _readback_evidence_summary(verdict)
+                    _die(f"{cfg['name']}：{_ui}；{_READBACK_FAIL_HINTS.get(verdict.outcome, '读回未通过——发布结果未确认')}"
+                         f"{_ev}（{verdict.error or ''}）",
+                         6 if verdict.outcome == "login_required" else 5)
+                m = verdict.matched
+                _acct = (verdict.evidence or {}).get("account") or {}
+                _who = f"；账号：{_acct.get('display_name')}" if _acct.get("display_name") else ""
+                print(f"✅ {cfg['name']}发布成功（读回核验：作品 {m.platform_content_id}，{m.status or 'published'}{_who}）")
+            elif chk:
+                if not ui_ok:
+                    try:  # 仅失败时截图，供排错（正常成功不截）
+                        fp = Path(__file__).resolve().parents[3] / "outputs" / "_login" / f"{a.platform}-publish-fail.png"
+                        fp.parent.mkdir(parents=True, exist_ok=True)
+                        page.screenshot(path=str(fp))
+                    except Exception:
+                        pass
+                    # 识别常见"账号级验证墙"（需短信/绑手机），给精准提示
+                    body_txt = ""
+                    try:
+                        body_txt = page.inner_text("body") or ""
+                    except Exception:
+                        pass
+                    if any(k in body_txt for k in ("设置手机号", "绑定手机号", "短信验证", "验证码登录")):
+                        _die(f"{cfg['name']}账号需先绑定手机号/短信验证才能发布，headless 无法完成——"
+                             f"请在普通浏览器给该账号绑定手机号后重试。", 4)
+                    # dump 点发布后出现的弹窗/可点按钮（供补二次确认步骤）
+                    try:
+                        dlg = page.evaluate("""() => {
+                            const out = [];
+                            const kws = ['确认','确定','发布','提交','继续','同意'];
+                            for (const el of document.querySelectorAll(
+                                    '[class*=dialog] button,[class*=dialog] [class*=btn],'
+                                    +'[class*=modal] button,[role=dialog] button,[class*=confirm] button,'
+                                    +'[class*=popup] button,[class*=publish-button]')) {
+                                if (el.offsetParent === null) continue;
+                                const t = (el.innerText||'').trim();
+                                if (!t || t.length > 10) continue;
+                                if (!kws.some(k => t.includes(k))) continue;
+                                out.push(el.tagName+' "'+t+'" class='+(el.className||'').toString().slice(0,45));
+                            }
+                            return [...new Set(out)].slice(0,15).join('\\n');
+                        }""")
+                        print("    点发布后出现的弹窗/按钮（供补二次确认选择器）：\n"
+                              + (dlg or "(无弹窗按钮——可能没触发发布或已直接提交)"), file=sys.stderr)
+                    except Exception:
+                        pass
+                    # 平台把真实拒绝原因打在 console（如掘金「账户目前受到限制」）→ 优先报它
+                    _blocked = next((e for e in console_errors
+                                     if any(k in e for k in ("限制", "受限", "风控", "封禁",
+                                                             "cannot publish", "restricted", "forbidden"))), "")
+                    if _blocked:
+                        _die(f"{cfg['name']}发布被平台拒绝：{_blocked}", 5)
+                    _die(f"发布未确认成功：步骤跑完但未跳到成功状态（当前 URL={page.url}）。"
+                         f"可能『发布』按钮未生效或有二次确认弹窗——需核对选择器。"
+                         + (f" 页面报错：{console_errors[-1]}" if console_errors else ""), 5)
+                print(f"✅ 发布成功（已确认跳转：{page.url}）")
+            else:
+                print("✅ 发布步骤执行完毕，请在浏览器/平台后台确认发布结果。")
+        except PWTimeout as e:
+            # 超时（常见：选择器失效 / 上传转码慢）——截图 + dump 当前可见输入控件，便于精修选择器
+            try:
+                fp = Path(__file__).resolve().parents[3] / "outputs" / "_login" / f"{a.platform}-publish-fail.png"
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(fp))
+                print(f"    失败截图：{fp}", file=sys.stderr)
+            except Exception:
+                pass
+            try:
+                dump = page.evaluate("""() => {
+                    const out = [];
+                    const q = 'textarea,[contenteditable=true],input[type=text],[placeholder],[data-placeholder]';
+                    for (const el of document.querySelectorAll(q)) {
+                        if (el.offsetParent === null) continue;
+                        const ph = el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '';
+                        out.push(el.tagName + ' class=' + (el.className||'').toString().slice(0,45) + ' ph=' + ph.slice(0,30));
+                    }
+                    return out.slice(0, 20).join('\\n');
+                }""")
+                print("    当前可见输入控件（供更新 SELECTORS）：\n" + (dump or "(无)"), file=sys.stderr)
+            except Exception:
+                pass
+            _die(f"步骤超时（选择器可能已失效，需更新）：{e}")
+        finally:
+            if not a.keep_open:
+                browser.close()
+    return 0
+
+
+def cmd_login(a) -> int:
+    return _run_browser(a, headed=True, do_publish=False)
+
+
+_LOGIN_MARKERS = ("login", "signin", "passport", "/account/")
+
+# 视频文件扩展名（视频流程平台的媒体类型校验用）
+VIDEO_EXTS = {".mp4", ".mov", ".flv", ".mkv", ".avi", ".webm", ".m4v", ".wmv", ".ts", ".mpeg", ".mpg"}
+
+# 登录轮询：间隔 1s（原 2s，成功检测延迟减半）；每 N 轮用辅助页深探一次
+_LOGIN_POLL_MS = 1000
+_LOGIN_PROBE_EVERY = 3
+
+
+def _navigate_login(page, destination: str, timeout_ms: int = 10000) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    try:
+        page.goto(destination, wait_until="commit", timeout=timeout_ms)
+    except PlaywrightTimeout:
+        current = (page.url or "").lower()
+        if (not current.startswith(("https://", "http://"))
+                or urlparse(current).hostname != urlparse(destination).hostname):
+            raise RuntimeError("登录页面连接超时，请检查服务器能否访问平台及扫码服务") from None
+
+
+def _account_identity(account: dict, base_url: str = "") -> dict:
+    name = account.get("name")
+    avatar = account.get("avatar_url")
+    name = name.strip().splitlines()[0][:40] if isinstance(name, str) and name.strip() else ""
+    avatar = avatar.strip() if isinstance(avatar, str) else ""
+    try:
+        if urlparse(avatar).scheme and not avatar.startswith(("https://", "http://")):
+            avatar = ""
+        avatar = urljoin(base_url, avatar) if avatar else ""
+        parsed = urlparse(avatar)
+        if parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.username or parsed.password:
+            avatar = ""
+    except ValueError:
+        avatar = ""
+    return {"name": name, "avatar": avatar}
+
+
+def _channels_account(payload) -> dict | None:
+    if not isinstance(payload, dict) or type(payload.get("errCode")) is not int or payload["errCode"] != 0:
+        return None
+    data = payload.get("data")
+    account = data.get("finderUser") if isinstance(data, dict) else None
+    if not isinstance(account, dict):
+        return None
+    identifier = account.get("finderUsername")
+    name = account.get("nickname")
+    if not isinstance(identifier, str) or not identifier.strip() or not isinstance(name, str) or not name.strip():
+        return None
+    return {"id": identifier, "name": name, "avatar_url": account.get("headImgUrl", "")}
+
+
+def _observe_channels_account(browser, cfg: dict) -> None:
+    if cfg.get("profile") != "ChannelsProfile":
+        return
+    browser._easel_channel_account = None
+
+    def observe(response):
+        parsed = urlparse(response.url)
+        if (parsed.scheme != "https" or parsed.hostname != "channels.weixin.qq.com"
+                or parsed.path != "/cgi-bin/mmfinderassistant-bin/auth/auth_data"):
+            return
+        try:
+            if 200 <= response.status < 300:
+                browser._easel_channel_account = _channels_account(response.json())
+        except Exception:
+            pass
+
+    browser.on("response", observe)
+
+
+def _authenticated_account(browser, cfg: dict) -> dict | None:
+    if cfg.get("profile") == "ChannelsProfile":
+        return getattr(browser, "_easel_channel_account", None)
+    if cfg.get("profile") == "JuejinProfile":
+        # 掘金用户接口：带登录 cookie 时 err_no==0 且 data 有 user_name/avatar_large；
+        # 未登录 err_no!=0。比 DOM 选择器可靠（实测 2026-10）。
+        try:
+            response = browser.request.get(
+                "https://api.juejin.cn/user_api/v1/user/get?aid=2608&uuid=0&spider=0",
+                timeout=3000)
+            if response.status != 200:
+                return None
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("err_no") != 0:
+                return None
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                return None
+            name = (data.get("user_name") or "").strip()
+            if not name:
+                return None
+            return {"id": str(data.get("user_id") or ""), "name": name,
+                    "avatar_url": data.get("avatar_large") or ""}
+        except Exception:
+            return None
+    if cfg.get("profile") != "ZhihuProfile":
+        return None
+    try:
+        response = browser.request.get("https://www.zhihu.com/api/v4/me", timeout=3000)
+        if response.status != 200:
+            return None
+        account = response.json()
+        if (isinstance(account, dict) and not account.get("error")
+                and isinstance(account.get("id"), str) and account["id"].strip()
+                and isinstance(account.get("name"), str) and account["name"].strip()):
+            return account
+    except Exception:
+        pass
+    return None
+
+
+def _login_qr_state(page, cfg: dict) -> str:
+    profile = cfg.get("profile")
+    if profile not in ("ZhihuProfile", "ChannelsProfile"):
+        return ""
+    try:
+        if profile == "ChannelsProfile":
+            frame = next((frame for frame in page.frames
+                          if urlparse(frame.url).hostname == "open.weixin.qq.com"
+                          and urlparse(frame.url).path == "/connect/qrconnect"), None)
+            if frame is None:
+                return ""
+            text = frame.inner_text("body", timeout=500)
+        else:
+            text = page.inner_text(".SignContainer, .SignFlow, .Login-content", timeout=500)
+    except Exception:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    if any(message in compact for message in (
+            "扫码成功", "扫描成功", "已扫码", "请在手机上确认", "请在知乎APP中确认",
+            "请在微信中确认", "请在手机微信上确认", "扫描成功请")):
+        return "scanned"
+    if any(message in compact for message in (
+            "二维码已失效", "二维码失效", "二维码已过期", "二维码过期", "二维码无效",
+            "请刷新二维码", "二维码已超时")):
+        return "expired"
+    return ""
+
+
+def _refresh_login_qr(page, qr_out: Path, cfg: dict) -> bool:
+    if _login_qr_state(page, cfg) != "expired":
+        return False
+    selectors = (".SignContainer button:has-text('刷新'), "
+                 ".SignContainer [role='button']:has-text('刷新'), "
+                 ".SignContainer span:has-text('刷新'), "
+                 ".SignFlow button:has-text('重新'), .SignFlow .Qrcode-mask")
+    for element in page.query_selector_all(selectors):
+        if element.is_visible():
+            element.click(timeout=2000)
+            page.wait_for_timeout(500)
+            if _login_qr_state(page, cfg) == "scanned":
+                return False
+            login_qr.capture_qr(page, qr_out, cfg["login_qr_selector"], attempts=1)
+            return True
+    return False
+
+
+def _is_logged_in(page, cfg: dict) -> bool:
+    """判断是否已登录，可靠性顺序：URL 落在登录页 → 登出浮层可见 → 强选择器命中 → URL 启发式兜底。
+    强选择器优先于 URL 启发式（快手实测：未登录会重定向到同域落地页，URL≠首页但其实未登录，
+    靠 URL 启发式会假阳性；配 login_strict 的平台不命中强选择器即判未登录）。"""
+    try:
+        url = (page.url or "").lower().rstrip("/")
+    except Exception:
+        url = ""
+    # 1. URL 明确在登录/验证页（视频号→login.html、知乎→signin，实测）
+    if any(m in url for m in _LOGIN_MARKERS):
+        return False
+    # 2. 登出浮层/二维码可见 → 未登录（快手停在发布页但弹登录浮层，实测）
+    out_sel = cfg.get("logged_out_selector")
+    if out_sel:
+        for s in (x.strip() for x in out_sel.split(",")):
+            try:
+                el = page.query_selector(s) if s else None
+                if el and el.is_visible():
+                    return False
+            except Exception:
+                pass
+    # 3. 强选择器（login_check）命中 → 已登录（最可靠，优先于 URL 启发式）
+    #    必须「可见」才算：快手等 SPA 登出后重定向到同域营销落地页，复用同一份前端 bundle，
+    #    创作者中心的 .user-line/.vertical-menu 等外壳节点可能仍存在于 DOM 但被隐藏 →
+    #    只用 query_selector（存在性）会假阳性判「已登录」。与上面 logged_out 的 is_visible 判定保持一致。
+    sel = cfg.get("login_check")
+    if sel:
+        for s in (x.strip() for x in sel.split(",")):
+            try:
+                el = page.query_selector(s) if s else None
+                if el and el.is_visible():
+                    return True
+            except Exception:
+                pass
+        # 配了 login_check 却都不命中：严格平台（快手：同域落地页 URL 区分不了）直接判未登录
+        if cfg.get("login_strict"):
+            return False
+    # 4. URL 启发式兜底（非严格平台）：已离开登录入口页且无登录标记 → 已登录
+    login_url = cfg["login_url"].lower().rstrip("/")
+    if url.startswith(("https://", "http://")) and url != login_url:
+        return True
+    return False
+
+
+# 发布子系统鉴权探针的「明确未登录」文案（外壳判定之外的第二道校验，见各平台 cfg["login_probe"]）
+_PROBE_LOGOUT_HINTS = ("未登录", "登录态", "请登录", "重新登录", "not login", "not logged", "unauthorized", "登录已过期")
+# 快手 REST 常见「登录态失效」result 码（外壳 token 活着但发布 token 已死时该模块会返回它们）
+_PROBE_LOGOUT_RESULTS = {109, 100110000}
+
+
+def _probe_publish_auth(page, cfg: dict) -> str:
+    """探发布/上传子系统自己的鉴权，返回 'ok' | 'expired' | 'unknown'。
+    背景：某些平台（快手）创作者中心「外壳」token 比「发布上传」token 活得久，
+    外壳 DOM 判定会在发布态早已失效后仍报已登录。故在外壳判定为已登录后，用页面上下文
+    （带 cookie、同源）再打一次发布模块自己的接口。
+    fail-safe：只有明确失效信号（跳登录页 / 401·403 / 未登录 result·文案）才返回 'expired'；
+    瞬时错误、网络失败、未知 result 一律 'unknown'，让调用方保留外壳判定，绝不把有效会话翻成未登录。"""
+    probe = cfg.get("login_probe")
+    if not probe:
+        return "unknown"
+    try:
+        r = page.evaluate(
+            """async ({u,m}) => {
+                try {
+                  const controller = new AbortController();
+                  const timer = setTimeout(() => controller.abort(), 3000);
+                  try {
+                  const resp = await fetch(u, {method:m||'GET', credentials:'include', signal:controller.signal,
+                                               headers:{'accept':'application/json'}});
+                  const t = await resp.text();
+                  return {status: resp.status, redirected: resp.redirected, finalUrl: resp.url, body: (t||'').slice(0,600)};
+                  } finally { clearTimeout(timer); }
+                } catch(e) { return {error: String(e)}; }
+            }""",
+            {"u": probe["url"], "m": probe.get("method", "GET")},
+        )
+    except Exception:
+        return "unknown"
+    if not isinstance(r, dict) or r.get("error"):
+        return "unknown"
+    final = (r.get("finalUrl") or "").lower()
+    if r.get("redirected") and any(m in final for m in _LOGIN_MARKERS):
+        return "expired"
+    if r.get("status") in (401, 403):
+        return "expired"
+    body = r.get("body") or ""
+    ok_results = probe.get("ok_result") or []
+    try:
+        d = json.loads(body)
+    except Exception:
+        d = None
+    if isinstance(d, dict):
+        res = d.get("result", d.get("code"))
+        if res in ok_results:
+            return "ok"
+        if res in _PROBE_LOGOUT_RESULTS:
+            return "expired"
+        msg = str(d.get("message") or d.get("msg") or "")
+        if any(h in msg.lower() if h.isascii() else h in msg for h in _PROBE_LOGOUT_HINTS):
+            return "expired"
+        return "unknown"  # 未知 result（如快手 500002「请稍后重试」瞬时）→ 不翻转
+    if any((h in body.lower() if h.isascii() else h in body) for h in _PROBE_LOGOUT_HINTS):
+        return "expired"
+    return "unknown"
+
+
+def _settle_login(page, cfg: dict, max_ms: int = 7000) -> None:
+    """判登录态前先等客户端跳转/渲染尘埃落定，再交给 _is_logged_in。
+    视频号等 SPA：死会话打开发布页后 URL 要 3-4s 才客户端跳回 login.html，
+    过早判定会命中 _is_logged_in 的 URL 启发式（URL≠入口且无 login 标记）→ 误报已登录。
+    轮询到任一明确信号即停：URL 出现登录标记（未登录）/ login_check 命中（已登录）/ 超时。
+    负向信号（跳回 login.html）可靠，不依赖 login_check 选择器是否准确。"""
+    deadline = time.time() + max_ms / 1000
+    checks = [x.strip() for x in (cfg.get("login_check") or "").split(",") if x.strip()]
+    while time.time() < deadline:
+        try:
+            u = (page.url or "").lower()
+        except Exception:
+            u = ""
+        if any(m in u for m in _LOGIN_MARKERS):
+            return  # 已跳到登录/验证页 → 明确未登录
+        for s in checks:
+            try:
+                el = page.query_selector(s)
+                if el and el.is_visible():
+                    return  # 命中可见的登录后元素 → 明确已登录（隐藏的外壳骨架不算，见 _is_logged_in 注释）
+            except Exception:
+                pass
+        page.wait_for_timeout(400)
+
+
+_QR_SELECTORS = (".login-qr", "[class*=login-qr]", "[class*=qrcode]", "[class*=qr-code]",
+                 "[class*=qrCode]", "[class*=scan-code]", "canvas", "img[src*=qr]", "img[src*=QR]")
+
+# 截二维码前先等它真正渲染（异步 base64/canvas 二维码，固定 wait 不够会截到空框/别的图）。
+# 平台可用 cfg["qr_loaded"] override；否则用这个通用默认。
+_QR_LOADED_DEFAULT = ("img[src^='data:image'], canvas, [class*=qrcode] img, "
+                      "[class*=qrcode] canvas, .login-qr img, img[src*=qr]")
+
+
+def _score_qr_el(el) -> float | None:
+    """给候选元素打「像不像二维码」的分：可见 + 接近正方形 + 尺寸合适才入选；
+    base64 img / canvas 本体加权（二维码几乎都是它们）。不合格返回 None。"""
+    try:
+        if not el.is_visible():
+            return None
+        b = el.bounding_box()
+    except Exception:
+        return None
+    if not b:
+        return None
+    w, h = b["width"], b["height"]
+    # 尺寸：收紧到 140~600（原 120~520 太松，logo/广告/头像会误命中）
+    if w < 140 or h < 140 or w > 600 or h > 600:
+        return None
+    ratio = w / h if h else 0
+    if not (0.75 <= ratio <= 1.34):   # 二维码接近正方形，排除横幅/文字条
+        return None
+    score = float(min(w, h))
+    try:
+        tag = (el.evaluate("e => e.tagName") or "").lower()
+        src = el.get_attribute("src") or ""
+        if tag == "img" and src.startswith("data:image"):
+            score += 10000        # base64 img = 二维码本体，最优先
+        elif tag == "canvas":
+            score += 5000
+        elif tag == "img" and ("qr" in src.lower()):
+            score += 2000
+    except Exception:
+        pass
+    return score
+
+
+def _crop_qr(page, qr_out, cfg) -> None:
+    """把登录二维码裁出来单独存图（而非整页）。遍历平台配置 + 常见选择器的所有候选，
+    用 _score_qr_el 挑「最像二维码」的那个（base64/canvas 本体 + 接近正方形 + 尺寸合适），
+    而不是遇到第一个宽松方形就用；都不中才退回整页。
+    strict_login_qr 平台则检测图案并裁剪，找不到实际二维码时明确报错，不退回整页。
+    ⚠️ 调用前应先等二维码渲染（见 cmd_login_qr 的 qr_loaded 等待），否则可能截到空框。"""
+    if cfg.get("strict_login_qr"):
+        login_qr.capture_qr(page, qr_out, cfg["login_qr_selector"])
+        return
+    cands: list[str] = []
+    if cfg.get("login_qr_selector"):  # 拆逗号逐个试，保证具体选择器优先于容器
+        cands += [s.strip() for s in cfg["login_qr_selector"].split(",") if s.strip()]
+    cands += list(_QR_SELECTORS)
+    best = None  # (score, el)
+    for sel in cands:
+        try:
+            els = page.query_selector_all(sel)
+        except Exception:
+            continue
+        for el in els:
+            sc = _score_qr_el(el)
+            if sc is None:
+                continue
+            if best is None or sc > best[0]:
+                best = (sc, el)
+    if best is not None:
+        try:
+            best[1].screenshot(path=str(qr_out))
+            return
+        except Exception:
+            pass
+    page.screenshot(path=str(qr_out))   # 兜底：整页
+
+
+def _capture_qr(page, qr_out, cfg) -> None:
+    """截登录二维码到 qr_out，按平台形态分两条路：
+    - 码在跨域 iframe（视频号：open.weixin.qq.com 的微信标准扫码组件）→ 主页面 query_selector 找不到，
+      截 iframe 元素并检测、裁剪真实二维码，不能用空白组件冒充二维码。
+    - 码在主页面 → 先等它渲染（qr_loaded），再用 _crop_qr 按打分裁剪最像二维码的元素。"""
+    ifr = cfg.get("login_qr_iframe")
+    if ifr:
+        try:
+            page.wait_for_selector(ifr, timeout=cfg.get("login_qr_iframe_timeout_ms", 15000), state="visible")
+            # 等 iframe 内二维码 img attach（跨域 frame 里 img 的 visible 判定不稳，用 attached 兜底）
+            for fr in page.frames:
+                if fr != page.main_frame and "qrconnect" in (fr.url or ""):
+                    try:
+                        fr.wait_for_selector(
+                            "img.js_qrcode_img, img.web_qrcode_img, img[src*='/connect/qrcode/']",
+                            timeout=10000, state="attached")
+                        fr.wait_for_function("""() => {
+                            const image = document.querySelector(
+                                "img.js_qrcode_img, img.web_qrcode_img, img[src*='/connect/qrcode/']");
+                            return image && image.complete && image.naturalWidth >= 96;
+                        }""", timeout=15000)
+                    except Exception:
+                        pass
+                    break
+            for attempt in range(3):
+                page.wait_for_timeout(800)
+                element = page.query_selector(ifr)
+                if (element and element.is_visible()
+                        and login_qr.save_qr(element.screenshot(timeout=3000, animations="disabled"),
+                                             Path(qr_out), minimum_size=96)):
+                    return
+        except Exception as error:
+            raise RuntimeError("微信扫码组件未加载，请检查服务器到 channels.weixin.qq.com、res.wx.qq.com 和 open.weixin.qq.com 的连接后重试") from error
+        raise RuntimeError("微信扫码组件中未找到可识别的二维码，请稍后重新登录")
+    # 主页面二维码：先等渲染（异步 base64/canvas，固定 wait 不够会截到空框），再打分裁剪
+    try:
+        page.wait_for_selector(cfg.get("qr_loaded") or _QR_LOADED_DEFAULT,
+                               timeout=15000, state="visible")
+    except Exception:
+        pass
+    _crop_qr(page, qr_out, cfg)
+
+
+def _probe_logged_in(browser, cfg: dict) -> bool:
+    """用辅助页 goto 发布页探测登录态——针对扫码成功后停在 passport/login 域、
+    不自动跳回创作者中心的平台（快手实测：点『立即登录』跳 passport，扫码后停在 passport
+    不自跳，主扫码页 URL 恒含 passport → _is_logged_in 恒 False → 一直超时）。
+    持久化 context 内 cookie 共享：已登录则辅助页能直接进发布页。不动主扫码页（保留二维码）。"""
+    probe = None
+    try:
+        probe = browser.new_page()
+        _navigate_login(probe, cfg.get("login_probe_url") or cfg.get("publish_url") or cfg["login_url"],
+                        timeout_ms=5000)
+        _settle_login(probe, cfg, max_ms=4000)
+        return _is_logged_in(probe, cfg)
+    except Exception:
+        return False
+    finally:
+        if probe:
+            try:
+                probe.close()
+            except Exception:
+                pass
+
+
+def _visible_account_identity(page, cfg: dict) -> dict:
+    account = {"name": "", "avatar_url": ""}
+    for field, selectors in (("name", cfg.get("me_name_selector")),
+                             ("avatar_url", cfg.get("me_avatar_selector"))):
+        for selector in (selectors or "").split(","):
+            if not selector.strip():
+                continue
+            for element in page.query_selector_all(selector.strip()):
+                if not element.is_visible():
+                    continue
+                value = element.inner_text() if field == "name" else element.get_attribute("src")
+                candidate = _account_identity({field: value}, page.url)
+                if candidate["name" if field == "name" else "avatar"]:
+                    account[field] = value
+                    break
+            if account[field]:
+                break
+    return _account_identity(account, page.url)
+
+
+def _settle_channels_account(page, browser, max_ms: int = 45000) -> bool:
+    deadline = time.monotonic() + max_ms / 1000
+    while time.monotonic() < deadline:
+        if _authenticated_account(browser, PLATFORMS["weixin-channels"]) is not None:
+            return True
+        for frame in page.frames:
+            parsed = urlparse(frame.url)
+            if parsed.hostname == "open.weixin.qq.com" and parsed.path == "/connect/qrconnect":
+                try:
+                    if frame.evaluate("""() => {
+                        const image = document.querySelector(
+                            "img.js_qrcode_img, img.web_qrcode_img, img[src*='/connect/qrcode/']");
+                        return !!(image && image.complete && image.naturalWidth >= 96);
+                    }"""):
+                        return False
+                except Exception:
+                    pass
+        page.wait_for_timeout(250)
+    raise RuntimeError("视频号账号页面或身份接口尚未就绪，请稍后重试校验")
+
+
+def cmd_login_qr(a) -> int:
+    """headless 抠二维码登录（供 Web 前端）：截登录页二维码 → 轮询登录成功 → 持久化。
+    状态写 login_state JSON 供后端轮询。同 xhs_publish.py login 的机制。
+
+    无扫码登录的平台（cfg login_mode == "window"，如 X，或显式 --headed）改走窗口模式：
+    弹有头浏览器由用户手动登录，脚本轮询登录态，成功后持久化并写 success。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        _die(f"需要 playwright：{e}", 3)
+    cfg = PLATFORMS.get(a.platform)
+    if not cfg:
+        _die(f"未知平台：{a.platform}（支持：{', '.join(PLATFORMS)}）")
+    profile = _profile_dir(a.platform, a.profile_base)
+    profile.mkdir(parents=True, exist_ok=True)
+    root = Path(__file__).resolve().parents[3] / "outputs" / "_login"
+    qr_out = Path(a.qr_out).expanduser() if a.qr_out else root / f"{a.platform}.png"
+    sf = a.status_file or str(root / f"{a.platform}.json")
+    timeout_s = a.timeout or 180
+    # 窗口登录：平台配置（X 无扫码）或显式 --headed 都弹有头窗口
+    window_mode = cfg.get("login_mode") == "window" or bool(getattr(a, "headed", False))
+
+    login_state.write_status(sf, "starting")
+    with sync_playwright() as p:
+        browser = None
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        def stop_login(signum, frame):
+            raise SystemExit(0)
+
+        try:
+            signal.signal(signal.SIGTERM, stop_login)
+            browser = p.chromium.launch_persistent_context(
+                str(profile), headless=not window_mode, locale="zh-CN", **_launch_kwargs(cfg, a.platform, headless=not window_mode))
+            page = browser.pages[0] if browser.pages else browser.new_page()
+            _block_heavy(browser, a.platform)
+            _observe_channels_account(browser, cfg)
+            _navigate_login(page, cfg["login_url"],
+                            timeout_ms=cfg.get("login_navigation_timeout_ms", 10000))
+            # 给客户端 redirect + 登录态渲染时间：已登录常从入口页跳到 /profile 等，
+            # 固定 1.2s 经常不够（快手实测 → 误判未登录去截整页）。等 login_check 出现最多 6s。
+            try:
+                page.wait_for_selector(
+                    ", ".join(filter(None, (cfg["login_check"], cfg.get("logged_out_selector")))),
+                    timeout=6000, state="visible")
+            except Exception:
+                page.wait_for_timeout(1200)
+            if _is_logged_in(page, cfg) or _authenticated_account(browser, cfg) is not None:
+                browser.close()
+                browser = None
+                login_state.write_status(sf, "success", "已登录")
+                print(f"✅ {cfg['name']} 已登录（登录态在持久化目录）")
+                return 0
+
+            # 窗口登录模式（X：无扫码）：不截二维码，写 window_login 状态后纯轮询登录态
+            if window_mode and cfg.get("login_mode") == "window":
+                login_state.write_status(
+                    sf, "window_login",
+                    f"请在运行 Easel 的电脑弹出的浏览器窗口里登录 {cfg['name']}，完成后窗口会自动关闭。该方式需要图形桌面。")
+                print(f"🪟 {cfg['name']} 请在弹出的浏览器窗口完成登录…", file=sys.stderr)
+                deadline = time.time() + timeout_s
+                while time.time() < deadline:
+                    try:
+                        if not browser.pages:
+                            login_state.write_status(sf, "expired", "登录窗口已关闭，请重新发起登录")
+                            return 1
+                        if any(_is_logged_in(candidate, cfg) for candidate in browser.pages):
+                            browser.close()
+                            browser = None
+                            login_state.write_status(sf, "success", "登录成功")
+                            print(f"✅ {cfg['name']} 登录成功，登录态已持久化")
+                            try:
+                                qr_out.unlink()
+                            except OSError:
+                                pass
+                            return 0
+                    except Exception:
+                        # 用户手动关了窗口/页面崩溃 → 明确终态，别让前端无限转圈
+                        login_state.write_status(sf, "expired", "登录窗口已关闭，请重新发起登录")
+                        return 1
+                    # 用 time.sleep 而非 page.wait_for_timeout：用户关窗后 page 已死，
+                    # 后者会抛 "Target closed" 逃逸成误导性的「登录异常」（真机踩过）
+                    time.sleep(_LOGIN_POLL_MS / 1000)
+                login_state.write_status(sf, "expired", "登录窗口超时未完成登录，请重新发起登录")
+                return 1
+
+            # 登录预备步骤（如快手：点『立即登录』跳 passport 再切『扫码登录』才出二维码）
+            for step in cfg.get("login_prep", []):
+                try:
+                    if "click" in step:
+                        for el in page.query_selector_all(step["click"]):
+                            if el.is_visible():
+                                el.click(timeout=3000)
+                                break
+                    if "wait" in step:
+                        page.wait_for_timeout(step["wait"])
+                except Exception:
+                    pass
+
+            # 截二维码为 PNG。视频号等把码放在跨域 iframe 里（主页面找不到）→ 截 iframe 元素本体；
+            # 其余平台在主页面异步渲染（base64/canvas）→ 先等渲染再按打分裁剪。统一走 _capture_qr。
+            qr_out.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if cfg.get("login_qr_switch"):
+                    login_qr.prepare_qr(page, qr_out, cfg["login_qr_selector"], cfg["login_qr_switch"])
+                else:
+                    _capture_qr(page, qr_out, cfg)
+            except Exception:
+                if not _is_logged_in(page, cfg) and _authenticated_account(browser, cfg) is None:
+                    raise
+                browser.close()
+                browser = None
+                login_state.write_status(sf, "success", "已登录")
+                print(f"✅ {cfg['name']} 已登录（登录态在持久化目录）")
+                return 0
+            login_state.write_status(sf, "qr_ready", f"扫码登录 {cfg['name']}", qr=str(qr_out))
+            print(f"📱 {cfg['name']} 登录页/二维码已保存：{qr_out}", file=sys.stderr)
+            print(f"⏳ 等待扫码（最长 {timeout_s}s）...", file=sys.stderr)
+
+            confirmed = False
+            scanned = False
+            refresh_count = 0
+            tick = 0
+            deadline = time.time() + timeout_s
+            next_refresh = time.monotonic() + 5
+            channels_probe = None
+            next_probe = time.monotonic() + 15
+            while time.time() < deadline:
+                tick += 1
+                if (any(_is_logged_in(candidate, cfg) for candidate in browser.pages)
+                        or cfg.get("profile") == "ChannelsProfile"
+                        and _authenticated_account(browser, cfg) is not None):
+                    confirmed = True
+                    break
+                qr_state = _login_qr_state(page, cfg)
+                if qr_state == "scanned":
+                    scanned = True
+                    login_state.write_status(sf, "scanned", "扫码成功，请在手机上确认登录")
+                elif qr_state == "expired":
+                    scanned = False
+                    if cfg.get("profile") == "ChannelsProfile":
+                        login_state.write_status(sf, "expired", "微信二维码已过期，请关闭后重新登录")
+                        return 1
+                # 扫码页仍停在 passport/login 域时深探：用辅助页 goto 发布页判登录态
+                # （快手扫码成功不自跳创作者中心，主扫码页 URL 恒含 passport）
+                try:
+                    cur = (page.url or "").lower()
+                except Exception:
+                    cur = ""
+                if tick % _LOGIN_PROBE_EVERY == 0:
+                    if _authenticated_account(browser, cfg) is not None:
+                        confirmed = True
+                        break
+                    if cfg.get("profile") == "ChannelsProfile":
+                        if time.monotonic() >= next_probe or scanned and channels_probe is None:
+                            if channels_probe is None:
+                                channels_probe = browser.new_page()
+                            next_probe = time.monotonic() + 30
+                            try:
+                                _navigate_login(channels_probe, cfg["login_url"], timeout_ms=5000)
+                            except Exception:
+                                channels_probe.close()
+                                channels_probe = None
+                    elif any(m in cur for m in _LOGIN_MARKERS) or cfg.get("login_probe_url"):
+                        if _probe_logged_in(browser, cfg):
+                            confirmed = True
+                            break
+                if cfg.get("strict_login_qr") and not scanned and time.monotonic() >= next_refresh:
+                    try:
+                        if qr_state == "expired":
+                            if refresh_count >= 3 or not _refresh_login_qr(page, qr_out, cfg):
+                                login_state.write_status(sf, "expired", "二维码已过期，请关闭后重新登录")
+                                return 1
+                            refresh_count += 1
+                            login_state.write_status(sf, "qr_ready", "二维码已刷新，请重新扫码", qr=str(qr_out))
+                        else:
+                            login_qr.capture_qr(page, qr_out, cfg["login_qr_selector"], attempts=1)
+                    except RuntimeError:
+                        if qr_state == "expired":
+                            login_state.write_status(sf, "expired", "二维码刷新失败，请关闭后重新登录")
+                            return 1
+                    next_refresh = time.monotonic() + 5
+                page.wait_for_timeout(_LOGIN_POLL_MS)
+            if confirmed:
+                browser.close()
+                browser = None
+                login_state.write_status(sf, "success", "登录成功")
+                print(f"✅ {cfg['name']} 登录成功，登录态已持久化")
+                try:
+                    qr_out.unlink()
+                except OSError:
+                    pass
+                return 0
+            login_state.write_status(sf, "expired", "已扫码但未完成登录确认，请在手机确认后重试" if scanned else "二维码超时未扫")
+            print(f"⏱️ {timeout_s}s 内未检测到登录成功（二维码可能过期）", file=sys.stderr)
+            return 1
+        except Exception as e:  # noqa: BLE001 — 任何异常都写 error 终态，否则前端轮询会卡在 starting/qr_ready
+            login_state.write_status(sf, "error", f"登录异常：{e}")
+            print(f"❌ {cfg['name']} 登录异常：{e}", file=sys.stderr)
+            return 1
+        finally:
+            try:
+                if browser is not None:
+                    browser.close()
+            finally:
+                signal.signal(signal.SIGTERM, previous_handler)
+
+
+def cmd_publish(a) -> int:
+    cfg = PLATFORMS.get(a.platform, {})
+    # 媒体是否必填由平台配置决定（知乎文章/纯文字推文可不带媒体）
+    if not a.media and not cfg.get("media_optional"):
+        _die("--media 媒体文件必填")
+    if a.media and not Path(a.media).expanduser().is_file():
+        _die(f"媒体文件不存在：{a.media}")
+    # 媒体类型校验：视频流程平台给图片会晦涩超时；但若平台有图文流程（steps_image）则放行走图文
+    if cfg.get("media_kind") == "video" and a.media and not cfg.get("steps_image"):
+        ext = Path(a.media).suffix.lower()
+        if ext not in VIDEO_EXTS:
+            _die(f"{cfg.get('name', a.platform)}走视频发布流程，需视频文件（{', '.join(sorted(VIDEO_EXTS))}），"
+                 f"当前选的是 {ext or '无扩展名'} 文件（{Path(a.media).name}）。"
+                 f"请改选视频文件；图文（发图片）发布暂未支持。", 7)
+    if not a.exec:
+        print("dry-run（加 --exec 真正发布）：")
+        content_guard.guard_or_die([a.title, a.desc, a.tags], exec_mode=False,
+                                   allow_unsafe=getattr(a, "allow_unsafe", False),
+                                   label=f"{cfg.get('name', a.platform)}发布内容")
+        return cmd_plan(a)
+    # 出站内容安全闸门：真发前扫描标题/正文/话题，检出内部设置泄露即阻止发布。
+    content_guard.guard_or_die([a.title, a.desc, a.tags], exec_mode=True,
+                               allow_unsafe=getattr(a, "allow_unsafe", False),
+                               label=f"{cfg.get('name', a.platform)}发布内容")
+    rc = _run_browser(a, headed=a.headed, do_publish=True)
+    if rc == 0:
+        # 发布成功 → 落统一内容日历（对话页自动；发布页 web 设 AUTORECORD=0 跳过防重复）
+        try:
+            import calendar_ops
+            ptype = ("文章" if a.platform == "zhihu"
+                     else ("视频" if a.media and Path(a.media).suffix.lower() in VIDEO_EXTS
+                           else "图文"))
+            calendar_ops.record_publish(a.platform, a.title or (a.desc or "")[:20],
+                                        ptype=ptype, tags=(a.tags or ""),
+                                        note=(a.desc or ""), source="chat")
+        except Exception:
+            pass
+    return rc
+
+
+def cmd_whoami(a) -> int:
+    """真校验登录态 + 读昵称/头像，输出单行 JSON（供 Web 后端解析）。
+    走发布页判定（比 avatar 选择器可靠）：URL 落登录页 / 登出浮层可见 → 未登录。
+    昵称/头像选择器为 best-effort，各平台登录后需校验。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        print(json.dumps({"loggedIn": False, "name": "", "avatar": "", "error": f"playwright:{e}"}))
+        return 0
+    cfg = PLATFORMS.get(a.platform)
+    if not cfg:
+        print(json.dumps({"loggedIn": False, "name": "", "avatar": "", "error": "unknown platform"}))
+        return 0
+    result = {"loggedIn": False, "name": "", "avatar": ""}
+    try:
+        with sync_playwright() as p:
+            profile = _profile_dir(a.platform, a.profile_base)
+            profile.mkdir(parents=True, exist_ok=True)
+            browser = p.chromium.launch_persistent_context(
+                str(profile), headless=True, locale="zh-CN", **_launch_kwargs(cfg, a.platform, headless=True))
+            page = browser.pages[0] if browser.pages else browser.new_page()
+            try:
+                _block_heavy(browser, a.platform, login_assets=False)
+                _observe_channels_account(browser, cfg)
+                account = _authenticated_account(browser, cfg)
+                if account is not None:
+                    result.update(loggedIn=True, **_account_identity(account))
+                    print(json.dumps(result, ensure_ascii=False))
+                    return 0
+                _navigate_login(page, cfg.get("whoami_url") or cfg.get("login_probe_url") or cfg["publish_url"])
+                if cfg.get("profile") == "ChannelsProfile":
+                    _settle_channels_account(page, browser)
+                else:
+                    _settle_login(page, cfg, max_ms=7000)
+                account = _authenticated_account(browser, cfg) if cfg.get("profile") == "ChannelsProfile" else None
+                logged = account is not None or _is_logged_in(page, cfg)
+                # 外壳判已登录后，再探发布子系统鉴权：外壳 token 活着但发布 token 已死时翻成未登录
+                if logged and cfg.get("login_probe"):
+                    pa = _probe_publish_auth(page, cfg)
+                    result["publishAuth"] = pa
+                    if pa == "expired":
+                        logged = False
+                        result["reason"] = "publish_auth_expired"
+                result["loggedIn"] = logged
+                if logged:
+                    result.update(_account_identity(account) if account else _visible_account_identity(page, cfg))
+                elif cfg.get("profile") == "ChannelsProfile":
+                    login_url = any(marker in (page.url or "").lower() for marker in _LOGIN_MARKERS)
+                    login_visible = any(element.is_visible() for selector in cfg["logged_out_selector"].split(",")
+                                        for element in page.query_selector_all(selector.strip()))
+                    if not login_url and not login_visible:
+                        result["error"] = "视频号账号页面或身份接口尚未就绪，请稍后重试校验"
+            finally:
+                browser.close()
+    except Exception as e:  # noqa: BLE001 — whoami 永远输出 JSON
+        result["error"] = str(e)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_selftest(_a) -> int:
+    print("web_publisher 自检（离线）...", file=sys.stderr)
+    assert PLATFORMS, "配置为空"
+    for k, c in PLATFORMS.items():
+        for key in ("name", "login_url", "publish_url", "profile", "steps", "selector_caveat"):
+            assert key in c, f"{k} 缺字段 {key}"
+        assert c["steps"], f"{k} 无步骤"
+        assert c.get("login_check"), f"{k} 缺 login_check（QR 登录判定用）"
+        for st in c["steps"]:
+            assert st["action"] in _ACTIONS, f"{k} 非法 action {st['action']}"
+    # 占位符解析
+    steps = _resolve_steps("kuaishou", {"media": "/x/a.mp4", "title": "标题",
+                                        "desc": "", "tags": "#话题", "cover": ""})
+    up = [s for s in steps if s["action"] == "upload"][0]
+    assert up["value"] == "/x/a.mp4", "media 占位符未替换"
+    fill = [s for s in steps if s["action"] == "fill"][0]
+    assert "标题" in fill["value"] and "#话题" in fill["value"], "title/tags 未替换"
+    # 未知平台
+    try:
+        _resolve_steps("nope", {})
+        raise AssertionError("未知平台未报错")
+    except SystemExit:
+        pass
+    # profile 目录路由
+    pd = _profile_dir("zhihu", None)
+    assert pd.name == "ZhihuProfile", "profile 目录名不对"
+    # 登录轮询提速 + 深探（快手扫码后停在 passport 不自跳的修复）
+    assert _LOGIN_POLL_MS <= 1000, "轮询间隔应 ≤1s（成功检测延迟）"
+    assert _LOGIN_PROBE_EVERY >= 1 and callable(_probe_logged_in)
+    assert "passport" in _LOGIN_MARKERS, "passport 应在登录标记内（快手 passport 扫码页）"
+    # 二维码打分：base64 img > canvas > 普通方图；非正方/过小/过大剔除（用轻量假元素离线测）
+    class _FakeEl:
+        def __init__(self, box, tag="div", src=""):
+            self._box, self._tag, self._src = box, tag, src
+        def is_visible(self):
+            return True
+        def bounding_box(self):
+            return self._box
+        def evaluate(self, _js):
+            return self._tag
+        def get_attribute(self, _n):
+            return self._src
+    sq = {"width": 220, "height": 220}
+    b64 = _score_qr_el(_FakeEl(sq, "img", "data:image/png;base64,AAAA"))
+    canv = _score_qr_el(_FakeEl(sq, "canvas"))
+    plain = _score_qr_el(_FakeEl(sq, "div"))
+    assert b64 and canv and plain and b64 > canv > plain, "二维码本体应加权优先"
+    assert _score_qr_el(_FakeEl({"width": 60, "height": 60}, "img", "data:image/x")) is None, "过小应剔除"
+    assert _score_qr_el(_FakeEl({"width": 400, "height": 90}, "canvas")) is None, "非正方（横条）应剔除"
+    assert _QR_LOADED_DEFAULT and "data:image" in _QR_LOADED_DEFAULT
+    # 多候选选择器拆分（修 split(',')[0] 丢兜底的坑）
+    assert _split_sels("a, b ,c") == ["a", "b", "c"] and _split_sels("") == []
+    # 快手发布步骤健壮化：清旧草稿(optional) + 描述框多候选 + 转码等待够长
+    ks = PLATFORMS["kuaishou"]["steps"]
+    assert any(s.get("optional") and s["action"] == "click" for s in ks), "缺清理旧草稿的 optional 步骤"
+    wf = [s for s in ks if s["action"] == "waitfor"][0]
+    assert "," in wf["selector"] and int(wf["value"]) >= 120000, "描述框应多候选且等待≥120s（转码慢）"
+    joyride_steps = [i for i, s in enumerate(ks)
+                     if s["action"] == "js_eval" and "react-joyride" in s.get("value", "")]
+    assert len(joyride_steps) >= 2, "快手应在填写前和最终发布前各清理一次 joyride 遮罩"
+    # 真发布按钮走 js_click（JS dispatchEvent；标准 click/:has-text 对该按钮不可靠）——
+    # 断言非 optional 的 click/js_click 提交步命中 button-primary（非 <button>、非左侧导航『发布作品』）
+    pub_click = [s for s in ks if s["action"] in ("click", "js_click") and not s.get("optional")][-1]
+    pub_click_index = ks.index(pub_click)
+    assert joyride_steps[-1] < pub_click_index, "最后一次 joyride 清理必须在发布点击前"
+    assert "button-primary" in pub_click["selector"], \
+        "快手发布按钮应为 [class*=button-primary]『发布』（走 js_click 派发；非 <button>，非导航『发布作品』）"
+    # 读回对账（platform_readback）接入：配置标记 + 注册表 + 提交步时间戳 + 离线解析冒烟
+    assert PLATFORMS["kuaishou"].get("readback") is True, "快手应标记 readback=True（发布后读回对账）"
+    assert callable(_readback_fn("kuaishou", 0)) and callable(_readback_fn("kuaishou", 1)), \
+        "kuaishou 读回函数应在 platform_readback 中存在并登记"
+    for _fn in ("capture_kuaishou_snapshot", "verify_kuaishou_publish",
+                "read_kuaishou_works", "read_kuaishou_account"):
+        assert callable(getattr(platform_readback, _fn, None)), f"platform_readback 缺 {_fn}"
+    commit_steps = [s for s in ks if s.get("commit")]
+    assert len(commit_steps) == 1 and commit_steps[0] is pub_click, \
+        "应有且仅有一个 commit 标记步（且为真发布按钮步）——读回时间窗基准"
+    # 单次提交契约 × 人类节奏：commit 步触发提交前双停顿（human_pace，静态检查）
+    import inspect as _ins
+    assert "pause_before_commit" in _ins.getsource(_run_browser), \
+        "提交步应触发 human_pace.pause_before_commit（复核+反应双停顿）"
+    assert callable(getattr(human_pace, "pause_before_commit", None))
+    _rb_now = int(time.time() * 1000)
+    _rb_fake = [{"url": "https://cp.kuaishou.com/rest/cp/works/v2/video/pc/photo/list", "data": {
+        "data": {"list": [
+            {"photo_id": "3xrb001", "caption": "读回对账自检标题十二字附言",
+             "create_time": _rb_now // 1000, "status_name": "已发布", "play_count": 12, "like_count": 3},
+            {"photo_id": "3xrb002", "caption": "无关旧作品",
+             "create_time": (_rb_now - 86_400_000) // 1000},
+        ], "total": 2}}}]
+    _rb_arr = platform_readback._find_content_array(_rb_fake, platform_readback.KUAISHOU_ID_KEYS)
+    assert len(_rb_arr) == 2 and _rb_arr[0]["photo_id"] == "3xrb001", "快手作品数组解析失败"
+    _rb_item = platform_readback._map_kuaishou_item(_rb_arr[0])
+    assert _rb_item and _rb_item.platform_content_id == "3xrb001"
+    assert "读回对账自检" in _rb_item.title and _rb_item.status == "已发布"
+    assert _rb_item.published_at_ms == (_rb_now // 1000) * 1000
+    assert platform_readback.find_published_work([_rb_item], "读回对账自检", since_ms=_rb_now - 300_000) is _rb_item
+    assert platform_readback.find_published_work(
+        [_rb_item], "读回对账自检", since_ms=None, exclude_ids={"3xrb001"}) is None, "发前快照排除应生效"
+    # 视频流程平台的媒体类型标记（快手/视频号只收视频，给图片会晦涩超时）
+    assert PLATFORMS["kuaishou"].get("media_kind") == "video", "快手应标记 media_kind=video"
+    assert ".mp4" in VIDEO_EXTS and ".png" not in VIDEO_EXTS
+    # 快手图文流程（发图片走 steps_image：切图文 tab + filechooser 上传图片）
+    ksi = PLATFORMS["kuaishou"].get("steps_image")
+    assert ksi, "快手应有 steps_image（图文发布）"
+    assert any(s["action"] == "filechooser_upload" for s in ksi), "图文上传应用 filechooser_upload"
+    assert any(s["action"] == "click" and "上传图文" in s.get("selector", "") for s in ksi), "图文流程应切『上传图文』tab"
+    # 图文步骤占位符 + action 合法性（复用 _resolve_steps 校验）
+    isteps = _resolve_steps("kuaishou", {"media": "/x/a.png", "title": "标题", "desc": "正文", "tags": ""}, "steps_image")
+    assert any(s["action"] == "filechooser_upload" and s["value"] == "/x/a.png" for s in isteps), "图文 media 占位符未替换"
+    # 视频号二维码在跨域 iframe（open.weixin.qq.com 的微信扫码组件）——必须配 login_qr_iframe 并走 _capture_qr 截 iframe 本体
+    wc = PLATFORMS["weixin-channels"]
+    assert "open.weixin.qq.com" in wc.get("login_qr_iframe", ""), "视频号应配 login_qr_iframe（码在跨域 iframe，主页面找不到）"
+    assert "open.weixin.qq.com" in wc.get("logged_out_selector", ""), "视频号未登录信号应认扫码 iframe"
+    assert callable(_capture_qr), "缺 _capture_qr（iframe 感知的二维码截取）"
+    # SPA 客户端跳转落定后再判登录态（修视频号未跳转期 URL 启发式误报已登录的假阳性）
+    assert callable(_settle_login), "缺 _settle_login（判登录态前等客户端跳转落定）"
+    # X（国际站）：窗口登录模式 + 代理声明 + 媒体规则
+    tx = PLATFORMS["twitter-x"]
+    assert tx.get("login_mode") == "window" and tx.get("needs_proxy") is True, \
+        "X 无扫码登录，须窗口模式 + needs_proxy"
+    assert tx.get("media_optional") is True, "X 纯文字推文合法，媒体应为可选"
+    assert any(s.get("needs_media") for s in tx["steps"]), "X 的附件等待步应标 needs_media（无媒体时跳过）"
+    # 代理路由：国内平台强制直连，国际站按环境变量走显式代理或系统代理
+    assert "--no-proxy-server" in _launch_kwargs(PLATFORMS["zhihu"], "zhihu")["args"]
+    # 与项目 .env 隔离：已配代理的机器上「未配代理回退系统代理」分支断言会失真
+    _real_env_file_value = _env_file_value
+    globals()["_env_file_value"] = lambda *a, **k: ""
+    try:
+        for _v in ("EASEL_PROXY", "TWITTER_X_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+            os.environ.pop(_v, None)
+        kw = _launch_kwargs(tx, "twitter-x")
+        assert "--no-proxy-server" not in kw["args"] and "proxy" not in kw, \
+            "国际站未配代理时应回退系统代理（不加 --no-proxy-server）"
+    finally:
+        globals()["_env_file_value"] = _real_env_file_value
+    os.environ["TWITTER_X_PROXY"] = "http://127.0.0.1:7891"
+    try:
+        kw = _launch_kwargs(tx, "twitter-x")
+        assert kw.get("proxy", {}).get("server") == "http://127.0.0.1:7891", "平台专属代理变量应生效"
+    finally:
+        os.environ.pop("TWITTER_X_PROXY", None)
+    os.environ["EASEL_PROXY"] = "http://127.0.0.1:7890"
+    try:
+        kw = _launch_kwargs(tx, "twitter-x")
+        assert kw.get("proxy", {}).get("server") == "http://127.0.0.1:7890", "EASEL_PROXY 应优先生效"
+    finally:
+        os.environ.pop("EASEL_PROXY", None)
+    # 纯文字推文：无媒体时 upload 步可跳过（_run_browser 的跳过逻辑静态检查）
+    import inspect as _ins2
+    assert "needs_media" in _ins2.getsource(_run_browser), "_run_browser 应支持 needs_media 跳步"
+    # 掘金（国内技术社区）：扫码登录（登录弹窗内 img.qrcode-img）+ CodeMirror 正文 + 接口判登录
+    jj = PLATFORMS["juejin"]
+    assert jj.get("media_optional") is True and not jj.get("needs_proxy"), "掘金国内直连、文章可不带媒体"
+    assert "qrcode-img" in jj.get("login_qr_selector", ""), "掘金登录弹窗二维码 img.qrcode-img"
+    assert any("CodeMirror" in s.get("selector", "") for s in jj["steps"]), "掘金正文写 CodeMirror"
+    assert any(s["action"] == "press" for s in jj["steps"]), "掘金 fill 后须补 Enter 触发编辑器状态同步"
+    # headless 校验国际站须伪装 UA（HeadlessChrome UA 会被 Google 风控踢会话）；headed 不伪装
+    kw_h = _launch_kwargs(tx, "twitter-x", headless=True)
+    assert "Headless" not in kw_h.get("user_agent", "Headless") and "Chrome/" in kw_h.get("user_agent", ""), \
+        "headless 国际站必须带正常 Chrome UA"
+    assert "user_agent" not in _launch_kwargs(tx, "twitter-x", headless=False), "窗口登录不伪装 UA"
+    assert "user_agent" not in _launch_kwargs(PLATFORMS["zhihu"], "zhihu", headless=True), \
+        "国内平台 headless 不动 UA"
+    print(f"✅ selftest 通过（{len(PLATFORMS)} 平台配置完整 + 步骤/占位符解析 + 路由 + 登录轮询/深探 "
+          "+ 二维码打分/iframe 截取 + 多候选/快手健壮化 + 读回对账（快手）+ 国际站窗口登录/代理/媒体规则）")
+    return 0
+
+
+def main() -> int:
+    login_state.configure_stdio()
+    ap = argparse.ArgumentParser(
+        description="通用浏览器发布框架（Playwright，配置驱动，登录态持久化）",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    def add_common(p):
+        p.add_argument("--platform", required=True, choices=list(PLATFORMS))
+        p.add_argument("--media", help="视频/图片文件")
+        p.add_argument("--title", help="标题")
+        p.add_argument("--desc", help="正文/简介")
+        p.add_argument("--tags", help="话题标签（如 '#AI #教程'）")
+        p.add_argument("--cover", help="封面")
+        p.add_argument("--profile-base", help="登录态根目录（默认 ~/.easel-browser-profiles）")
+
+    sub.add_parser("platforms", help="列出平台").set_defaults(func=cmd_platforms)
+    sub.add_parser("check", help="检查 playwright/内核").set_defaults(func=cmd_check)
+
+    p = sub.add_parser("plan", help="发布步骤预览（dry-run）")
+    add_common(p)
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("login", help="有头浏览器登录并持久化")
+    add_common(p)
+    p.set_defaults(func=cmd_login)
+
+    p = sub.add_parser("login-qr", help="headless 抠二维码登录（供 Web 前端）；无扫码平台用窗口模式")
+    add_common(p)
+    p.add_argument("--qr-out", help="二维码图片输出路径")
+    p.add_argument("--status-file", help="登录状态 JSON 输出路径（供 Web 后端轮询）")
+    p.add_argument("--timeout", type=int, help="等待扫码超时秒数（默认 180）")
+    p.add_argument("--headed", action="store_true",
+                   help="弹有头窗口手动登录（X 等无扫码平台由配置自动开启，无需显式传）")
+    p.set_defaults(func=cmd_login_qr)
+
+    p = sub.add_parser("publish", help="网页发布")
+    add_common(p)
+    p.add_argument("--exec", action="store_true", help="真正发布（默认 dry-run）")
+    p.add_argument("--allow-unsafe", action="store_true",
+                   help="放行内容安全闸门（检出内部设置泄露也照发，谨慎）")
+    p.add_argument("--headed", action="store_true", help="有头模式执行（便于观察/首次校验）")
+    p.add_argument("--keep-open", action="store_true", help="发布后不关闭浏览器")
+    p.set_defaults(func=cmd_publish)
+
+    p = sub.add_parser("whoami", help="真校验登录态 + 读昵称/头像（输出 JSON）")
+    add_common(p)
+    p.set_defaults(func=cmd_whoami)
+
+    sub.add_parser("selftest", help="自检").set_defaults(func=cmd_selftest)
+
+    a = ap.parse_args()
+    if not getattr(a, "func", None):
+        ap.print_help()
+        return 1
+    return a.func(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

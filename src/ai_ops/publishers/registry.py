@@ -232,6 +232,19 @@ def build_default_registry(
         registration_id="builtin:wechat_mp_browser",
     )
 
+    # Easel 会话版公众号草稿适配器：复用 vendored Easel 扫码会话（免 AppID、
+    # 未认证个人号可用），publish=建草稿+真实读回。默认关闭，启用前须专用账号
+    # canary 与 readback 证据卡；优先于自建浏览器草稿适配器。
+    if getattr(active_config, "easel_wechat_publisher_enabled", False):
+        from .easel_wechat import EaselWechatPublisher
+
+        reg.register(
+            Platform.WECHAT_MP,
+            EaselWechatPublisher,
+            priority=5,
+            registration_id="builtin:easel_wechat_oa",
+        )
+
     # 公众号官方 API（draft + freepublish）canary：文档化接口、无浏览器依赖，
     # 但发布是公开副作用且未经真实账号 canary，只有显式开启才装配，
     # 并优先于仅保存草稿的浏览器适配器（那是部分副作用路径，不是发布）。

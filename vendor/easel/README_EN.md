@@ -1,0 +1,379 @@
+<p align="left">
+  <img src="assets/readme/logos/zhejiang_university_horizontal_readme.png#gh-light-mode-only" width="106" align="middle" alt="Zhejiang University">
+  <img src="assets/readme/logos/zhejiang_university_horizontal_dark.png#gh-dark-mode-only" width="106" align="middle" alt="Zhejiang University">
+  &nbsp;&nbsp;&nbsp;
+  <img src="assets/readme/logos/peking_university_horizontal_red.png#gh-light-mode-only" width="98" align="middle" alt="Peking University">
+  <img src="assets/readme/logos/peking_university_horizontal_dark.png#gh-dark-mode-only" width="98" align="middle" alt="Peking University">
+</p>
+
+<p align="center">
+  <img src="assets/readme/brand.png#gh-light-mode-only" width="640" alt="Easel">
+  <img src="assets/readme/brand-dark.png#gh-dark-mode-only" width="640" alt="Easel">
+  <br>
+  <img src="assets/readme/logos/real_lab_horizontal_readme.png" width="74" alt="REAL Lab">&thinsp;&thinsp;<img src="assets/readme/logos/opendcai_lab_horizontal_readme.png#gh-light-mode-only" width="83" alt="OpenDCAI Lab"><img src="assets/readme/logos/opendcai_lab_horizontal_readme_dark.png#gh-dark-mode-only" width="83" alt="OpenDCAI Lab">
+</p>
+
+<p align="center">
+  <a href="README.md">简体中文</a> · <strong>English</strong> · <a href="README_JA.md">日本語</a>
+</p>
+
+<p align="center">
+  Your personal, continuously evolving social media content assistant.<br>
+  Start with an idea, then discover, plan, create, publish, and learn.
+</p>
+
+<p align="center">
+  <a href="https://zju-real.github.io/Easel/"><img src="https://img.shields.io/badge/Easel-Project_Page-F05A3C?style=flat-square&logo=googlechrome&logoColor=white" alt="Easel Project Page"></a>
+  <img src="https://img.shields.io/badge/OpenClaw-powered-111827?style=flat-square" alt="Powered by OpenClaw">
+  <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+">
+  <a href="docs/skill-function-mapping.md"><img src="https://img.shields.io/badge/Skills-113-0F9D8A?style=flat-square" alt="113 Skills"></a>
+  <a href="https://github.com/ZJU-REAL/Easel/stargazers"><img src="https://img.shields.io/github/stars/ZJU-REAL/Easel?style=flat-square&color=F6C344" alt="GitHub Stars"></a>
+  <a href="https://github.com/ZJU-REAL/Easel/releases/latest"><img src="https://img.shields.io/github/v/release/ZJU-REAL/Easel?style=flat-square&color=0F9D8A&label=release" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-2EA44F?style=flat-square" alt="License: Apache 2.0"></a>
+  <a href="assets/readme/wechat-group.png"><img src="https://img.shields.io/badge/WeChat-Join_Group-07C160?style=flat-square&logo=wechat&logoColor=white" alt="WeChat Group"></a>
+</p>
+
+<p align="center">
+  <a href="https://trendshift.io/repositories/195527?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-195527" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/195527/daily?language=Python" alt="ZJU-REAL%2FEasel | Trendshift" width="250" height="55"/></a> <a href="https://trendshift.io/repositories/195527?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-195527" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/195527/weekly?language=Python" alt="ZJU-REAL%2FEasel | Trendshift" width="250" height="55"/></a>
+</p>
+
+![Easel product poster](assets/readme/poster.png)
+
+## 🎨 What Is Easel?
+
+Easel is an open-source content workspace for social media creators. It connects an OpenClaw Agent, account profiles, content Skills, and real media tools, enabling the Agent to produce and archive content instead of merely explaining what to do, with direct or on-demand publishing when needed.
+
+Think of Easel as a content partner that remembers your positioning, audience, voice, platform constraints, preferences, and past performance. It stays with you from trend discovery through publishing, then carries what it learns into the next creation cycle.
+
+### Local OpenAI-Compatible Gateways
+
+Configure an independent gateway in `.env`:
+
+```dotenv
+EASEL_DIRECT_API_BASE_URL=http://localhost:50288/v1
+EASEL_DIRECT_API_MODEL=your-model-id
+EASEL_DIRECT_API_KEY=your-real-gateway-key
+```
+
+Use a base URL including `/v1`, not the full `/chat/completions` URL. Leave the key empty for gateways without authentication.
+
+- `bash setup.sh` uses OpenClaw by default. A complete independent configuration creates the `local-api` provider with OpenClaw's tool runtime and permits requests to the configured private gateway. The model must support tool calling. Configure `.env` before installation; there is no terminal model-selection wizard.
+- `bash setup.sh --api` skips OpenClaw installation, skills synchronization, and Gateway startup. Alternatively, select **API direct** in the Web model settings, or set `EASEL_CHAT_TRANSPORT=api` manually.
+- Direct mode supports streaming chat, separate multi-turn history, profiles, text/image attachments, stop, and reconnection. It cannot execute local tools, skills, or publishing. Start a new conversation after changing modes.
+- Direct configuration only reads `EASEL_DIRECT_API_*`; it never falls back to `OPENAI_*`. CLI `chat`, `ping`, and `doctor` recognize direct mode. `ping` verifies actual connectivity; a configured badge alone does not.
+
+These installer options apply to Linux/macOS `setup.sh`. Windows users can configure direct mode in `.env` or Web settings.
+
+Easel promotional demo:
+
+https://github.com/user-attachments/assets/4dd060dc-53dd-4bb2-99a3-e65ab6f65166
+
+Easel follows five connected workflows: **Discover** relevant trends and opportunities, **Plan** topics, hooks, scripts, and schedules, **Produce** text, audio, and video, **Publish** checked and platform-ready content directly to the appropriate platforms, and **Attribute** performance insights back to the account profile.
+
+#### 📌 Usage Notes and Research Vision
+
+> - **Use the Web workspace for the complete experience:** it includes conversations, assets, accounts, profiles, a content library, and publishing management beyond the CLI entry points, and it is our recommended way to use Easel; for terminal-only display quirks, see [Known Issues](docs/known-issues_EN.md).
+> - **Be cautious with automated Xiaohongshu publishing:** automation may trigger verification, reach restrictions, or account risk. Use preview and preflight checks, and prefer human-confirmed publishing.
+> - **Research applied to real life:** Easel brings our research into real social media workflows. We will continue exploring social intelligence for AI in social media, including a deeper understanding of creators, audiences, and authentic interaction.
+
+## ✨ Why Easel?
+
+- **One Agent across the entire workflow:** discover trends, evaluate topics, plan calendars, generate copy and visuals, produce video, publish, and analyze results in one continuous flow.
+- **Profile-driven creation:** each account has its own positioning, style, audience, platforms, preferences, boundaries, and long-term memory.
+- **Executable Skills:** image, card, voice-over, subtitle, editing, short-drama, and publishing Skills include runnable tools and save deliverables to `outputs/`.
+- **One source, many platforms:** adapt a single idea into Xiaohongshu cards, short video, a Zhihu article, or a short post while respecting platform conventions.
+- **Project-based outputs:** source material, intermediate files, metadata, and final deliverables stay together for revision, retrying, and publishing.
+- **A publishing and learning loop:** Easel supports login, adaptation, and publishing workflows for Xiaohongshu, Douyin, Kuaishou, Zhihu, Bilibili, WeChat Channels, WeChat Official Accounts, and Toutiao, with performance data feeding back into account profiles.
+
+## 🧭 Five-Layer Content Workflow
+
+1. **Discover:** aggregate trending topics, industry news, competitors, and user conversations to identify relevant opportunities.
+2. **Plan:** turn opportunities into topics, titles, scripts, content series, and calendar entries.
+3. **Produce:** create copy, cards, posters, infographics, audio, video, short dramas, and paper explainers.
+4. **Publish:** adapt titles, copy, aspect ratios, and media for each platform, run preflight checks, and publish through logged-in accounts.
+5. **Attribute:** collect views, engagement, comments, and content performance, then preserve useful patterns in the account profile.
+
+## 🧰 Implemented Capabilities
+
+The trend radar accepts user-defined Python collectors, HTTP services, and RSS/Atom feeds through a versioned data contract. Its existing six platforms use the same pipeline; adding your own source does not require changing the frontend.
+
+| Layer | Capabilities |
+|---|---|
+| **Discover** | Cross-platform trends, vertical research, content-gap analysis, event calendars, algorithm updates, competitor research, industry news, platform differences, RSS aggregation, and UGC discovery |
+| **Plan** | Positioning, audience profiles, persona and voice, account diagnosis, content matrices, topic scoring, trend adaptation, series planning, hooks, outlines, storyboards, calendars, repurposing, livestreams, campaigns, and collaborations |
+| **Text & Visual** | Social copy, video scripts, Xiaohongshu notes, long-form articles, novels, natural rewriting, style transfer, paper explainers, quote cards, knowledge cards, posters, infographics, charts, mind maps, comparison cards, product images, memes, AI images, enhancement, background removal, and batch processing |
+| **Audio & Video** | Text-to-speech, multi-role dubbing, voice cloning, AI music, denoising, mixing, transcription, audio visualization, AI video, short drama, subtitles, translation, editing, clipping, highlights, format conversion, intros/outros, slideshows, beat sync, green screen, and video-to-article conversion |
+| **Publish & Attribute** | Quality gates, risk checks, search optimization, publishing checklists, platform adaptation, seven-platform publishing workflows, calendar logging, account analytics, comment insights, postmortems, ROI, and profile memory |
+
+## 🖥️ Workspace Examples
+
+These are four representative examples, not the complete feature set. Explore the Skill library in the Web workspace or the [capability map](docs/skill-function-mapping.md) for more.
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><strong>🧬 Account Profiles</strong><br><sub>Build reusable account context from identity, social links, goals, preferences, and boundaries.</sub><br><br><img src="assets/readme/features/profile.png" width="100%" alt="Easel account profile"></td>
+    <td width="50%" valign="top"><strong>🔥 Trend Radar</strong><br><sub>Aggregate real-time trends across major platforms and identify topics relevant to the current account.</sub><br><br><img src="assets/readme/features/discover.png" width="100%" alt="Easel trend radar"></td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><strong>📅 Content Calendar</strong><br><sub>Manage ideas, drafts, scheduled posts, published work, platform events, and daily plans.</sub><br><br><img src="assets/readme/features/calendar.png" width="100%" alt="Easel content calendar"></td>
+    <td width="50%" valign="top"><strong>📣 Publishing Center</strong><br><sub>Generate platform-specific versions from one master asset, preview them, run checks, and publish.</sub><br><br><img src="assets/readme/features/publish.png" width="100%" alt="Easel publishing center"></td>
+  </tr>
+</table>
+
+## 🖼️ Real Outputs
+
+The following examples were produced by real Easel workflows. README media lives under `assets/readme/`; the project page uses lightweight six-second previews under `web/static/showcase/`.
+
+### 📚 Paper Explainers and Knowledge Cards
+
+<p align="center">
+  <img src="assets/readme/showcase/spatialevo-cards-strip.jpg" width="49%" alt="SpatialEvo explainer cards">
+  <img src="assets/readme/showcase/spatialladder-cards-strip.jpg" width="49%" alt="SpatialLadder explainer cards">
+</p>
+<p align="center">
+  <img src="assets/readme/showcase/culture-mt-cards-strip.jpg" width="49%" alt="CULTURE-MT research cards">
+  <img src="assets/readme/showcase/knowu-cards-strip.jpg" width="49%" alt="KnowU-Bench explainer cards">
+</p>
+
+### 📖 Novels and Stories
+
+<p align="center">
+  <img src="assets/readme/showcase/novel-xiuxian.png" width="24%" alt="Comedy cultivation story">
+  <img src="assets/readme/showcase/novel-horror.png" width="24%" alt="Horror short story">
+  <img src="assets/readme/showcase/novel-romance.png" width="24%" alt="Romantic comedy">
+  <img src="assets/readme/showcase/novel-seventh.png" width="24%" alt="Suspense story">
+</p>
+
+### 🌿 Lifestyle and Meme Content
+
+<p align="center">
+  <img src="assets/readme/showcase/life-color-cards-strip.jpg" width="49%" alt="Colorful lifestyle cards">
+  <img src="assets/readme/showcase/life-mountain-cards-strip.jpg" width="49%" alt="Nature cards">
+</p>
+<p align="center">
+  <img src="assets/readme/showcase/life-chengdu-cards-strip.jpg" width="49%" alt="Chengdu lifestyle cards">
+  <img src="assets/readme/showcase/jokes-cards-strip-wide.jpg" width="49%" alt="Meme cards">
+</p>
+
+### 🎬 Finished Videos
+
+For faster browsing, each cover opens a lightweight preview of up to one minute. Use the links beneath each row for the full videos.
+
+<p align="center">
+  <a href="assets/readme/videos/preview/spatialladder-explainer.mp4"><img src="assets/readme/videos/thumbnails/spatialladder-explainer.jpg" width="49%" alt="Play SpatialLadder preview"></a>
+  <a href="assets/readme/videos/preview/culture-mt-explainer.mp4"><img src="assets/readme/videos/thumbnails/culture-mt-explainer.jpg" width="49%" alt="Play CULTURE-MT preview"></a>
+</p>
+<p align="center"><sub>Full videos: <a href="assets/readme/videos/full/spatialladder-explainer.mp4">SpatialLadder</a> · <a href="assets/readme/videos/full/culture-mt-explainer.mp4">CULTURE-MT</a></sub></p>
+
+<p align="center">
+  <a href="assets/readme/videos/preview/ordinary-person.mp4"><img src="assets/readme/videos/thumbnails/ordinary-person.jpg" width="24%" alt="Play Ordinary Person preview"></a>
+  <a href="assets/readme/videos/preview/hanako-change.mp4"><img src="assets/readme/videos/thumbnails/hanako-change.jpg" width="24%" alt="Play Hanako preview"></a>
+  <a href="assets/readme/videos/preview/cyber-cultivation.mp4"><img src="assets/readme/videos/thumbnails/cyber-cultivation.jpg" width="24%" alt="Play cyber cultivation preview"></a>
+  <a href="assets/readme/videos/preview/cyber-turtle.mp4"><img src="assets/readme/videos/thumbnails/cyber-turtle.jpg" width="24%" alt="Play cyber turtle preview"></a>
+</p>
+<p align="center"><sub>Full videos: <a href="assets/readme/videos/full/ordinary-person.mp4">Ordinary Person</a> · <a href="assets/readme/videos/full/hanako-change.mp4">Hanako's Change</a> · <a href="assets/readme/videos/full/cyber-cultivation.mp4">Cyber Cultivation</a> · <a href="assets/readme/videos/full/cyber-turtle.mp4">Cyber Turtle Mukbang</a></sub></p>
+
+<p align="center">
+  <a href="assets/readme/videos/preview/jilong-news.mp4"><img src="assets/readme/videos/thumbnails/jilong-news.jpg" width="32%" alt="Play Jilong news preview"></a>
+  <a href="assets/readme/videos/preview/daomu-book.mp4"><img src="assets/readme/videos/thumbnails/daomu-book.jpg" width="32%" alt="Play Daomu Biji preview"></a>
+  <a href="assets/readme/videos/preview/zju-intro.mp4"><img src="assets/readme/videos/thumbnails/zju-intro.jpg" width="32%" alt="Play Zhejiang University preview"></a>
+</p>
+<p align="center"><sub>Full videos: <a href="assets/readme/videos/full/jilong-news.mp4">Jilong Landslide News</a> · <a href="assets/readme/videos/full/daomu-book.mp4">Daomu Biji Introduction</a> · <a href="assets/readme/videos/full/zju-intro.mp4">Zhejiang University</a></sub></p>
+
+## 🚀 Quick Start
+
+Requirements: Linux, macOS, or Windows 10/11, Python 3.10+, and Git. The installer checks Node.js 24.22.1+ (24.x), 26.12.1+ (26.x), or 27+ (25.x is unsupported), plus FFmpeg and Playwright/Chromium. It provides a platform-specific guide when Node.js is missing.
+
+```bash
+git clone git@github.com:ZJU-REAL/Easel.git
+cd Easel
+bash setup.sh
+source .venv/bin/activate    # easel is installed in .venv; activate it first (Windows: .venv\Scripts\activate)
+easel web
+# Or: easel chat
+```
+
+> If you see `easel: command not found`, the virtual environment is not activated. You can also run it by full path without activating, e.g. `.venv/bin/easel doctor` (Windows: `.venv\Scripts\easel.exe doctor`).
+
+For native Windows 10/11, run the following in PowerShell; WSL and Bash are not required:
+
+```powershell
+git clone https://github.com/ZJU-REAL/Easel.git
+cd Easel
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1
+.\.venv\Scripts\easel.exe doctor
+.\.venv\Scripts\easel.exe web
+```
+
+The Windows installer uses `winget` to install missing system tools when available, creates `.venv`, installs Python and frontend dependencies, builds the Web UI, and installs Playwright Chromium. Easel uses an isolated `easel` OpenClaw profile. Windows PowerShell 5.1 is supported. Native installation and the Web/CLI entry points are available; broader Windows compatibility across individual skills and browser publishing is still being improved.
+
+`bash setup.sh` is a rerunnable installer. It detects and reuses an existing local OpenClaw
+installation without touching `~/.openclaw/`; Easel uses its isolated `~/.openclaw-easel/` profile.
+
+**Configure your model API key in the browser — the installer no longer asks for it in the terminal.**
+After installing, run `easel web`; on first open it takes you straight to *Settings → Model config*.
+Enter your key and save, and Easel writes the OpenClaw configuration and restarts the gateway for you
+— no need to rerun `setup.sh`. The panel can also list a provider's available models and run a
+connectivity self-test, neither of which the old terminal prompt could do. Alternatively, copy
+`.env.example`, fill in a key, and run `easel doctor` to re-check.
+
+The installer is fully non-interactive apart from one question (whether to create `.venv`, which takes
+its default when stdin is not a TTY), so it is safe for CI. Non-fatal problems — FFmpeg, Chromium,
+gateway startup, missing model config — are collected into a summary at the end and written to
+`outputs/_install/last-install.json` for `easel doctor` to repeat; the install itself still exits 0.
+Set `EASEL_SETUP_STRICT=1` to turn those warnings back into hard failures.
+
+Open `http://localhost:7860` for the Web workspace. Run `easel doctor` to check the environment and `easel ping` to verify the gateway and Agent connection.
+
+When Easel runs on a server accessed through VSCode Remote SSH, forward server port `7860`
+in VSCode's Ports panel and open the displayed local forwarded address; the local port may differ.
+The server's `localhost` is not your computer's. Do not expose an unauthenticated workspace publicly.
+
+The installer installs the Python dependencies required by the Web UI, media processing, and browser publishing:
+
+```bash
+pip install -e .
+python -m playwright install chromium
+# FFmpeg is also required on the system.
+```
+
+## ⚙️ Configuration
+
+The minimum configuration is a usable LLM in the project-root `.env` file:
+
+```bash
+ANTHROPIC_API_KEY=your_api_key
+CLAUDE_MODEL=anthropic/claude-sonnet-4-6
+```
+
+`.env.example` also documents optional video, music, voice, and Anthropic-compatible provider settings. Configure only the capabilities you use. Missing media-provider credentials do not prevent chat, planning, or text creation.
+
+Custom chat providers in Web Settings expose a “该模型会思考” (reasoning-capable) checkbox.
+Enabling it writes `reasoning: true`; OpenAI-compatible providers also offer a thinking format
+(OpenAI, DeepSeek, etc.) that must match the upstream API. Native Anthropic uses its own format.
+New rows default to off, while existing declarations are shown. Disabling reasoning writes
+`reasoning: false` and removes only reasoning-related compatibility keys, preserving other
+capabilities. Omitting `thinking` from the save API preserves existing declarations; enabling
+it preserves existing effort mappings rather than guessing supported effort levels.
+The format is stored as OpenClaw's `compat.thinkingFormat`; actual wire parameters depend
+on its version and model adapter. For example, OpenClaw 2026.9.8 may still send only
+`reasoning_effort` for generic custom models; this is not an arbitrary dialect converter.
+This declares capability, not verified upstream support, and does not override
+`EASEL_THINKING_LEVEL=off`. The switch is not available in direct API mode.
+For a current model explicitly marked `reasoning: false`, Web uses `--thinking off`
+when invoking the OpenClaw CLI rather than requesting an unsupported `medium` level.
+
+| Capability | Configuration | Additional dependency |
+|---|---|---|
+| AI video | `VIDEO_PROVIDER` plus the provider key, URL, and model | A supported video service |
+| AI music | `MUSIC_PROVIDER` plus provider settings | A supported music service |
+| Cloud voice | `VOICE_PROVIDER` plus provider settings | A supported voice service |
+| Local media processing | No model is required for supported local tools | FFmpeg |
+| Browser publishing | Log in from the Web workspace's Accounts page | Playwright Chromium and valid platform accounts |
+
+Never commit `.env`, cookies, or platform login state. Real publishing can be affected by verification, permissions, platform risk controls, and UI changes; use previews and checks for the first attempt.
+
+The Publishing Center offers **Automatic publishing / Human-reviewed publishing**, retaining the existing automatic workflow by default. The manual path uses AI formatting, human review, copy/export, and personal submission on the official platform page. Editing the copy, tags, or media invalidates the previous review; copying, exporting, and scheduling never mark a post as published. WeChat Official Accounts support rich-text copy and an HTML preview. Switching paths does not change global publishing permissions; set `EASEL_PUBLISH_MODE=manual` to disable automatic Web submissions on the backend. See [the manual publishing guide](docs/manual-publishing.md) for configuration, browser login boundaries, and exports.
+
+## 🧩 Using Easel
+
+| Command | Purpose |
+|---|---|
+| `easel web [--port 7860]` | Start the Web workspace |
+| `easel chat` | Start a multi-turn terminal conversation and select an account profile |
+| `easel skill <name> -i "..." [-p <profile>]` | Run a Skill directly; input may also be a file path |
+| `easel doctor` | Check Python, Node.js, OpenClaw, and essential configuration |
+| `easel ping` | Check the gateway and Agent connection |
+| `easel gateway start\|stop\|restart\|status\|logs` | Manage the OpenClaw gateway |
+
+```bash
+easel skill quality-gate -i "Review this social media post"
+easel skill social-content -i "Write a post introducing spatial intelligence"
+easel skill quality-gate -i "Review this draft" -p MyCreatorProfile
+```
+
+## 🧬 Account Profiles
+
+Each profile is stored under `profiles/<name>/` and contains six dimensions: identity, style, audience, platforms, preferences and boundaries, and long-term memory.
+
+```bash
+cp -r profiles/_template "profiles/MyCreatorProfile"
+```
+
+Profiles can also be created and edited from the Web workspace.
+
+## 🏗️ Project Structure
+
+```text
+Easel/
+├── easel/                    Python CLI
+├── web/                      FastAPI backend and React workspace
+├── skills/builtin/           Discover, plan, produce, publish, and attribution Skills
+├── skills/shared/            Shared scripts and references
+├── assets/                   Brand, README media, and imported assets
+├── profiles/                 Account profiles
+├── outputs/                  Content projects and final deliverables
+├── agents/                   Shared Agent workspace, harness configuration, and sync scripts
+└── docs/                     Specifications, capability map, and architecture docs
+```
+
+Easel uses an isolated `easel` OpenClaw profile and does not overwrite an existing OpenClaw setup. The Web workspace defaults to port `7860`; the gateway port is chosen by OpenClaw (non-default profiles get a hashed port — `easel` → `37289`, not `18789`) and is resolved automatically by Easel.
+
+Hermes Agent is also available in **Settings → Agent runtime**, through its native ACP server and a separate `easel` profile. Credentials stay in Hermes; the default OpenClaw setup remains available. See [the Harness guide](docs/agent-harnesses.md).
+
+## 📑 Documentation
+
+- [Trend collectors: Python scripts / HTTP services / RSS feeds (Chinese)](docs/trend-collectors.md)
+- [Capability map](docs/skill-function-mapping.md)
+- [SKILL interface specification](docs/SKILL-SPEC.md)
+- [Prompt and architecture layers](docs/prompt-stack.md)
+- [Context budget diagnostics](docs/context-budget-diagnostics.md)
+- [Known issues](docs/known-issues_EN.md)
+- [Full acknowledgments](docs/ACKNOWLEDGMENTS.md)
+
+## 🗺️ Roadmap
+
+Ordered by priority — contributions welcome; feel free to claim or add items via Issues/PRs:
+
+- [ ] **1. Windows support** — Complete native Windows compatibility across installation, paths/encoding, and browser publishing.
+- [ ] **2. Simpler installation** — Lower the barrier to entry with fewer manual steps and a smoother one-click setup.
+- [ ] **3. Better in-app Agent UX** — Improve the Web workbench's chat interaction, loading logic, and streaming feedback.
+- [ ] **4. More Agent harnesses** — Improve the existing Codex / OpenCode integrations and support additional runtimes such as Claude Code and DeepSeek harness. See [Agent harness integration](docs/agent-harnesses.md) for switching between existing engines.
+
+## 🙏 Acknowledgments
+
+Easel's Skill system and workflows benefit from many excellent open-source projects, tools, and content methodologies. We thank their original authors and contributors. See the [full acknowledgments](docs/ACKNOWLEDGMENTS.md) for projects, usage, and license information.
+
+Contributions and discussion are welcome. If you have ideas, questions, or improvements, feel free to open an Issue or PR — or scan the QR code to join our WeChat group:
+
+<p align="center">
+  <img src="assets/readme/wechat-group.png" width="240" alt="Easel WeChat group QR code">
+</p>
+<p align="center"><sub>Easel WeChat group · the QR code is refreshed periodically; if it has expired, reach us via Issues</sub></p>
+
+### 🤝 Contributors
+
+<table>
+  <tr>
+    <td align="center" width="84"><a href="https://github.com/lidingm"><img src="https://github.com/lidingm.png?size=96" width="72" height="72" alt="lidingm"><br><strong>lidingm</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/qywMichelle"><img src="https://github.com/qywMichelle.png?size=96" width="72" height="72" alt="qywMichelle"><br><strong>qywMichelle</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/wulinjuan"><img src="https://github.com/wulinjuan.png?size=96" width="72" height="72" alt="wulinjuan"><br><strong>wulinjuan</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/arctanxarc"><img src="https://github.com/arctanxarc.png?size=96" width="72" height="72" alt="arctanxarc"><br><strong>arctanxarc</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/hongxingli319"><img src="https://github.com/hongxingli319.png?size=96" width="72" height="72" alt="hongxingli319"><br><strong>hongxingli319</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/mengyuyuan"><img src="https://github.com/mengyuyuan.png?size=96" width="72" height="72" alt="mengyuyuan"><br><strong>mengyuyuan</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/Dear47"><img src="https://github.com/Dear47.png?size=96" width="72" height="72" alt="Dear47"><br><strong>Dear47</strong></a></td>
+  </tr>
+</table>
+
+## ⚖️ License
+
+[Apache 2.0](LICENSE)
+
+## 🌟 Star History
+
+<p align="center">
+  <a href="https://star-history.com/#ZJU-REAL/Easel&Date">
+    <img src="https://api.star-history.com/svg?repos=ZJU-REAL/Easel&type=Date" width="720" alt="Easel Star History Chart">
+  </a>
+</p>

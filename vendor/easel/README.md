@@ -1,0 +1,442 @@
+<p align="left">
+  <img src="assets/readme/logos/zhejiang_university_horizontal_readme.png#gh-light-mode-only" width="106" align="middle" alt="Zhejiang University">
+  <img src="assets/readme/logos/zhejiang_university_horizontal_dark.png#gh-dark-mode-only" width="106" align="middle" alt="Zhejiang University">
+  &nbsp;&nbsp;&nbsp;
+  <img src="assets/readme/logos/peking_university_horizontal_red.png#gh-light-mode-only" width="98" align="middle" alt="Peking University">
+  <img src="assets/readme/logos/peking_university_horizontal_dark.png#gh-dark-mode-only" width="98" align="middle" alt="Peking University">
+</p>
+
+<p align="center">
+  <img src="assets/readme/brand.png#gh-light-mode-only" width="640" alt="Easel">
+  <img src="assets/readme/brand-dark.png#gh-dark-mode-only" width="640" alt="Easel">
+  <br>
+  <img src="assets/readme/logos/real_lab_horizontal_readme.png" width="74" alt="REAL Lab">&thinsp;&thinsp;<img src="assets/readme/logos/opendcai_lab_horizontal_readme.png#gh-light-mode-only" width="83" alt="OpenDCAI Lab"><img src="assets/readme/logos/opendcai_lab_horizontal_readme_dark.png#gh-dark-mode-only" width="83" alt="OpenDCAI Lab">
+</p>
+
+<p align="center">
+  <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_JA.md">日本語</a>
+</p>
+
+<p align="center">
+  你的私人、持续进化的社媒运营助手<br>
+  从一个想法开始，完成发现、策划、创作、发布与复盘。
+</p>
+
+<p align="center">
+  <a href="https://zju-real.github.io/Easel/"><img src="https://img.shields.io/badge/Easel-Project_Page-F05A3C?style=flat-square&logo=googlechrome&logoColor=white" alt="Easel Project Page"></a>
+  <img src="https://img.shields.io/badge/OpenClaw-powered-111827?style=flat-square" alt="Powered by OpenClaw">
+  <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+">
+  <a href="docs/skill-function-mapping.md"><img src="https://img.shields.io/badge/Skills-113-0F9D8A?style=flat-square" alt="113 Skills"></a>
+  <a href="https://github.com/ZJU-REAL/Easel/stargazers"><img src="https://img.shields.io/github/stars/ZJU-REAL/Easel?style=flat-square&color=F6C344" alt="GitHub Stars"></a>
+  <a href="https://github.com/ZJU-REAL/Easel/releases/latest"><img src="https://img.shields.io/github/v/release/ZJU-REAL/Easel?style=flat-square&color=0F9D8A&label=release" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-2EA44F?style=flat-square" alt="License: Apache 2.0"></a>
+  <a href="assets/readme/wechat-group.png"><img src="https://img.shields.io/badge/微信群-加入交流-07C160?style=flat-square&logo=wechat&logoColor=white" alt="WeChat Group"></a>
+</p>
+
+<p align="center">
+  <a href="https://trendshift.io/repositories/195527?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-195527" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/195527/daily?language=Python" alt="ZJU-REAL%2FEasel | Trendshift" width="250" height="55"/></a> <a href="https://trendshift.io/repositories/195527?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-195527" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/195527/weekly?language=Python" alt="ZJU-REAL%2FEasel | Trendshift" width="250" height="55"/></a>
+</p>
+
+![Easel 产品宣传海报](assets/readme/poster.png)
+
+## 🎨 Easel 是什么
+
+Easel 是一个面向社交媒体创作者的开源内容工作台。它把 OpenClaw Agent、账号画像、内容技能和真实的媒体工具接在一起，让 Agent 不只回答“应该怎么做”，而是直接把内容做出来并归档，且可实现直接/按需发布。
+
+你可以把它理解成一个会记住你的内容搭档：它了解账号定位、受众、风格、平台限制和历史表现，从热点发现一直陪你做到发布，再把结果带回下一次创作。
+
+Easel 宣传演示：
+
+https://github.com/user-attachments/assets/4dd060dc-53dd-4bb2-99a3-e65ab6f65166
+
+Easel 围绕五个连续工作流展开：**发现**适合账号的热点与机会，**策划**选题、标题、脚本和排期，
+**创作**图文、音频与视频内容，**发布**经过检查和平台适配的成品直接到对应平台，再通过**归因**分析表现并把有效经验沉淀回账号画像。
+
+#### 📌 使用提示与研究愿景
+
+> - **推荐使用 Web 前端**：前端提供完整的会话、素材、账号、画像、内容库和发布管理能力，体验和功能比单独使用 CLI 更全面，也是我们推荐的使用方式；部分终端专有的显示问题见[已知问题](docs/known-issues.md)。
+> - **谨慎自动发布到小红书**：小红书平台可能检测自动化操作，存在验证、限流或账号风控风险；建议使用预览与发布前检查，并由用户确认后手动发布，其他平台正常。
+> - **从研究走向真实生活**：Easel 是我们将研究成果应用到真实社媒创作场景的一次实践。后续我们会继续研究 AI 在社媒场景中的社交智能，让 Agent 更好地理解创作者、受众与真实互动。
+
+## ✨ 为什么是 Easel
+
+- **一个 Agent 贯穿完整链路**：发现热点、评估选题、规划日历、生成文案与视觉、制作视频、发布和归因在同一个工作流中完成。
+- **画像驱动，而不是一次性生成**：每个账号有独立的定位、风格、受众、平台、偏好和记忆，输出会越来越贴合真实账号。
+- **技能是真执行，不是功能清单**：图片、卡片、配音、字幕、剪辑、短剧和发布技能都配有可运行脚本，成品写入 `outputs/`。
+- **一份素材，多种平台形态**：同一主题可以改写成小红书卡片、短视频、知乎长文或短帖，并遵循不同平台的格式和字数要求。
+- **项目化保存产物**：内容、素材、中间文件和元数据按项目归档，后续修改、重试和发布不会散落在聊天记录里。
+- **真实发布与复盘闭环**：目前支持小红书、抖音、快手、知乎、B 站、微信视频号、微信公众号、推特 X、掘金、今日头条十个平台的登录、适配和发布，并可回收账号数据。
+
+## 🧭 五层内容工作流
+
+1. **发现**：聚合热榜、行业新闻、竞品动态和用户讨论，筛选真正适合账号的机会。
+2. **策划**：把机会变成选题、标题、脚本和内容矩阵，写入内容日历。
+3. **创作**：生成文案、卡片、海报、信息图、音频、视频、短剧和论文解读等可发布素材。
+4. **发布**：按平台适配标题、正文、画幅和媒体要求，执行发布前检查并发送到已登录账号。
+5. **归因**：读取播放、互动、评论和内容表现，把有效结构和偏好沉淀回账号画像。
+
+## 🧰 已经落地的能力
+
+| 能力层 | 已实现功能 |
+|---|---|
+| **发现** | 全网热搜聚合、垂类趋势研究、内容缺口分析、节日与事件日历、平台算法动态、竞品分析、行业资讯、跨平台差异、RSS 聚合、UGC 发现 |
+| **策划** | 账号定位分析、受众画像、人设与声音构建、账号诊断、选题矩阵、选题评分、热点结合、系列内容规划、标题与 Hook、文章大纲、分镜脚本、内容日历、跨平台复用、直播策划、营销活动与商单方案 |
+| **文字与视觉** | 社媒文案、短视频与中长视频脚本、小红书笔记、长文、小说、去 AI 感改写、风格迁移、论文解读、金句卡、小红书知识卡、海报、信息图、数据图表、思维导图、对比图、电商详情图、Meme、AI 生图、图片增强、去背景与批处理 |
+| **音频与视频** | 文字转语音、多角色配音、声音克隆、AI 音乐、降噪、混音、语音转文字、音频可视化、AI 视频、AI 短剧、字幕与翻译、视频剪辑、长视频切片、直播高光、横竖版转换、片头片尾、相册视频、音乐卡点、绿幕换背景、视频转图文与章节目录 |
+| **发布与归因** | 发布质量门禁、敏感与版权风险检查、平台搜索优化、发布 Checklist、多平台格式适配；小红书、抖音、快手、知乎、B 站、微信视频号、微信公众号、推特 X、掘金、今日头条登录与发布；内容日历回写、账号数据、评论洞察（掘金走公开 JSON 接口、X 走网页 DOM 采集）、内容复盘、ROI 与画像记忆 |
+
+## 🖥️ 工作台功能示例
+
+下面只展示 Easel 工作台中的四个代表性功能，并不是完整功能清单。更多发现、策划、创作、发布和归因能力，
+可以在工作台的技能库或[能力地图](docs/skill-function-mapping.md)中查看。
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>🧬 账号画像</strong><br>
+      <sub>通过基础信息、社媒链接、运营意图和偏好红线建立账号上下文；一份画像可以跨多个平台和会话持续使用。</sub><br><br>
+      <img src="assets/readme/features/profile.png" width="100%" alt="Easel 账号画像配置">
+    </td>
+    <td width="50%" valign="top">
+      <strong>🔥 热点雷达</strong><br>
+      <sub>聚合现有平台热榜，并通过标准协议接入你自己的 Python 采集脚本、HTTP 服务或 RSS/Atom 订阅，从更多来源寻找适合账号的选题。</sub><br><br>
+      <img src="assets/readme/features/discover.png" width="100%" alt="Easel 多平台热点雷达">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>📅 内容日历</strong><br>
+      <sub>统一管理选题、草稿、待发、已发和平台活动，结合节日节点规划内容，并记录每一天的发布安排。</sub><br><br>
+      <img src="assets/readme/features/calendar.png" width="100%" alt="Easel 内容日历">
+    </td>
+    <td width="50%" valign="top">
+      <strong>📣 发布中心</strong><br>
+      <sub>从一份母版内容生成多平台版本，集中完成格式适配、媒体附件、发布前检查、预览和真实发布。</sub><br><br>
+      <img src="assets/readme/features/publish.png" width="100%" alt="Easel 多平台发布中心">
+    </td>
+  </tr>
+</table>
+
+## 🖼️ 真实产物
+
+这些文件来自 Easel 的实际工作流，主页中也有同一批案例的分类展示。
+README 的品牌图、海报、案例图片和视频统一保存在 `assets/readme/`；产品主页使用独立的
+`web/static/showcase/` 素材，其中视频保持为 6 秒轻量预览。
+
+### 📚 论文解读与知识卡片
+
+<p align="center">
+  <img src="assets/readme/showcase/spatialevo-cards-strip.jpg" width="49%" alt="SpatialEvo 论文解读卡片">
+  <img src="assets/readme/showcase/spatialladder-cards-strip.jpg" width="49%" alt="SpatialLadder 论文解读卡片">
+</p>
+<p align="center"><sub>SpatialEvo · 论文解读　/　SpatialLadder · VLM 视觉叙事</sub></p>
+
+<p align="center">
+  <img src="assets/readme/showcase/culture-mt-cards-strip.jpg" width="49%" alt="CULTURE-MT 研究卡片">
+  <img src="assets/readme/showcase/knowu-cards-strip.jpg" width="49%" alt="KnowU-Bench 论文解读卡片">
+</p>
+<p align="center"><sub>CULTURE-MT · 文化翻译　/　KnowU-Bench · 侦探漫画</sub></p>
+
+<p align="center">
+  <img src="assets/readme/showcase/agentg2-cards-strip.jpg" width="49%" alt="AGENT G2 论文解读卡片">
+  <img src="assets/readme/showcase/pause-cards-strip.jpg" width="49%" alt="Pause or Fabricate 论文解读卡片">
+</p>
+<p align="center"><sub>AGENT G2 · 暗夜英雄　/　Pause or Fabricate · 角色化科普</sub></p>
+
+### 📖 小说与故事
+
+<p align="center">
+  <img src="assets/readme/showcase/novel-xiuxian.png" width="24%" alt="外门弟子整顿修仙界">
+  <img src="assets/readme/showcase/novel-horror.png" width="24%" alt="中元节那晚">
+  <img src="assets/readme/showcase/novel-romance.png" width="24%" alt="我和相亲对象互演正常人">
+  <img src="assets/readme/showcase/novel-seventh.png" width="24%" alt="第七格">
+</p>
+<p align="center"><sub>搞笑修仙　/　恐怖短篇　/　爱情喜剧　/　悬疑故事</sub></p>
+
+### 🌿 生活分享与梗内容
+
+<p align="center">
+  <img src="assets/readme/showcase/life-color-cards-strip.jpg" width="49%" alt="丰富多彩的生活">
+  <img src="assets/readme/showcase/life-mountain-cards-strip.jpg" width="49%" alt="大山大水">
+</p>
+<p align="center"><sub>生活方式　/　自然记录</sub></p>
+
+<p align="center">
+  <img src="assets/readme/showcase/life-chengdu-cards-strip.jpg" width="49%" alt="成都乡土生活">
+  <img src="assets/readme/showcase/jokes-cards-strip-wide.jpg" width="49%" alt="开学趣事梗卡">
+</p>
+<p align="center"><sub>城市生活　/　梗内容</sub></p>
+
+### 🎬 视频成片
+
+为便于快速浏览，这里使用可点击的视频封面。点击封面查看最长 1 分钟的轻量预览，点击封面下方的标题
+查看完整成片。
+
+**论文解读视频**
+
+<p align="center">
+  <a href="assets/readme/videos/preview/spatialladder-explainer.mp4"><img src="assets/readme/videos/thumbnails/spatialladder-explainer.jpg" width="49%" alt="播放 SpatialLadder 论文解读预览"></a>
+  <a href="assets/readme/videos/preview/culture-mt-explainer.mp4"><img src="assets/readme/videos/thumbnails/culture-mt-explainer.jpg" width="49%" alt="播放 CULTURE-MT 论文解读预览"></a>
+</p>
+<p align="center"><sub>▶ 点击封面播放预览 · 查看完整视频：<a href="assets/readme/videos/full/spatialladder-explainer.mp4">SpatialLadder</a>　/　<a href="assets/readme/videos/full/culture-mt-explainer.mp4">CULTURE-MT</a></sub></p>
+
+**口播、连续剧与 AI 角色短视频**
+
+<p align="center">
+  <a href="assets/readme/videos/preview/ordinary-person.mp4"><img src="assets/readme/videos/thumbnails/ordinary-person.jpg" width="24%" alt="播放普通人口播剧预览"></a>
+  <a href="assets/readme/videos/preview/hanako-change.mp4"><img src="assets/readme/videos/thumbnails/hanako-change.jpg" width="24%" alt="播放花子的转变预览"></a>
+  <a href="assets/readme/videos/preview/cyber-cultivation.mp4"><img src="assets/readme/videos/thumbnails/cyber-cultivation.jpg" width="24%" alt="播放赛博修仙预览"></a>
+  <a href="assets/readme/videos/preview/cyber-turtle.mp4"><img src="assets/readme/videos/thumbnails/cyber-turtle.jpg" width="24%" alt="播放赛博吃播甲鱼预览"></a>
+</p>
+<p align="center"><sub>▶ 点击封面播放预览 · 查看完整视频：<a href="assets/readme/videos/full/ordinary-person.mp4">普通人</a>　/　<a href="assets/readme/videos/full/hanako-change.mp4">花子的转变</a>　/　<a href="assets/readme/videos/full/cyber-cultivation.mp4">赛博修仙</a>　/　<a href="assets/readme/videos/full/cyber-turtle.mp4">赛博吃播甲鱼</a></sub></p>
+
+**氛围影像与横版内容**
+
+<p align="center">
+  <a href="assets/readme/videos/preview/jilong-news.mp4"><img src="assets/readme/videos/thumbnails/jilong-news.jpg" width="32%" alt="播放西藏吉隆泥石流预览"></a>
+  <a href="assets/readme/videos/preview/daomu-book.mp4"><img src="assets/readme/videos/thumbnails/daomu-book.jpg" width="32%" alt="播放盗墓笔记小说介绍预览"></a>
+  <a href="assets/readme/videos/preview/zju-intro.mp4"><img src="assets/readme/videos/thumbnails/zju-intro.jpg" width="32%" alt="播放浙江大学介绍预览"></a>
+</p>
+<p align="center"><sub>▶ 点击封面播放预览 · 查看完整视频：<a href="assets/readme/videos/full/jilong-news.mp4">西藏吉隆泥石流</a>　/　<a href="assets/readme/videos/full/daomu-book.mp4">盗墓笔记小说介绍</a>　/　<a href="assets/readme/videos/full/zju-intro.mp4">浙江大学</a></sub></p>
+
+## 🚀 快速开始
+
+环境要求：Linux、macOS 或 Windows 10/11、Python 3.10 及以上、Python `venv` 模块和 `git`。安装向导会检查 Node.js 24.22.1+（24.x）、26.12.1+（26.x）或 27+（25.x 不兼容）、FFmpeg、Playwright/Chromium；缺少 Node.js 时会按系统给出安装引导。
+
+```bash
+git clone https://github.com/ZJU-REAL/Easel.git
+cd Easel
+bash setup.sh
+```
+
+Windows 原生安装请在 PowerShell 中执行（不需要 WSL）：
+
+```powershell
+git clone https://github.com/ZJU-REAL/Easel.git
+cd Easel
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1
+```
+
+Windows 安装器会优先通过 `winget` 自动安装缺失的 Python 3.10+、Node.js 24.22.1+（24.x）、26.12.1+（26.x）或 27+、Git 和 FFmpeg；25.x 不兼容。如果系统没有 `winget`，再使用官方安装器安装并加入 PATH。随后安装器会创建项目内 `.venv`，安装 Python/Node 依赖、前端生产包和 Playwright Chromium，并使用独立的 `easel` OpenClaw profile。安装完成后可运行 `.venv\Scripts\easel.exe doctor` 检查环境。
+
+安装器支持 Windows 自带的 PowerShell 5.1，安装后可直接运行 `.venv\Scripts\easel.exe web` 启动工作台。原生安装与 Web/CLI 入口已经提供；各技能及浏览器发布的 Windows 全链路兼容仍在持续完善。
+
+`bash setup.sh` 是可重复运行的引导式安装器，直接执行即可，不需要先手动安装 Easel 依赖。安装过程中会：
+
+1. 检查 Python、Python `venv`、Node.js 和 Git；FFmpeg 缺失时会尝试通过系统包管理器安装，装不上只会降级提示（视频/音频类技能不可用），不再中断安装。
+2. 询问是否创建或复用项目虚拟环境 `.venv/`；默认选择 `Y`。如果系统缺少 `venv`，会提示安装对应系统包（例如 Debian/Ubuntu 的 `python3-venv`）。
+3. 检查或安装 OpenClaw，并创建独立的 `easel` profile，不覆盖用户已有的 `~/.openclaw/`。
+4. 安装 Python、Web、媒体和浏览器发布依赖，构建 React Web 工作台并安装 Chromium。Python 依赖与前端构建失败会停止；Chromium 下载失败只降级提示（浏览器登录/发布不可用）。
+5. 同步 skills、校验 OpenClaw 配置并启动 gateway。
+
+**模型 API Key 在浏览器里配，安装器不再在终端询问。** 装完运行 `easel web`，首次打开会直接停在「设置 → 模型配置」，填入 Key 保存即可 —— Easel 会自动写好 OpenClaw 配置并重启 gateway，不需要再跑一遍 `setup.sh`。相比终端向导，这里还能拉取可用模型列表、做连通性自测。也可以直接编辑 `.env` 填好 Key，再运行 `easel doctor` 复检。
+
+安装器全程非交互（只有「是否创建 `.venv`」一问，非交互环境下按默认值），适合 CI 与自动化。非致命问题（FFmpeg、Chromium、gateway 启动、模型未配置等）会收集起来在结尾汇总，并写入 `outputs/_install/last-install.json` 供 `easel doctor` 复述，安装本身仍以 0 退出。若希望这些问题直接让安装失败，设 `EASEL_SETUP_STRICT=1`。
+
+安装完成后，`easel` 命令安装在项目的 `.venv` 中。先激活虚拟环境再运行（每次新开终端都要先激活）：
+
+```bash
+source .venv/bin/activate    # 激活后 easel 命令才可用（Windows：.venv\Scripts\activate）
+easel doctor                 # 检查运行环境
+easel ping                   # 实际测试 gateway 和 Agent
+easel web                    # 启动 Web 工作台
+# 或：easel chat              # 启动终端对话
+```
+
+> 如果提示 `easel: command not found`，就是虚拟环境没激活。也可以不激活、直接用完整路径运行，例如 `.venv/bin/easel doctor`（Windows：`.venv\Scripts\easel.exe doctor`）。
+
+启动 Web 工作台后访问 `http://localhost:7860`。安装完成后可以运行 `easel doctor` 检查环境，
+运行 `easel ping` 检查 gateway 和 Agent 连通性。
+
+如果 Easel 运行在 VSCode Remote SSH 连接的服务器上，需要在 VSCode 的“端口”面板
+转发服务器端口 `7860`，再打开面板显示的本地转发地址（本地端口可能不同）。
+服务器的 `localhost` 不是你电脑的 `localhost`；不要为了访问而把无认证的工作台暴露到公网。
+
+安装器会统一安装 Web、媒体处理和浏览器发布所需的 Python 依赖：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -e .
+python3 -m playwright install chromium
+# 手动安装时仍需提前安装 ffmpeg
+```
+
+## ⚙️ 配置说明
+
+最小配置只需要在项目根目录 `.env` 中提供一个可用的 LLM：
+
+```bash
+ANTHROPIC_API_KEY=你的_API_Key
+CLAUDE_MODEL=anthropic/claude-sonnet-4-6
+```
+
+也可以使用 OpenAI 或 OpenAI-compatible 服务：
+
+```bash
+OPENAI_API_KEY=你的_API_Key
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o
+```
+
+如果聊天 API 不提供向量模型，请单独配置 Embedding API；否则 OpenClaw 会默认请求 `text-embedding-3-small`，可能得到“模型不可用”。不配置独立向量 API 时，Easel 会显式使用关键词记忆检索，不会反复请求聊天端点的 embedding 模型：
+
+```dotenv
+EASEL_EMBEDDING_API_KEY=你的向量_API_Key
+EASEL_EMBEDDING_BASE_URL=https://your-embedding-provider.example/v1
+EASEL_EMBEDDING_MODEL=你的向量模型名
+```
+
+修改向量 provider 或模型后，使用对应 profile 重建一次索引：
+
+```bash
+openclaw --profile easel memory index --force
+```
+
+或者使用其他 Anthropic-compatible 服务：
+
+```bash
+EASEL_LLM_API_KEY=你的_API_Key
+EASEL_LLM_BASE_URL=https://你的服务地址/v1
+CLAUDE_MODEL=你的模型名
+```
+
+安装器会把这些标准配置同步到 OpenClaw。OpenClaw 支持但 Easel 没有预设环境变量映射的其他 provider，
+可以按 OpenClaw 自身的 provider/auth 配置方式配置；Easel 不会覆盖这些自定义配置。
+
+在 Web 设置的聊天通道中，自定义供应商可勾选“该模型会思考”，保存后会写入模型的
+`reasoning: true`。OpenAI 兼容协议还可选择思考格式（OpenAI、DeepSeek 等），需与上游
+接口实际支持的格式一致；原生 Anthropic 协议使用其自身的思考格式，无需另选。
+新增行默认关闭，避免对非推理模型发送不支持的参数；已有声明会回显。取消勾选会写入
+`reasoning: false`，仅移除该模型的思考相关兼容项，不影响工具等其它能力声明。
+保存 API 不传 `thinking` 时保持原有声明；启用时保留已有努力档位映射，不推测上游支持的档位。
+思考格式会写入 OpenClaw 的 `compat.thinkingFormat`，实际发送哪些参数由其版本和模型适配器决定；
+例如 OpenClaw 2026.9.8 对普通自定义模型仍可能只发送 `reasoning_effort`，不是任意方言转换器。
+这只是能力声明，不保证网关支持推理，亦不覆盖 `EASEL_THINKING_LEVEL=off`；
+API 直连模式不提供此 OpenClaw 专用开关。
+对显式声明 `reasoning: false` 的当前模型，Web 调用 OpenClaw CLI 时会使用 `--thinking off`，
+避免禁用后仍请求不支持的 `medium` 档位。
+
+`.env.example` 还列出了视频、音乐、语音等可选模型配置。只需要配置实际使用的能力，也可以在 Web
+工作台的“技能库”中填写；没有配置的媒体 Skill 不会影响聊天、策划和文本创作。常见可选项包括：
+
+| 能力 | 配置入口 | 额外依赖 |
+|---|---|---|
+| AI 视频 | `VIDEO_PROVIDER` 及对应服务的 Key、URL、模型 | 相应视频生成服务 |
+| AI 音乐 | `MUSIC_PROVIDER` 及对应服务配置 | 相应音乐生成服务 |
+| 云端配音 | `VOICE_PROVIDER` 及对应服务配置 | 相应语音生成服务 |
+| 图片与音视频处理 | 无额外模型时也可使用本地工具 | FFmpeg |
+| 浏览器发布 | 在 Web“账号”页面登录目标平台 | Playwright Chromium、有效平台账号 |
+
+## 🧩 使用 Easel
+
+发布中心提供“自动发布 / 人工审核发布”两条可选路径，默认保留原有自动发布流程。人工路径采用“AI 排版 → 人工审核 → 复制/导出 → 官方发布页亲自提交”，修改稿件或素材后需重新审核，导出和排期不等于已发布；公众号支持富文本复制和 HTML 预览。页面切换不更改全局发布权限；如需在 Web 后端禁用自动提交，可配置 `EASEL_PUBLISH_MODE=manual`。配置边界、登录状态和导出说明见[人工发布工作流](docs/manual-publishing.md)。
+
+常用入口：
+
+| 命令 | 作用 |
+|---|---|
+| `easel web [--port 7860]` | 启动 Web 工作台 |
+| `easel chat` | 在终端开启多轮对话并选择账号画像 |
+| `easel skill <name> -i "..." [-p <画像>]` | 直接运行指定 Skill；输入也可以是文件路径 |
+| `easel doctor` | 检查 Python、Node.js、OpenClaw 和关键配置 |
+| `easel ping` | 检查 gateway 与 Agent 连通性 |
+| `easel gateway start\|stop\|restart\|status\|logs` | 管理 OpenClaw gateway |
+
+所有技能都通过 Easel 的 Agent 执行。Agent 会读取对应 `SKILL.md`，调用脚本和工具，并把产物保存到 `outputs/`。
+
+```bash
+easel skill quality-gate -i "帮我检查这条小红书文案"
+easel skill social-content -i "写一条介绍空间智能的微博"
+easel skill quality-gate -i "这是一段待发布文案" -p 科技数码达人
+```
+
+Web 工作台提供同样的能力，并额外管理会话、素材、账号、画像、内容库和发布状态。拖入对话框的素材会作为结构化附件传给 Agent，用户消息只显示实际输入的文字。
+
+## 🧬 账号画像
+
+一个画像对应 `profiles/<名字>/` 目录，包含六个维度：定位、风格、受众、平台、偏好与红线、长期记忆。
+
+```bash
+cp -r profiles/_template "profiles/我的账号"
+```
+
+在 Web 的“画像”页面可以直接创建和编辑；同一画像可以跨多个已登录平台使用。
+
+## 🏗️ 项目结构
+
+```text
+Easel/
+├── easel/                    Python CLI：chat / web / skill / doctor / ping
+├── web/                      FastAPI 后端与 React 工作台
+├── skills/builtin/           发现、策划、制作、发布、归因技能
+├── skills/shared/            跨技能脚本与参考资料
+├── assets/                   品牌、README 媒体与用户导入素材
+├── profiles/                 账号画像（每个画像一个目录）
+├── outputs/                  内容项目与最终产物
+├── agents/                   共享 Agent 工作区、底座配置与同步脚本
+└── docs/                     能力规范、能力地图与架构文档
+```
+
+Easel 使用独立的 `easel` OpenClaw profile，不会覆盖你本机已有的 OpenClaw 配置。Web 默认运行在 `7860`；gateway 端口由 OpenClaw 决定（非默认 profile 会分配哈希端口，如 `easel` → `37289`，不是 `18789`），Easel 会自动解析，无需手配。
+
+也可在「设置 → Agent 底座」选择 Hermes Agent。手动安装 Hermes 并启用 ACP：`hermes pm install --extra acp`；先用 `hermes profile list` 检查 `easel` profile，若不存在再运行 `hermes profile create easel --no-skills`，随后用 `hermes --profile easel setup` 配置。已有同名 profile 时先确认用途和状态，不要覆盖或删除。Easel 通过 Hermes CLI 选择该 profile，模型凭证仍由 Hermes 管理，不会复制默认 profile 或 Easel `.env` 中的模型凭证。profile 隔离 Hermes 自身配置和会话，不是操作系统沙箱；工具仍以运行 Easel 的账户权限访问文件。运行 `python -m easel.commands.hermes_skills` 可将缺失的内置技能目录复制到该 profile；脚本会通过 Hermes CLI 解析准确路径，且已有同名技能会原样保留。详见[Agent 底座配置](docs/agent-harnesses.md)。
+
+## 📑 文档
+
+- [热点数据源接入：Python 脚本 / HTTP 服务 / RSS 订阅](docs/trend-collectors.md)
+- [渠道平台接入指南](docs/channel-platforms.md)
+- [能力地图](docs/skill-function-mapping.md)
+- [SKILL 接口规范](docs/SKILL-SPEC.md)
+- [提示词与架构分层](docs/prompt-stack.md)
+- [上下文预算诊断](docs/context-budget-diagnostics.md)
+- [已知问题](docs/known-issues.md)
+- [完整致谢](docs/ACKNOWLEDGMENTS.md)
+
+## 🗺️ 开发计划（Roadmap）
+
+按优先级排列，欢迎在 Issue / PR 中认领或补充：
+
+- [ ] **1. 适配 Windows 系统** —— 完善原生 Windows 下安装、路径与编码、浏览器发布等全链路兼容。
+- [ ] **2. 安装简易化** —— 降低上手门槛，减少手动步骤，提供更顺滑的一键安装体验。
+- [ ] **3. 优化页面 Agent 交互** —— 改进 Web 工作台的对话交互、加载逻辑与流式反馈等体验细节。
+- [ ] **4. 适配更多 Agent Harness** —— 完善现有 Codex / OpenCode 接入，并适配 Claude Code、DeepSeek harness 等更多运行框架。已有引擎的切换方式见 [Agent 底座接入](docs/agent-harnesses.md)。
+
+## 🙏 致谢
+
+Easel 的技能体系和工作流受益于许多优秀的开源项目、工具与内容方法论。感谢所有原作者和社区贡献者；
+具体项目、用途和许可信息请查看[完整致谢](docs/ACKNOWLEDGMENTS.md)。
+
+欢迎参与贡献与讨论。有想法、问题或改进建议，欢迎提交 Issue 或 PR；也欢迎扫码加入我们的微信交流群：
+
+<p align="center">
+  <img src="assets/readme/wechat-group.png" width="240" alt="Easel 微信交流群二维码">
+</p>
+<p align="center"><sub>Easel 交流群 · 二维码定期更新，若已失效请通过 Issue 联系我们</sub></p>
+
+### 🤝 Contributors
+
+<table>
+  <tr>
+    <td align="center" width="84"><a href="https://github.com/lidingm"><img src="https://github.com/lidingm.png?size=96" width="72" height="72" alt="lidingm"><br><strong>lidingm</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/qywMichelle"><img src="https://github.com/qywMichelle.png?size=96" width="72" height="72" alt="qywMichelle"><br><strong>qywMichelle</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/wulinjuan"><img src="https://github.com/wulinjuan.png?size=96" width="72" height="72" alt="wulinjuan"><br><strong>wulinjuan</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/arctanxarc"><img src="https://github.com/arctanxarc.png?size=96" width="72" height="72" alt="arctanxarc"><br><strong>arctanxarc</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/hongxingli319"><img src="https://github.com/hongxingli319.png?size=96" width="72" height="72" alt="hongxingli319"><br><strong>hongxingli319</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/mengyuyuan"><img src="https://github.com/mengyuyuan.png?size=96" width="72" height="72" alt="mengyuyuan"><br><strong>mengyuyuan</strong></a></td>
+    <td align="center" width="84"><a href="https://github.com/Dear47"><img src="https://github.com/Dear47.png?size=96" width="72" height="72" alt="Dear47"><br><strong>Dear47</strong></a></td>
+  </tr>
+</table>
+
+## ⚖️ 许可证
+
+[Apache 2.0](LICENSE)
+
+## 🌟 Star 趋势
+
+<p align="center">
+  <a href="https://star-history.com/#ZJU-REAL/Easel&Date">
+    <img src="https://api.star-history.com/svg?repos=ZJU-REAL/Easel&type=Date" width="720" alt="Easel Star History Chart">
+  </a>
+</p>

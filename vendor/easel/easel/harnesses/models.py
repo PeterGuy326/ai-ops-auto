@@ -1,0 +1,139 @@
+"""Read native model catalogs without starting a conversation."""
+from __future__ import annotations
+
+import asyncio
+import os
+import signal
+from dataclasses import replace
+
+from easel import __version__
+
+from .base import HarnessError, RunRequest
+from .commands import base_command
+from .rpc import RPC, connection
+
+
+def _valid_id(value):
+    return isinstance(value, str) and 0 < len(value) <= 240 and not any(
+        ord(character) < 32 for character in value)
+
+
+async def available_models(runtime: str, request: RunRequest) -> list[dict]:
+    if runtime == "hermes":
+        from .commands import hermes_command
+        from .hermes import HermesAdapter
+
+        async def reject(method, params):
+            raise HarnessError("读取模型列表时不允许执行工具")
+
+        command = list(hermes_command(profile="easel"))
+        profile_request = replace(request, env=HermesAdapter._profile_env(request.env), command=(),
+                                  session_key="", native_id="")
+        async with connection(profile_request, command, lambda method, params: None, reject, acp=True) as rpc:
+            initialized = await rpc.call("initialize", {
+                "protocolVersion": 1, "clientInfo": {"name": "easel", "version": __version__},
+                "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False},
+                                       "terminal": False}}, timeout=15)
+            if not isinstance(initialized, dict) or initialized.get("protocolVersion") != 1:
+                raise HarnessError("Hermes 不支持 ACP v1")
+            result = await rpc.call("session/new", {"cwd": str(request.cwd), "mcpServers": []}, timeout=30)
+            if not isinstance(result, dict) or not isinstance(result.get("models"), dict):
+                raise HarnessError("Hermes 未返回有效的原生模型列表，请检查 profile 和 ACP 版本")
+            models_result = result.get("models") or {}
+            available = models_result.get("availableModels") or []
+            if not isinstance(available, list) or len(available) > 2000:
+                raise HarnessError("Hermes 返回了无效或过大的原生模型列表")
+            current = models_result.get("currentModelId")
+            models = []
+            for item in available:
+                if not isinstance(item, dict):
+                    continue
+                identifier = item.get("modelId") or item.get("id")
+                if _valid_id(identifier):
+                    label = item.get("name") or item.get("displayName") or identifier
+                    models.append({"id": identifier,
+                                   "label": label if _valid_id(label) else identifier,
+                                   "default": identifier == current})
+    elif runtime == "codex":
+        async def reject(method, params):
+            raise HarnessError("读取模型列表时不允许执行工具")
+
+        models = []
+        cursor = None
+        async with RPC(request, base_command("codex") + ["app-server"],
+                       lambda method, params: None, reject) as rpc:
+            await rpc.call("initialize", {
+                "clientInfo": {"name": "easel", "version": __version__},
+                "capabilities": {"experimentalApi": True}}, timeout=15)
+            await rpc.send({"method": "initialized"})
+            for page in range(20):
+                params = {"limit": 100, "includeHidden": False}
+                if cursor:
+                    params["cursor"] = cursor
+                response = await rpc.call("model/list", params, timeout=15)
+                if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+                    raise HarnessError("Codex 返回了无效的模型列表")
+                for item in response.get("data") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    identifier = item.get("model") or item.get("id")
+                    if not item.get("hidden") and _valid_id(identifier):
+                        label = item.get("displayName")
+                        models.append({"id": identifier,
+                                       "label": label if _valid_id(label) else identifier,
+                                       "default": bool(item.get("isDefault"))})
+                        if isinstance(item.get("supportedReasoningEfforts"), list):
+                            from .store import CODEX_EFFORTS
+                            models[-1]["efforts"] = list(dict.fromkeys(
+                                option["reasoningEffort"] for option in item["supportedReasoningEfforts"]
+                                if isinstance(option, dict) and option.get("reasoningEffort")
+                                and option.get("reasoningEffort") in CODEX_EFFORTS))
+                            models[-1]["defaultEffort"] = item.get("defaultReasoningEffort", "")
+                        if isinstance(item.get("inputModalities"), list):
+                            models[-1]["inputModalities"] = [value for value in item["inputModalities"]
+                                                             if value in ("text", "image")]
+                following = response.get("nextCursor")
+                if not following or following == cursor:
+                    break
+                cursor = following
+    elif runtime == "opencode":
+        env = {**request.env, "EASEL_ROOT": str(request.cwd.resolve()),
+               "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        process = await asyncio.create_subprocess_exec(
+            *base_command("opencode"), "models",
+            cwd=str(request.cwd), env=env, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, start_new_session=os.name != "nt")
+        try:
+            async def read_output():
+                chunks = []
+                size = 0
+                while chunk := await process.stdout.read(65536):
+                    size += len(chunk)
+                    if size > 1024 * 1024:
+                        raise HarnessError("OpenCode 模型列表过大")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+            output = await asyncio.wait_for(read_output(), 15)
+            await asyncio.wait_for(process.wait(), 5)
+            if process.returncode or len(output) > 1024 * 1024:
+                raise HarnessError("OpenCode 模型列表读取失败，请检查原生 CLI 配置")
+        finally:
+            if os.name != "nt":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            elif process.returncode is None:
+                process.kill()
+            await process.wait()
+        models = [{"id": identifier, "label": identifier, "default": False}
+                  for identifier in output.decode("utf-8").splitlines()
+                  if _valid_id(identifier) and "/" in identifier and not any(
+                      character.isspace() for character in identifier)]
+    else:
+        raise HarnessError("此底座不支持原生模型列表")
+    unique = {}
+    for item in models:
+        unique.setdefault(item["id"], item)
+    return list(unique.values())

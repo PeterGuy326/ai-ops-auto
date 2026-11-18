@@ -60,3 +60,10 @@ Thumbs.db
 
 # Claude Code local config
 .claude/
+
+# vendored Easel runtime
+vendor/easel/outputs/
+vendor/easel/.env
+vendor/easel/.venv/
+vendor/easel/web/frontend/node_modules/
+vendor/easel/web/frontend/dist/

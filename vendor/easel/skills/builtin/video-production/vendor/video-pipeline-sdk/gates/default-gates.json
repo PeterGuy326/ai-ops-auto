@@ -1,0 +1,52 @@
+{
+  "gates": [
+    {
+      "id": "source-exists",
+      "title": "原片输入仍可读取",
+      "phase": "verify",
+      "cmd": "{python} -c \"import json; from pathlib import Path; st=json.loads(Path(r'{run_dir}/run-state.json').read_text(encoding='utf-8')); p=Path(st.get('source','')); raise SystemExit(0 if p.is_file() else 1)\""
+    },
+    {
+      "id": "scenes-exists",
+      "title": "scenes.json 已生成",
+      "phase": "verify",
+      "cmd": "{python} -c \"from pathlib import Path; p=Path(r'{run_dir}/artifacts/scenes.json'); raise SystemExit(0 if p.is_file() else 1)\""
+    },
+    {
+      "id": "design-table-exists",
+      "title": "design-table.md 已生成",
+      "phase": "verify",
+      "cmd": "{python} -c \"from pathlib import Path; p=Path(r'{run_dir}/artifacts/design-table.md'); raise SystemExit(0 if p.is_file() else 1)\""
+    },
+    {
+      "id": "build-ok-exists",
+      "title": "代码构建已通过",
+      "phase": "verify",
+      "cmd": "{python} -c \"from pathlib import Path; p=Path(r'{run_dir}/workdir/.build-ok'); raise SystemExit(0 if p.is_file() else 1)\""
+    },
+    {
+      "id": "timeline",
+      "title": "时间线结构有效",
+      "phase": "verify",
+      "cmd": "{python} gates/check_timeline.py --scenes \"{run_dir}/artifacts/scenes.json\""
+    },
+    {
+      "id": "dup",
+      "title": "镜头去重检查",
+      "phase": "verify",
+      "cmd": "{python} gates/check_dup.py --scenes \"{run_dir}/artifacts/scenes.json\""
+    },
+    {
+      "id": "final-exists",
+      "title": "成片已生成",
+      "phase": "render",
+      "cmd": "{python} -c \"from pathlib import Path; p=Path(r'{run_dir}/workdir/out/final.mp4'); raise SystemExit(0 if p.is_file() else 1)\""
+    },
+    {
+      "id": "audio",
+      "title": "成片音频有效",
+      "phase": "render",
+      "cmd": "{python} gates/check_audio.py \"{run_dir}/workdir/out/final.mp4\""
+    }
+  ]
+}
