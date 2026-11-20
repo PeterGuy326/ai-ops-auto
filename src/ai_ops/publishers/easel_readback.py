@@ -51,6 +51,11 @@ def split_paragraphs(md: str) -> list[str]:
         # 围栏外剥离行首 markdown 标记（标题/列表/引用），保留正文文字。
         line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
         line = line.replace("**", "")
+        line = line.replace("`", "")
+        # 表格分隔行（|---|---|）不渲染，整行剔除；其余表格行去竖线取单元格文字。
+        if re.fullmatch(r"\s*\|?[\s:|-]*-[\s:|-]*\|?\s*", line):
+            continue
+        line = line.replace("|", "")
         buf.append(re.sub(r"^\s*(#{1,6}\s+|[-*+]\s+|>\s?|\d+\.\s+)", "", line))
     if buf:
         paras.append("\n".join(buf))

@@ -122,7 +122,10 @@ class EaselWechatPublisher(PublisherBase):
         data = _parse_json(out)
         if rc != 0 or data is None:
             raise NotImplementedError(f"easel stats unavailable: {err[:200]}")
-        return data
+        # 草稿（无公开 URL）没有公开阅读/点赞/评论数据：fail-closed 跳过，绝不伪造计数。
+        # 已发表文章的逐篇 likes/comments 需上游 stats 扩展后才能归一化（Phase C），
+        # 当前同样跳过而非用账号级数据冒充逐篇指标。
+        return {"skipped": True}
 
     async def publish(
         self, account_id: int, credential: dict, content: PublishContent

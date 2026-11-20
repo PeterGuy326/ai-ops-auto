@@ -90,7 +90,8 @@ async def test_health_and_metrics(tmp_path, monkeypatch):
     _patch_run(monkeypatch)
     pub = ew.EaselWechatPublisher()
     assert await pub.health_check(1, {}) == AccountHealth.HEALTHY
-    assert (await pub.collect_metrics("1", None, {}))["fans"] == 100
+    # 草稿无公开指标：fail-closed 跳过，不伪造计数
+    assert (await pub.collect_metrics("1", None, {}))["skipped"] is True
     _patch_run(monkeypatch, whoami=False)
     assert await pub.health_check(1, {}) == AccountHealth.EXPIRED
 
@@ -111,4 +112,16 @@ def test_readback_compare_fence_and_meta():
     rep = compare_article(src, "标题行", "", rb, source_title="标题行")
     assert rep["title_match"] is True
     assert rep["body_all_match"] is True  # 围栏 '# 注释' 保留、META 剔除
+    assert rep["body_total"] == rep["body_matched"]
+
+
+def test_readback_compare_table_and_inline_code():
+    src = (
+        "标题行\n\n| 结果 | 含义 |\n|---|---|\n| accept | 值得接 |\n\n"
+        "跑 `eval` 检查，钉在 `0.6.0`：\n\n结尾段"
+    )
+    # 渲染后：表格去竖线/分隔行，行内代码去反引号
+    rb = "标题行 结果 含义 accept 值得接 跑 eval 检查，钉在 0.6.0： 结尾段"
+    rep = compare_article(src, "标题行", "", rb, source_title="标题行")
+    assert rep["body_all_match"] is True
     assert rep["body_total"] == rep["body_matched"]

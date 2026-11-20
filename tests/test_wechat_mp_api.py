@@ -385,6 +385,8 @@ def test_registry_gate(monkeypatch):
     from ai_ops.publishers.registry import build_default_registry
 
     monkeypatch.setattr(settings, "wechat_mp_api_publisher_enabled", False)
+    # 隔离 easel 会话版开关，避免本地 .env 启用时抢占优先级（本测试只验证 api vs 浏览器草稿版）。
+    monkeypatch.setattr(settings, "easel_wechat_publisher_enabled", False)
     registry_off = build_default_registry()
     kinds_off = [
         registry_off.kind_value(p) for p in registry_off.resolve(P.WECHAT_MP)
