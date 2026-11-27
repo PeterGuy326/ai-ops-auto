@@ -180,6 +180,47 @@ def build_default_registry(
             registration_id="builtin:youtube_uploader",
         )
 
+    # B站 bilitool 0.1.3 canary：只有 stderr 中的 bvid 回执才算发布成功，上游
+    # 退出码不可信。只有显式开启才装配，并优先于无 post identity 的 SAU 路径；
+    # 子进程一旦启动却未收到 bvid，会由 worker 的 outcome_uncertain 语义阻断 fallback。
+    if getattr(active_config, "bilitool_enabled", False):
+        from .bilibili_tool import BilibiliToolPublisher
+
+        reg.register(
+            Platform.BILIBILI,
+            BilibiliToolPublisher,
+            priority=5,
+            registration_id="builtin:bilitool",
+        )
+
+    # 抖音开放平台官方视频发布 API canary：文档化接口、无浏览器依赖。官方能力
+    # 「代替用户发布内容到抖音」的准入条件是开发者主体为党政机关或事业单位，
+    # 且未经真实账号 canary；只有显式开启才装配，并优先于 SAU 浏览器路径。
+    # 账号若存的不是开放平台凭证，适配器会返回可 fallback 的失败，不误伤 SAU 账号。
+    if getattr(active_config, "douyin_open_api_enabled", False):
+        from .douyin_open_api import DouyinOpenApiPublisher
+
+        reg.register(
+            Platform.DOUYIN,
+            DouyinOpenApiPublisher,
+            priority=5,
+            registration_id="builtin:douyin_open_api",
+        )
+
+    # 快手开放平台官方视频发布 API canary：文档化接口、无浏览器依赖。准入需开发者
+    # 资质认证、应用审核与接口权限审核，且未经真实账号 canary；只有显式开启才装配，
+    # 并优先于 SAU 浏览器路径。账号若存的不是开放平台凭证，适配器会返回可 fallback
+    # 的失败，不误伤 SAU 账号。
+    if getattr(active_config, "kuaishou_open_api_enabled", False):
+        from .kuaishou_open_api import KuaishouOpenApiPublisher
+
+        reg.register(
+            Platform.KUAISHOU,
+            KuaishouOpenApiPublisher,
+            priority=5,
+            registration_id="builtin:kuaishou_open_api",
+        )
+
     # 小红书反风控主链路：BROWSER_ENGINE=camoufox 时，XhsCamoufoxPublisher 顶到最高优先级
     if active_config.browser_engine == "camoufox":
         from .xhs_camoufox import XhsCamoufoxPublisher

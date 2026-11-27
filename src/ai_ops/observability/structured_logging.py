@@ -105,6 +105,22 @@ def setup_logging(*, log_format: str = "text", log_level: str = "INFO") -> None:
         handlers=[handler],
         force=True,
     )
+    # httpx 在 INFO 级别记录每个请求行 ``HTTP Request: POST <完整 URL> ...``，
+    # 而开放平台接口按官方约定把凭证放在查询串里（微信 access_token、快手
+    # access_token/app_secret/refresh_token/upload_token）。默认 LOG_LEVEL=INFO，
+    # 这些凭证因此会以明文写进 stdout / 日志采集。请求行没有不可替代的诊断
+    # 价值，所以无论配置的级别多低，httpx logger 都硬性不低于 WARNING。
+    _cap_httpx_logger()
+
+
+def _cap_httpx_logger() -> None:
+    """把 ``httpx`` logger 的级别钉在 WARNING：它的 INFO 记录含完整请求 URL。"""
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _restore_httpx_logger_for_test() -> None:
+    """测试辅助：撤销 ``_cap_httpx_logger``，以免污染其它用例的 logger 级别。"""
+    logging.getLogger("httpx").setLevel(logging.NOTSET)
 
 
 def get_logger(name: str) -> logging.Logger:

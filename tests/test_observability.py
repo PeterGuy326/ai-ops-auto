@@ -19,7 +19,11 @@ import pytest
 from ai_ops import observability as obs_mod
 from ai_ops.observability import get_logger, init_observability
 from ai_ops.observability.sentry import init_sentry
-from ai_ops.observability.structured_logging import JsonFormatter, setup_logging
+from ai_ops.observability.structured_logging import (
+    JsonFormatter,
+    _restore_httpx_logger_for_test,
+    setup_logging,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -213,3 +217,47 @@ class TestInitObservability:
         data = json.loads(line)
         assert data["message"] == "init_test"
         assert data["task"] == "G"
+
+
+class TestHttpxLoggerCap:
+    """httpx 的 INFO 请求行含完整 URL，而开放平台接口把凭证放在查询串里。"""
+
+    def test_httpx_logger_is_capped_even_when_log_level_is_debug(self):
+        for fmt in ("text", "json"):
+            setup_logging(log_format=fmt, log_level="DEBUG")
+            assert logging.getLogger("httpx").isEnabledFor(logging.WARNING)
+            assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+
+    def test_request_line_with_query_credentials_never_reaches_the_log(
+        self, capsys
+    ):
+        """真实 HTTP 客户端发出带凭证的请求后，输出里不得出现凭证。"""
+        import asyncio
+
+        import httpx
+
+        setup_logging(log_format="text", log_level="INFO")
+        try:
+            async def send() -> None:
+                transport = httpx.MockTransport(
+                    lambda request: httpx.Response(200, json={"result": 1})
+                )
+                async with httpx.AsyncClient(
+                    base_url="https://open.example.com", transport=transport
+                ) as client:
+                    await client.post(
+                        "/openapi/photo/publish",
+                        params={"access_token": "SECRET-ACCESS", "app_id": "ks1"},
+                    )
+                    await client.get(
+                        "/oauth2/refresh_token",
+                        params={"app_secret": "SECRET-APP", "refresh_token": "SECRET-R"},
+                    )
+
+            asyncio.run(send())
+            out = capsys.readouterr().out
+        finally:
+            _restore_httpx_logger_for_test()
+        assert "HTTP Request" not in out
+        for secret in ("SECRET-ACCESS", "SECRET-APP", "SECRET-R"):
+            assert secret not in out

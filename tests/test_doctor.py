@@ -614,6 +614,7 @@ def test_enabled_optional_binary_adapter_missing_is_warning(tmp_path):
 
     assert by_id["adapter.zhihu_cli"].outcome == CheckOutcome.WARN
     assert by_id["adapter.youtube_uploader"].outcome == CheckOutcome.SKIP
+    assert by_id["adapter.bilitool"].outcome == CheckOutcome.SKIP  # default-off
     assert by_id["adapter.github_pages_gh"].outcome == CheckOutcome.SKIP
 
 
@@ -1096,6 +1097,7 @@ def test_check_order_is_stable(tmp_path):
         "browser.runtime",
         "adapter.zhihu_cli",
         "adapter.youtube_uploader",
+        "adapter.bilitool",
         "adapter.github_pages_gh",
         "adapter.social_auto_upload",
         "adapter.xhs_skills",
@@ -1138,3 +1140,46 @@ def test_top_level_doctor_fails_for_missing_enabled_plugin(tmp_path):
 
     assert check.outcome == CheckOutcome.FAIL
     assert check.details["missing_enabled"] == ["missing-ai-ops:missing.plugin"]
+
+
+def test_bilitool_doctor_check_follows_the_cli_adapter_convention(tmp_path):
+    # disabled -> SKIP; enabled + binary -> PASS; enabled without binary -> WARN.
+    from ai_ops.doctor import _adapter_checks
+
+    disabled = {item.check_id: item for item in _adapter_checks(_config(tmp_path), lambda _b: True)}
+    assert disabled["adapter.bilitool"].outcome == CheckOutcome.SKIP
+
+    enabled = _config(tmp_path, bilitool_enabled=True, bilitool_bin="bilitool")
+    present = {item.check_id: item for item in _adapter_checks(enabled, lambda b: b == "bilitool")}
+    assert present["adapter.bilitool"].outcome == CheckOutcome.PASS
+    assert present["adapter.bilitool"].details == {
+        "enabled": True,
+        "executable_available": True,
+        "probed_online": False,
+    }
+
+    absent = {item.check_id: item for item in _adapter_checks(enabled, lambda _b: False)}
+    assert absent["adapter.bilitool"].outcome == CheckOutcome.WARN
+    assert absent["adapter.bilitool"].details["executable_available"] is False
+
+
+@pytest.mark.parametrize(
+    ("flag", "name"),
+    [
+        ("bilitool_enabled", "bilitool"),
+        ("douyin_open_api_enabled", "douyin_open_api"),
+        ("kuaishou_open_api_enabled", "kuaishou_open_api"),
+        ("wechat_mp_api_publisher_enabled", "wechat_mp_api"),
+    ],
+)
+def test_every_api_or_cli_publish_switch_is_a_live_publication_capability(tmp_path, flag, name):
+    # The registry wires each of these as the first publisher for its platform.
+    # Leaving one out of the safety report would let a worker start publishing
+    # through it while doctor still says nothing is live.
+    off = _publication_safety_check(_config(tmp_path))
+    assert off.outcome == CheckOutcome.PASS
+    assert off.details == {"live_capability_count": 0}
+
+    check = _publication_safety_check(_config(tmp_path, **{flag: True}))
+    assert check.outcome == CheckOutcome.WARN
+    assert check.details["enabled_capabilities"] == [name]

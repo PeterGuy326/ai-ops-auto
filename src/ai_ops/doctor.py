@@ -977,6 +977,11 @@ def _publication_safety_check(config: Any) -> DoctorCheck:
         "github_pages_live": not bool(getattr(config, "github_pages_dry_run", True)),
         "zhihu_cli": bool(getattr(config, "zhihu_cli_enabled", False)),
         "youtube_uploader": bool(getattr(config, "youtube_uploader_enabled", False)),
+        "bilitool": bool(getattr(config, "bilitool_enabled", False)),
+        # Official Open Platform APIs: a publish request is a public post.
+        "douyin_open_api": bool(getattr(config, "douyin_open_api_enabled", False)),
+        "kuaishou_open_api": bool(getattr(config, "kuaishou_open_api_enabled", False)),
+        "wechat_mp_api": bool(getattr(config, "wechat_mp_api_publisher_enabled", False)),
         "publisher_plugins": bool(getattr(config, "publisher_plugin_allowlist", ())),
         "baijiahao_stub": bool(getattr(config, "baijiahao_publisher_enabled", False)),
         "sohuhao_stub": bool(getattr(config, "sohuhao_publisher_enabled", False)),
@@ -1626,6 +1631,13 @@ def _adapter_checks(
         label="YouTube uploader",
         executable_probe=executable_probe,
     )
+    bilitool = _binary_adapter_check(
+        "adapter.bilitool",
+        enabled=bool(getattr(config, "bilitool_enabled", False)),
+        binary=str(getattr(config, "bilitool_bin", "bilitool")),
+        label="bilitool",
+        executable_probe=executable_probe,
+    )
     github_pages_gh = _github_pages_gh_check(
         config,
         executable_probe=executable_probe,
@@ -1670,7 +1682,7 @@ def _adapter_checks(
         entry_relative=Path("funclip/videoclipper.py"),
         configured_python=funclip_python,
     )
-    return [zhihu, youtube, github_pages_gh, sau, xhs, mpt, funclip]
+    return [zhihu, youtube, bilitool, github_pages_gh, sau, xhs, mpt, funclip]
 
 
 def _publisher_plugin_selection_check(
