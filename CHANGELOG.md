@@ -71,6 +71,22 @@ once release automation is established.
   kinds across metrics and Agent exact execution, and per-construction identity validation.
 - `ai-ops plugins list` for metadata-only inventory and `ai-ops plugins doctor` for explicit
   validation of allowlisted trusted code, including stable JSON and installed-wheel fixture smoke.
+- A feature-gated `bilitool==0.1.3` adapter (`BILITOOL_ENABLED`) for Bilibili, registered ahead of
+  the social-auto-upload path only when enabled. Each account uses its own virtualenv; success is
+  bound to the `bvid` receipt line on stderr because upstream exit codes are not a success signal.
+  The `append` subcommand is deliberately not wired. Offline contract tests only; no real-account canary.
+- A feature-gated Douyin Open Platform video-publish API adapter (`DOUYIN_OPEN_API_ENABLED`) with
+  chunked upload, strict success/refused/unknown outcome semantics, and token refresh confined to
+  `login()`. Offline contract tests against the audited official contract; no real-account canary,
+  and the platform restricts the capability to government or public-institution developers.
+- A feature-gated Kuaishou Open Platform video-publish API adapter (`KUAISHOU_OPEN_API_ENABLED`) with
+  start-upload/direct/fragmented upload through the documented gateway host, a required jpg cover,
+  strict outcome semantics, and single-use refresh-token rotation written back only by `login()`.
+  The server-supplied upload endpoint is restricted to a bare hostname. Offline contract tests
+  against the audited official contract; no real-account canary.
+- `ai-ops doctor` now lists the bilitool, Douyin API, Kuaishou API and WeChat MP API publish switches
+  under `safety.publication`, and reports `adapter.bilitool` with the same executable check as the
+  other CLI adapters.
 - A local `ai-ops-mcp` stdio bridge that reuses the Agent contract HTTP client and exposes exactly
   seven Agent operations to MCP clients while keeping all human-only approval operations outside
   the tool surface.
@@ -120,6 +136,10 @@ once release automation is established.
 - Phase 0 was accepted on 2026-08-11 after all six CI jobs passed on merged `main@16eccb5`.
 - Third-party Publisher imports are deny-by-default. Invalid enabled selections keep diagnostics
   importable but block Publisher routing instead of silently choosing a different write path.
+- `ruff` no longer lints `vendor/`, which holds unmodified upstream snapshots with their own lint
+  policy, so the backend lint step passes again.
+- The `httpx` logger is capped at WARNING during logging setup. Its INFO records print the full
+  request URL, and these adapters put `access_token` in the query string.
 
 ### Security
 
@@ -158,6 +178,12 @@ once release automation is established.
 - The MCP bridge is configured with a scoped Agent Bearer token only through its process environment,
   never exposes legacy administrator or human-approval capabilities, reserves stdout for protocol
   frames, and inherits the v1 idempotency, validation, and redacted error boundaries over HTTP.
+- `httpx` request logging at INFO no longer writes access tokens into application logs. The existing
+  WeChat MP API adapter already put `access_token` into request URLs, so with the default
+  `LOG_LEVEL=INFO` every API call was logged with a usable credential; the same applied to the new
+  Douyin and Kuaishou adapters.
+- `safety.publication` in `ai-ops doctor` omitted the WeChat MP API publish switch, so a deployment
+  could have real publication enabled while the safety report said no live capability was on.
 
 ### Known limitations
 
@@ -182,6 +208,15 @@ once release automation is established.
   content-file input and idempotency, and its Markdown/HTML behavior still needs real canary evidence.
 - The YouTube CLI adapter is disabled by default and still requires a dedicated-channel private
   canary; unverified Google API projects cannot use it as evidence of public publication.
+- The bilitool, Douyin Open Platform and Kuaishou Open Platform adapters are disabled by default
+  and have only offline contract evidence. None has published through a real account; eligibility
+  (developer qualification reviews, interface-permission approval) has not been exercised, and the
+  Douyin `part_number` base is taken from an official description that gives no example.
+- The two Open Platform adapters do not refresh tokens outside `login()`: an operator has to call
+  `POST /accounts/{id}/login` within every token lifetime (15 days for Douyin, 48 hours for Kuaishou).
+  Kuaishou's refresh token is single-use, so a missed rotation needs a fresh user authorization.
+- The Kuaishou upload gateway is plain `http` by official design, and its host is validated by name
+  only: a platform hostname resolving to a private address is not detected.
 - Publisher plugins are trusted in-process Python code, not sandboxed extensions. Untrusted
   community tools still require a future subprocess/RPC host and capability-scoped secret broker.
 - MCP is currently a local stdio bridge, not a remote, hosted, or multi-tenant MCP service; protocol

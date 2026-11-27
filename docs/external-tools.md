@@ -12,6 +12,9 @@
 | social-auto-upload（SAU） | [dreammis/social-auto-upload@008e4ff](https://github.com/dreammis/social-auto-upload/commit/008e4ff66abdf48eb1f4b999272ef979711af436) | `SocialAutoUploadPublisher` 通过 subprocess CLI 或 HTTP 翻译发布请求；无 post identity 时只记 unknown | 否 |
 | pyzhihu-cli 0.2.4 | [BAIGUANGMEI/zhihu-cli](https://github.com/BAIGUANGMEI/zhihu-cli/tree/8e32b99e1883eaa0842653993618937a262817b6) | `ZhihuCliPublisher` 的版本门禁 canary；CLI 预检失败才回退 Playwright | 否（feature flag 默认关闭） |
 | youtubeuploader v1.25.5 | [porjo/youtubeuploader](https://github.com/porjo/youtubeuploader/releases/tag/v1.25.5) | `YoutubeUploaderPublisher` 通过官方 Data API 上传，以 `-metaJSONout` video ID 作回执 | 否（feature flag 默认关闭） |
+| bilitool 0.1.3 | [timerring/bilitool](https://github.com/timerring/bilitool) | `BilibiliToolPublisher` 的版本门禁 canary；每账号独立 venv，只认 stderr 的 bvid 回执 | 否（feature flag 默认关闭） |
+| 抖音开放平台视频发布 API | [抖音开放平台](https://open.douyin.com/platform/resource/docs/openapi/video-management/douyin/create/create-video/) | `DouyinOpenApiPublisher`；官方 API，需平台准入与接口权限 | 否（feature flag 默认关闭） |
+| 快手开放平台视频发布 API | [快手开放平台](https://open.kuaishou.com/platform/openApi) | `KuaishouOpenApiPublisher`；官方 API，需开发者资质与接口权限审核 | 否（feature flag 默认关闭） |
 | XiaohongshuSkills | [white0dew/XiaohongshuSkills](https://github.com/white0dew/XiaohongshuSkills) | `XhsSkillsPublisher` 的小红书可选 fallback | 否 |
 | MoneyPrinterTurbo | [harry0703/MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo) | `MoneyPrinterEngine` 的 HTTP/外置引擎；CLI 仅使用仓库内显式配置的独立 venv | 否 |
 | FunClip | [modelscope/FunClip](https://github.com/modelscope/FunClip) | ASR + 文字稿视频切片；仅使用仓库内显式配置且可验证的独立 venv | 否 |
@@ -66,6 +69,24 @@ data/cli_profiles/youtube/account_<id>/
 
 开启 `YOUTUBE_UPLOADER_ENABLED=true` 前，先在专用频道做 private canary。适配器固定
 `-oAuthPort=-1`，凭证不完整时失败关闭，不在后台开浏览器或监听 OAuth 端口。
+
+### bilitool 的隔离安装
+
+适配器不代建环境：它只使用 `BILITOOL_PROFILE_ROOT/account_<id>/venv` 里**已经装好**的
+`bilitool`，缺了就预检失败并回退到 SAU 路径，绝不使用 `PATH` 上的副本。每个 `account_id`
+单独建一个：
+
+```bash
+python3 -m venv data/cli_profiles/bilibili/account_<id>/venv
+data/cli_profiles/bilibili/account_<id>/venv/bin/pip install 'bilitool==0.1.3'
+data/cli_profiles/bilibili/account_<id>/venv/bin/bilitool --version
+# bilitool 0.1.3 and source code at ...
+```
+
+只接受 0.1.3（之后的版本去掉了 `--copyright`）。登录在可信终端完成，把导出的 `cookie.json`
+放到 `data/cli_profiles/bilibili/account_<id>/cookie.json`（`0600`），再调用
+`POST /accounts/{id}/login` 导入。它走 B 站未公开的 member 接口，不是开放平台；
+配置与验收见 [Publishing SOP](publishing-sop.md)。
 
 ## 安装模式
 

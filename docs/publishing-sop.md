@@ -125,13 +125,15 @@ uv tool install 'pyzhihu-cli==0.2.4'
 | Platform | 主力 Publisher（priority） | 加固 / fallback Publisher | 备注 |
 |---|---|---|---|
 | `XIAOHONGSHU` | `SocialAutoUploadPublisher`（10） | `XhsSkillsPublisher`（20） | 均无 post ID；只有前者未启动时才可 fallback，启动后需人工对账 |
-| `DOUYIN` / `BILIBILI` / `KUAISHOU` | `SocialAutoUploadPublisher`（10） | — | 走已审计 SAU CLI 命令；无 post ID 不落 SUCCESS |
+| `DOUYIN` | `DouyinOpenApiPublisher`（5，flag 默认关闭） | `SocialAutoUploadPublisher`（10） | 官方 API canary，见 §三-E；关闭 flag 时只有 SAU，无 post ID 不落 SUCCESS |
+| `BILIBILI` | `BilibiliToolPublisher`（5，flag 默认关闭） | `SocialAutoUploadPublisher`（10） | bilitool 0.1.3 CLI canary，见 §三-E；关闭 flag 时只有 SAU |
+| `KUAISHOU` | `KuaishouOpenApiPublisher`（5，flag 默认关闭） | `SocialAutoUploadPublisher`（10） | 官方 API canary，见 §三-E；关闭 flag 时只有 SAU |
 | `WECHAT_VIDEO` | `SocialAutoUploadPublisher`（10） | — | 仅 SAU HTTP `/postVideo`；当前集成无认证、无 post ID |
 | `YOUTUBE` | `YoutubeUploaderPublisher`（5，flag 默认关闭） | — | v1.25.5 receipt canary；当前没有 SAU fallback |
 | `TIKTOK` | — | — | 当前没有注册 Publisher；优先规划官方 Content Posting API |
 | `ZHIHU` | `ZhihuCliPublisher`（5，flag 默认关闭） | `ZhihuPublisher`（10） | CLI 0.2.4 canary；只有 preflight 安全失败才回退浏览器 |
 | `TOUTIAO` | `ToutiaoPublisher`（10） | — | 开源缺口，自建 |
-| `WECHAT_MP` | `WechatMpPublisher`（10） | — | 开源缺口，persistent_context 路径 |
+| `WECHAT_MP` | flag 全关：`WechatMpPublisher`（10）。`EASEL_WECHAT_PUBLISHER_ENABLED`：`EaselWechatPublisher`（5，只建草稿）。`WECHAT_MP_API_PUBLISHER_ENABLED`：`WechatMpApiPublisher`（5，官方 API 真发布） | 下一优先级适配器 | 两个 flag 都开时 Easel 在前（同为 5，按注册 id 排序），官方 API 路径不会被走到；浏览器路径只保存草稿 |
 | `GITHUB_PAGES` | `GitHubPagesPublisher`（10） | — | dry-run 默认开启；受控图片根目录 + 仓库锁 + commit 路径/SHA 对账 |
 
 ## 三-A、头条号 Publisher（自建，开源缺口）
@@ -314,6 +316,96 @@ src/ai_ops/
 2. 如果还跑不通 → 停止操作，核对平台条款和能力矩阵，再决定是否在测试账号验证其他引擎
 3. inspect 后台图文编辑器拿 selector（套 `ZhihuPublisher` 经验，预计含 iframe `frame_locator`）
 4. 实现 `_do_publish` 仅做"存草稿"（**不实现 send-draft**，阶段 1 不群发）
+
+## 三-E、抖音 / 快手 / B 站 Publisher（官方 API 与 CLI canary，默认关闭）
+
+> **当前决策**：三个适配器都已接入 registry，但**默认关闭且均未经真实账号 canary**。
+> 各自启用后 priority=5，排在 SAU 浏览器路径（priority=10）之前；关闭时行为与此前完全一致。
+> 只有专用测试账号 canary 通过后才可以开启。
+
+| 平台 | 主力 Publisher（flag 开启时） | 实现 | 登录方式 |
+|---|---|---|---|
+| `DOUYIN` | `DouyinOpenApiPublisher`（5，`DOUYIN_OPEN_API_ENABLED`） | 官方开放平台视频发布 API | `POST /accounts/{id}/login` = 用 `refresh_token` 换新 `access_token` |
+| `KUAISHOU` | `KuaishouOpenApiPublisher`（5，`KUAISHOU_OPEN_API_ENABLED`） | 官方开放平台视频发布 API | `POST /accounts/{id}/login` = 刷新并轮换令牌 |
+| `BILIBILI` | `BilibiliToolPublisher`（5，`BILITOOL_ENABLED`） | 第三方 `bilitool==0.1.3` CLI | 可信终端 `bilitool login --export`，再 `POST /accounts/{id}/login` 导入 |
+
+### 共同约定（三个适配器）
+
+- **让路**：账号存的不是该适配器的凭证（例如 SAU 浏览器会话）时，`health_check` 返回
+  `UNKNOWN`，`publish` 返回可 fallback 的失败（`effect_applied=False`）。开启 flag 不影响
+  现有 SAU 账号。
+- **`login` 端点的语义随 flag 改变**：API 适配器启用后它是 `pubs[0]`，
+  `POST /accounts/{id}/login` 对该账号执行的就是令牌刷新（或 bilitool 的 cookie 导入）。
+- **写路径不自动重试未知结果**：公开写请求已发出但回执不可读（超时、非 JSON、
+  「服务内部错误」类结果码）时返回 `outcome_uncertain=True`，worker 不 fallback、不 retry，
+  转人工核验后再决定是否重发。只有确认请求未发出的失败才可重试。
+- **无指标回流**：三个适配器都不声明 `supports_metrics`，采集任务不会伪造数据。
+- **预检失败不发请求**：凭证不完整、素材不在受控 asset root 内、符号链接、文件为空或超限，
+  都在发出任何请求之前作为确定失败返回。
+- 凭证值只存在于加密的 credential 中，不进 argv、日志、回执、`error` 或 `raw_response`。
+  `httpx` 的 INFO 级请求日志会输出完整 URL（含 query 中的 token），`setup_logging` 已把
+  该 logger 钉在 WARNING；部署时不要把 `httpx` 的级别调回 INFO。
+
+### 抖音官方 API（`douyin_open_api`）
+
+- **准入**：官方文档写明「代替用户发布内容到抖音」能力要求开发者主体为党政机关或
+  事业单位，个人与普通企业无法申请。申请下来之前这条路径不可用，这是平台限制而非实现缺口。
+- 凭证：`{"client_key", "client_secret", "refresh_token"}`；`open_id` 由刷新接口返回。
+- 令牌：`access_token` 15 天，`refresh_token` 30 天且**不轮换**。需每 15 天内执行一次
+  `POST /accounts/{id}/login`；worker 与健康探测不刷新令牌。
+- 输入：单个本地视频（mp4/webm/mov/avi）。可选 `content.extra`：`douyin_cover_tsp`、
+  `douyin_private_status`（0 公开 / 1 自见 / 2 好友可见）、`douyin_download_type`。
+- 回执：官方返回的 `item_id` 作为 post ID。**不写 `platform_url`**：官方文档没有给出
+  分享 URL 的构造规则，不自行拼接。
+- **未确认点**：分片上传的 `part_number` 官方只写「分片序号」未给示例，实现按 1 起始；
+  `text_extra` 话题定位、`micro_app_id`、`publish_way`（立即/定时/私有）未接入。
+
+### 快手官方 API（`kuaishou_open_api`）
+
+- **准入**：开发者资质认证（企业/法人/管理员信息，平台审核）+ 应用审核 + 接口权限审核
+  （scope `user_video_publish`）。
+- 凭证：`{"app_id", "app_secret", "refresh_token"}`。
+- 令牌：`access_token` 48 小时；`refresh_token` **一次性**——每次刷新返回新的 refresh_token，
+  旧的立即作废。因此 `login` 把新旧两个令牌**一起**写回，并且**只有 `login` 会刷新**：
+  worker 与健康探测不持久化凭证变更，在那里刷新会让库里存的 refresh_token 当场失效。
+  需每 48 小时内执行一次 `POST /accounts/{id}/login`；逾期需重新完成用户授权。
+- 输入：单个本地视频；**封面必填**，`content.extra.kuaishou_cover` 指向 asset root 内的
+  jpg（<10MB）。标题与正文必填。
+- 上传：`start_upload` 返回 `upload_token` 与上传网关 `endpoint`，视频字节按官方设计走
+  **明文 `http://`** 上传网关（不是 https）。小于 10MB 直接上传，更大的文件按 ≤10MB 分片
+  （`fragment_id` 从 0 起），最后 `complete` 合并。`endpoint` 只接受裸主机名，拒绝
+  scheme / 端口 / IP 字面量 / 可被解析器读成数字的标签（`0x7f.1`、`127.1` 等）；
+  **不校验该主机名解析到哪里**。
+- 回执：`result == 1` 且带 `photo_id` 才算成功。`play_url` 在转码完成前为空，此时
+  成功但不写 `platform_url`。
+- `100100402` 一个码两种含义（用户被封禁 / 超过当日请求上限），按确定拒绝处理，不重试。
+- **未确认点**：发布后不调用 `photo/info` 轮询转码状态（需要额外 scope，且作品已存在）。
+
+### B 站 bilitool CLI（`bilitool`）
+
+- **性质**：第三方 CLI（`timerring/bilitool`，MIT），走 B 站**未公开的 member 接口**，
+  不是开放平台。接口随时可能变，随时可能触发风控。
+- 版本固定 `0.1.3`：之后的版本去掉了 `--copyright`，所有投稿都会被标为转载。
+- 隔离：每个 `account_id` 一个独立 venv（`BILITOOL_PROFILE_ROOT/account_<id>/venv`），
+  因为上游把登录态写死在自己的包目录内。cookie 是该 venv 内的磁盘敏感文件，不受
+  Fernet 加密保护，目录权限 `0700`、文件 `0600`。
+- 回执：**退出码不可信**（服务端拒绝的投稿也可能退出 0）。只认 stderr 中的
+  `upload success!\tbvid:BV...` 回执行。
+- 不接入 `append`（分P）子命令：它以 `verify=False` 调用两个 `http://` member 接口并发送
+  `access_key`，会主动降低凭证的传输安全。
+- 官方 Open Platform 的稿件 API 仍是更稳妥的长期路线，当前未实现。
+
+### 验收时的关键 SOP（canary 清单）
+
+1. 用专用测试账号，不碰运营账号；`ai-ops doctor` 确认对应 flag 已出现在
+   `safety.publication` 的 `enabled_capabilities` 中。
+2. API 适配器：先完成平台准入与接口权限审核，写入凭证，执行一次
+   `POST /accounts/{id}/login`，确认 `health_check` 返回 `HEALTHY`。
+3. bilitool：在隔离 venv 中安装 0.1.3，可信终端登录并导入 cookie，确认 `health_check`。
+4. 发一条 canary：到平台端人工确认作品存在、内容与标题一致；对照回执中的 post ID。
+5. 发第二条，在上传阶段断网，确认结果是「可重试、未发布」；再在发布请求阶段断网，
+   确认结果是「结果未知、不重试、转人工」，且平台端没有重复作品。
+6. 关闭 flag，确认同一账号回落到 SAU 路径且行为与此前一致。
 
 ## 四、二维码递交（首次登录 / cookie 失效）
 

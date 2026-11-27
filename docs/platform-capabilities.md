@@ -22,9 +22,9 @@ Experimental 对外呈现。
 | 小红书 | **Experimental** | SAU + XhsSkills；Camoufox 可选 | Registry/fallback/unknown 契约；CLI exit 0 或浏览器 success toast 无严格公开 note ID/URL 均不算 SUCCESS；历史真发描述无完整 evidence card | 未实现平台级采集 | 2026-05-17（历史描述；本次未复测） |
 | 头条号 | **Experimental** | 自建 Playwright publisher | 全 mock 发布/selector/结果解析契约；历史真发描述待补证 | 已实现代码路径，仅有 mock 契约证据 | 2026-05-17（历史描述；本次未复测） |
 | 知乎 | **Experimental** | 社区 `pyzhihu-cli==0.2.4` gated canary + Playwright fallback | 固定 commit 源码审计；fake CLI/结果不确定/fallback/超时契约；历史真发描述待补证 | 已实现代码路径，仅有 mock 契约证据 | CLI：2026-08-11 E2 源码复核；真发未复测 |
-| 抖音 | **Experimental** | social-auto-upload wrapper | wrapper/unknown/mock 契约 | 未实现；SAU 无 post id/url 时不确认成功 | — |
-| B 站 | **Experimental** | 当前 SAU wrapper；后续优先官方 Open Platform | wrapper/unknown/mock 契约；已确认官方稿件/专栏 API、沙箱与 webhook 存在，但尚未实现 | 未实现 | 2026-08-11 E1 官方文档审计；未调用 |
-| 快手 | **Experimental** | 当前 SAU wrapper；后续优先官方 OpenAPI | wrapper/unknown/mock 契约；已确认官方 OAuth/视频发布链路存在，但尚未实现 | 未实现 | 2026-08-11 E1 官方文档审计；未调用 |
+| 抖音 | **Experimental** | 官方开放平台视频发布 API（`douyin_open_api`，默认关闭 `DOUYIN_OPEN_API_ENABLED`）优先；social-auto-upload wrapper 作 fallback | wrapper/unknown/mock 契约；官方 API 的分片上传/发布/unknown/令牌轮换离线契约测试；未经真实账号 canary | 未实现。API 路径返回 `item_id` 作 post ID，无分享 URL（官方文档未给出）；SAU 无 post id 时不确认成功 | API：2026-11-28 官方文档审计 + 离线契约；未调用 |
+| B 站 | **Experimental** | `bilitool==0.1.3` CLI canary（默认关闭 `BILITOOL_ENABLED`）优先；SAU wrapper 作 fallback | wrapper/unknown/mock 契约；bilitool 0.1.3 固定版本源码审计；fake CLI/bvid 回执/unknown 契约；走未公开 member 接口，未经真实账号 canary。官方 Open Platform 稿件 API 存在但未实现 | 未实现。bilitool 路径以 stderr 的 bvid 回执为成功边界，退出码不作数 | CLI：2026-11-28 源码审计 + 离线契约；官方 API 2026-08-11 文档审计；均未调用 |
+| 快手 | **Experimental** | 官方开放平台视频发布 API（`kuaishou_open_api`，默认关闭 `KUAISHOU_OPEN_API_ENABLED`）优先；SAU wrapper 作 fallback | wrapper/unknown/mock 契约；官方 API 的 start_upload/分片上传/publish/unknown/一次性 refresh_token 轮换离线契约测试；未经真实账号 canary | 未实现。API 路径返回 `photo_id` 作 post ID；`play_url` 转码完成前为空，此时不写 `platform_url` | API：2026-11-28 官方文档审计 + 离线契约；未调用 |
 | 视频号 | **Experimental** | social-auto-upload HTTP wrapper | wrapper/mock 契约；HTTP 能力受上游约束 | 未实现 | — |
 | TikTok | **Stub** | 当前无注册 Publisher；官方 Content Posting API 是后续候选 | 无发布契约 | 未实现 | — |
 | YouTube | **Experimental** | `youtubeuploader v1.25.5` gated canary；无 SAU fallback | 固定 tag 源码审计；fake CLI/OAuth 隔离/receipt/partial/unknown 契约 | 未实现 | CLI：2026-08-10 E2 源码审计；真发未测 |
