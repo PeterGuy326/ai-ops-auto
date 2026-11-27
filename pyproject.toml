@@ -105,6 +105,10 @@ include-package-data = true
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# vendor/ holds unmodified upstream snapshots with their own lint policy. See
+# vendor/easel/UPSTREAM.md: local patches are not applied, so local edits
+# would be overwritten at the next sync.
+extend-exclude = ["vendor"]
 
 [tool.ruff.lint]
 # Ruff 0.16 changed its implicit default to a much broader ruleset. Keep the
