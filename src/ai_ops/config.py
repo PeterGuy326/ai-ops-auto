@@ -264,6 +264,25 @@ class Settings(BaseSettings):
         ge=1024,
     )
 
+    # ====== 快手开放平台官方视频发布 API ======
+    # 官方文档化接口（open.kuaishou.com）。发布需要用户授权换来的 access_token，
+    # 且需完成开发者资质认证（企业/法人/管理员信息，平台审核）、应用审核与接口
+    # 权限审核（scope ``user_video_publish``）。默认关闭，未做真实账号 canary。
+    # access_token 有效期 48 小时，refresh_token 一次性：只在 login() 里刷新。
+    kuaishou_open_api_enabled: bool = False
+    kuaishou_open_api_timeout_seconds: int = Field(default=600, ge=5, le=3600)
+    kuaishou_open_api_asset_root: Path = Path("./data")
+    # 官方：直接上传适合小于 10MB 的文件；分片建议不大于 10MB。
+    kuaishou_open_api_fragment_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=10 * 1024 * 1024,
+    )
+    kuaishou_open_api_max_video_bytes: int = Field(
+        default=4 * 1024 * 1024 * 1024,
+        ge=1024,
+    )
+
     # ====== Third-party Publisher Plugin SDK ======
     # Each selector binds both the normalized Python distribution and its
     # versioned entry-point name. An empty tuple guarantees zero plugin imports.
