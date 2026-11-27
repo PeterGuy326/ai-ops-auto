@@ -225,6 +225,45 @@ class Settings(BaseSettings):
         ge=1024,
     )
 
+    # ====== B站 CLI（第三方 timerring/bilitool==0.1.3，MIT）======
+    # 默认关闭：bilitool 走 B站未公开的 member 接口，退出码不可作为成功依据，
+    # 只有 stderr 中的 bvid 回执行才算发布成功。完成专用账号 canary 前不得开启。
+    bilitool_enabled: bool = False
+    bilitool_bin: str = "bilitool"
+    # 必须小于 worker 的全局执行超时，给子进程回收与 DB 落库留窗口。
+    bilitool_timeout_seconds: int = Field(default=1500, ge=1, le=7200)
+    # 上游把登录态写死在自己的包目录内且无隔离钩子，因此每个 account_id
+    # 使用独立 venv：<root>/account_<id>/venv，凭证只存在于该 venv 的 site-packages。
+    bilitool_profile_root: Path = Path("./data/cli_profiles/bilibili")
+    bilitool_asset_root: Path = Path("./data")
+    bilitool_max_video_bytes: int = Field(
+        default=8 * 1024 * 1024 * 1024,
+        ge=1024,
+    )
+
+    # ====== 抖音开放平台官方视频发布 API ======
+    # 官方文档化接口（open.douyin.com）。发布需要用户授权换来的 access_token，
+    # 且「代替用户发布内容到抖音」能力的官方准入条件是开发者主体为党政机关或
+    # 事业单位，个人与普通企业均无法申请。默认关闭，未做真实账号 canary。
+    douyin_open_api_enabled: bool = False
+    douyin_open_api_timeout_seconds: int = Field(default=600, ge=5, le=3600)
+    douyin_open_api_asset_root: Path = Path("./data")
+    # 直接上传上限 300MB（官方：超过必须分片）；总大小上限 4GB。
+    douyin_open_api_direct_upload_bytes: int = Field(
+        default=300 * 1024 * 1024,
+        ge=1024,
+    )
+    # 官方：单个分片最小 5MB、最大 100MB，建议 20MB。
+    douyin_open_api_part_bytes: int = Field(
+        default=20 * 1024 * 1024,
+        ge=5 * 1024 * 1024,
+        le=100 * 1024 * 1024,
+    )
+    douyin_open_api_max_video_bytes: int = Field(
+        default=4 * 1024 * 1024 * 1024,
+        ge=1024,
+    )
+
     # ====== Third-party Publisher Plugin SDK ======
     # Each selector binds both the normalized Python distribution and its
     # versioned entry-point name. An empty tuple guarantees zero plugin imports.
@@ -296,6 +335,13 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "YOUTUBE_UPLOADER_TIMEOUT_SECONDS must be lower than JOB_EXECUTION_TIMEOUT_SECONDS"
+            )
+        if (
+            self.bilitool_enabled
+            and self.bilitool_timeout_seconds >= self.job_execution_timeout_seconds
+        ):
+            raise ValueError(
+                "BILITOOL_TIMEOUT_SECONDS must be lower than JOB_EXECUTION_TIMEOUT_SECONDS"
             )
         if (
             self.metrics_task_lease_seconds
