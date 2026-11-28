@@ -73,6 +73,9 @@ SPECS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
 
 CANARY_TITLE = "canary"
 
+# bilitool's own upload lines; the adapter accepts exactly these.
+_BILITOOL_CDN_LINES = ("qn", "bldsa", "ws", "bda2", "tx")
+
 
 def fail(message: str) -> None:
     print(f"  ✗ {message}", file=sys.stderr)
@@ -278,7 +281,7 @@ def _find_or_create_topic(platform: str) -> int:
         ).id
 
 
-def _publish_blocking(platform: str, account_id: int, video: str) -> int:
+def _publish_blocking(platform: str, account_id: int, video: str, *, extra: dict | None = None) -> int:
     """The public write, through the ordinary pipeline: no gate is skipped."""
     from ai_ops.content import distributor
     from ai_ops.content.manager import attach_asset, create_article
@@ -315,6 +318,7 @@ def _publish_blocking(platform: str, account_id: int, video: str) -> int:
                 content_type=ContentType.VIDEO,
                 target_platforms=[Platform(platform)],
                 target_account_ids=[account_id],
+                extra=dict(extra or {}),
             ),
         ).id
         attach_asset(
@@ -332,6 +336,7 @@ def _publish_blocking(platform: str, account_id: int, video: str) -> int:
         actual_kind = job.publisher_kind
         status = str(JobStatus(job.status).value)
         post_id = job.platform_post_id
+        raw = dict(job.raw_response or {})
     print(f"\n▎结果：job #{job_id} status={status}，实际使用的发布器 = {actual_kind or '（未到达任何发布器）'}")
     if actual_kind and actual_kind != expected_kind:
         # The worker falls through to the next Publisher (the browser path) when
@@ -346,21 +351,42 @@ def _publish_blocking(platform: str, account_id: int, video: str) -> int:
         print(f"  ✓ 发布成功，平台作品 ID = {post_id}。请到 {platform} 平台端人工确认。")
         return 0
     print(f"  ✗ 未发布成功：{result.error}")
-    print(
-        f"    retryable={result.retryable}，outcome_uncertain={result.outcome_uncertain}。"
-        "outcome_uncertain=True 表示平台端可能已有作品，先人工核对再决定是否重发。"
-    )
+    uncertain = "outcome_uncertain" in (raw or {})
+    advice = {
+        "retrying": "worker 会按重试节奏自动再试；养号期、发布间隔也表现为这个状态。",
+        "dead": "重试预算已用完，账号健康可能已被降级。",
+        "failed": "不会自动重试。平台已确认拒绝或未发出，可以修正后重新 publish。",
+    }.get(status, "")
+    if uncertain:
+        advice = "平台结果未知：平台端可能已有作品，先人工核对再决定是否重发。"
+    if advice:
+        print("    " + advice)
     return 1
 
 
-def run_publish(platform: str, account_id: int, video: str) -> int:
+def run_publish(
+    platform: str,
+    account_id: int,
+    video: str,
+    *,
+    cdn: str = "",
+    copyright_value: int | None = None,
+) -> int:
     spec = SPECS[platform]
     print(f"▎canary 发布：{platform} / 账号 #{account_id}（这一步会公开发布）")
+    if cdn and platform != "bilibili":
+        fail("--cdn 只适用于 bilibili")
+        return 2
+    extra: dict = {}
+    if cdn:
+        extra["bilibili_cdn_line"] = cdn
+    if copyright_value is not None:
+        extra["bilibili_copyright"] = copyright_value
     if not check_switch(platform, spec):
         return 1
     if not verify_login(platform, account_id):
         return 1
-    return _publish_blocking(platform, account_id, video)
+    return _publish_blocking(platform, account_id, video, extra=extra)
 
 
 def run_prepare(platform: str, nickname: str) -> int:
@@ -405,6 +431,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     publish.add_argument("--account-id", type=int, required=True)
     publish.add_argument("--video", required=True, help="asset root 内的本地视频")
     publish.add_argument("--yes", action="store_true", help="确认公开发布")
+    publish.add_argument(
+        "--copyright",
+        choices=("self", "repost"),
+        default="",
+        help="bilibili 专用：self=自制，repost=转载；不填用适配器默认（转载）",
+    )
+    publish.add_argument(
+        "--cdn",
+        choices=sorted(_BILITOOL_CDN_LINES),
+        default="",
+        help="bilibili 专用：指定上传线路，跳过 bilitool 的线路自动探测",
+    )
     return parser.parse_args(argv)
 
 
@@ -421,7 +459,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.yes:
         fail("publish 会公开发布内容；确认后加 --yes")
         return 2
-    return run_publish(args.platform, args.account_id, args.video)
+    copyright_value = {"self": 1, "repost": 2}.get(args.copyright, None)
+    if copyright_value is not None and args.platform != "bilibili":
+        fail("--copyright 只适用于 bilibili")
+        return 2
+    return run_publish(
+        args.platform, args.account_id, args.video, cdn=args.cdn, copyright_value=copyright_value
+    )
 
 
 if __name__ == "__main__":

@@ -93,8 +93,13 @@ once release automation is established.
   last rotated refresh token; it stops before publishing and prints the adapter's real login
   reason, which the login endpoint deliberately does not return. `publish` needs `--yes`, goes
   through the ordinary article → approve → distribute → job path, and reports a run that fell
-  through to another Publisher as a failure. `.env.example` now also lists
-  `EASEL_WECHAT_PUBLISHER_ENABLED`.
+  through to another Publisher as a failure. For bilibili, `--cdn` selects one of
+  bilitool's upload lines (skipping its line auto-probe, which aborts on a TLS error before
+  any byte is uploaded) and `--copyright self|repost` overrides the adapter's default
+  (转载); both are refused for the other platforms. On a failed run the script prints
+  what the job state means for the operator: retried automatically, budget exhausted,
+  or outcome unknown and to be checked by hand before resubmitting. `.env.example` now also
+  lists `EASEL_WECHAT_PUBLISHER_ENABLED`.
 - A local `ai-ops-mcp` stdio bridge that reuses the Agent contract HTTP client and exposes exactly
   seven Agent operations to MCP clients while keeping all human-only approval operations outside
   the tool surface.
@@ -221,17 +226,33 @@ once release automation is established.
 - The YouTube CLI adapter is disabled by default and still requires a dedicated-channel private
   canary; unverified Google API projects cannot use it as evidence of public publication.
 - The bilitool, Douyin Open Platform and Kuaishou Open Platform adapters are disabled by default
-  and have only offline contract evidence. None has published through a real account; eligibility
+  and none has published through a real account (bilitool reached the platform's publish
+  endpoint with a real account and was refused, see below); eligibility
   (developer qualification reviews, interface-permission approval) has not been exercised, and the
   Douyin `part_number` base is 1, matching the example value on the official page and four
   independent implementations (Rust, TypeScript, PHP, Python). The page does not state the base
   and the gateway rejects a fake token before it looks at the parameter, so the platform itself
   has not confirmed it; the first real canary must.
-- Those three adapters have now been exercised against the real platforms with fake credentials
-  (pre-publication paths only: refresh, health, login, and the real `bilitool` 0.1.3 binary
-  driven through the adapter up to its cookie-import step). No upload or publish request has
-  been sent with a real grant, so the upload gateways, the Kuaishou `photo_id` and every post-ID
-  receipt remain unverified on the platform side.
+- The bilitool adapter now reports a platform rejection as a definite failure instead of an
+  unknown outcome. When bilitool exits 0 without a bvid line and its last line is an
+  `[ERROR]` from its own `bilitool` logger with no traceback, the publish request was
+  answered and refused, so the result is `outcome_uncertain=false`, not retryable and
+  `raw_response.outcome="rejected"`; the worker therefore no longer resubmits the same
+  content up to the retry budget and then degrades the account, and it may fall through to
+  the next Publisher. A non-zero exit, a traceback, a timeout or a line from another logger
+  is still unknown, and the platform's message is not stored (only its length), because it
+  can echo submitted metadata. Observed on 2026-11-28 with a real account: code `21590`
+  (“投稿工具已停用”), i.e. Bilibili refuses third-party upload clients for this account, and
+  the upload phase completed first, so the bytes went up before the refusal arrived.
+- Those three adapters have now been exercised against the real platforms: with fake
+  credentials for all three (pre-publication paths: refresh, health, login, and the real
+  `bilitool` 0.1.3 binary driven through the adapter up to its cookie-import step), and for
+  bilitool with a real account on 2026-11-28. The real run logged in, passed the health
+  check and uploaded a 5-second canary video, and was refused at publish with code `21590`;
+  no archive was created. That refusal is a verdict on this tool, not a fault in the
+  request, so the bilitool path cannot publish for this account as things stand. No
+  successful publish has been observed on any platform, so every post-ID receipt, the
+  Douyin and Kuaishou upload gateways and the Kuaishou `photo_id` remain unverified.
 - The worker tries the next Publisher when an adapter fails before sending anything, so a canary
   whose API/CLI preflight fails (missing cover, asset outside the asset root) is published by the
   browser path instead and the job still reads as a success. The job's `publisher_kind` records

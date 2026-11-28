@@ -387,3 +387,42 @@ def test_bilibili_prepare_checks_the_binary_the_adapter_will_run(canary_env, mon
 
     assert adapter.credentials_seen == []  # stopped before touching the login
     assert "account_1/venv" in capsys.readouterr().err
+
+
+def test_publish_passes_the_cdn_line_to_the_adapter(canary_env, monkeypatch, tmp_path):
+    """bilitool's CDN auto-probe can abort before any upload; --cdn must reach the adapter."""
+    seen: list[dict] = []
+    api = canary_env["api"]
+    original_publish = api.publish
+
+    async def publish(account_id, credential, content):
+        seen.append(dict(content.extra))
+        return await original_publish(account_id, credential, content)
+
+    monkeypatch.setattr(api, "publish", publish)
+    assert _prepare(monkeypatch) == 0
+    video = tmp_path / "canary.mp4"
+    video.write_bytes(b"fake video")
+    monkeypatch.setattr(settings, "kuaishou_open_api_asset_root", tmp_path)
+
+    rc = canary.main(
+        ["publish", "kuaishou", "--account-id", "1", "--video", str(video), "--yes",
+         "--cdn", "bda2"]
+    )
+
+    assert rc == 2  # --cdn is bilitool-only: refused before anything is created
+    assert seen == []
+    assert _rows(PublishJob) == 0
+
+
+def test_publish_rejects_a_cdn_line_bilitool_does_not_have(canary_env, monkeypatch):
+    assert _prepare(monkeypatch) == 0
+
+    with pytest.raises(SystemExit) as exc:
+        canary.main(
+            ["publish", "kuaishou", "--account-id", "1", "--video", "v.mp4", "--yes",
+             "--cdn", "not-a-line"]
+        )
+
+    assert exc.value.code == 2
+    assert _rows(PublishJob) == 0

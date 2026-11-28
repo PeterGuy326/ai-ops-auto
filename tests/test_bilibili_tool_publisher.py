@@ -16,7 +16,7 @@ import pytest
 
 from ai_ops.config import settings
 from ai_ops.core.enums import AccountHealth, ContentType, Platform, PublisherKind
-from ai_ops.core.schemas import PublishContent
+from ai_ops.core.schemas import PublishContent, PublishResult
 from ai_ops.publishers.base import AgentContractRendererUnavailable
 from ai_ops.publishers.bilibili_tool import (
     BilibiliToolPublisher,
@@ -214,20 +214,80 @@ def test_success_requires_bvid_line_not_exit_code(bili_settings, monkeypatch):
     assert durable["platform_post_id"] == BVID
 
 
-@pytest.mark.parametrize("returncode", [0, 1, None])
-def test_started_without_bvid_is_unknown_even_on_exit_zero(bili_settings, monkeypatch, returncode):
-    """Upstream exits 0 when Bilibili rejects the publish. No bvid means unknown."""
-    _, assets = bili_settings
+# The line upstream logs when Bilibili refuses the publish (``publish_video``
+# -> logger.error(response["message"])); the text is what the platform answered
+# with on 2026-11-28 for code 21590.
+REJECT_LINE = "[ERROR] - [2026-11-28 22:50:16,883 bilitool] - 投稿工具已停用，请使用官方投稿平台\n"
+TRACEBACK = "Traceback (most recent call last):\n  File \"bilitool/upload/bili_upload.py\", line 1\nSSLError: x\n"
+
+
+def _publish_with_stderr(monkeypatch, assets, stderr, *, returncode):
     pub = BilibiliToolPublisher()
 
     async def run(account_id, *args, timeout=None):
-        stderr = "[ERROR] - [2025-01-15 10:00:00,001 bilitool] - 标题不合规\n"
         return _CommandResult(started=True, returncode=returncode, stderr=stderr)
 
     _ready(pub, monkeypatch)
     monkeypatch.setattr(pub, "_run", run)
+    return asyncio.run(pub.publish(1, {}, _content(_video(assets))))
 
-    result = asyncio.run(pub.publish(1, {}, _content(_video(assets))))
+
+def test_platform_rejection_on_a_clean_exit_is_a_definite_failure(bili_settings, monkeypatch):
+    """Observed 2026-11-28: code 21590, exit 0, no archive on the account.
+
+    The publish request was answered and refused, so nothing was posted and the
+    registry may fall through to the next Publisher.  It is not retryable: the
+    job would resubmit the same content to the same refusal.  Reporting this as
+    "unknown" parked every such job for manual platform reconciliation.
+    """
+    _, assets = bili_settings
+
+    result = _publish_with_stderr(monkeypatch, assets, REJECT_LINE, returncode=0)
+
+    assert result.success is False
+    assert result.effect_applied is False
+    assert result.outcome_uncertain is False
+    assert result.retryable is False
+    assert result.platform_post_id is None
+    assert result.raw_response["outcome"] == "rejected"
+    assert result.raw_response["write_started"] is True
+    assert "投稿工具已停用" not in result.model_dump_json()  # upstream text is not kept
+
+
+@pytest.mark.parametrize("returncode", [1, None])
+def test_rejection_line_without_a_clean_exit_stays_unknown(bili_settings, monkeypatch, returncode):
+    """A crash or a kill after the line leaves the platform outcome unproven."""
+    _, assets = bili_settings
+
+    result = _publish_with_stderr(monkeypatch, assets, REJECT_LINE, returncode=returncode)
+
+    assert result.outcome_uncertain is True
+    assert result.retryable is False
+    assert result.raw_response["outcome"] == "unknown"
+
+
+def test_rejection_line_followed_by_a_traceback_stays_unknown(bili_settings, monkeypatch):
+    _, assets = bili_settings
+
+    result = _publish_with_stderr(monkeypatch, assets, REJECT_LINE + TRACEBACK, returncode=0)
+
+    assert result.outcome_uncertain is True
+    assert result.raw_response["outcome"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "",  # nothing came back at all
+        TRACEBACK,  # today's other failure: a crash before any upload
+        "[ERROR] - [2026-11-28 22:50:16,883 urllib3] - Max retries exceeded\n",  # another logger
+        "[INFO] - [2026-11-28 22:50:16,000 bilitool] - Completed preupload phase\n",  # info only
+    ],
+)
+def test_started_without_bvid_or_rejection_is_unknown(bili_settings, monkeypatch, stderr):
+    _, assets = bili_settings
+
+    result = _publish_with_stderr(monkeypatch, assets, stderr, returncode=0)
 
     assert result.success is False
     assert result.outcome_uncertain is True
@@ -235,6 +295,28 @@ def test_started_without_bvid_is_unknown_even_on_exit_zero(bili_settings, monkey
     assert result.platform_post_id is None
     assert result.raw_response["write_started"] is True
     assert result.raw_response["outcome"] == "unknown"
+
+
+def test_the_classifier_itself_never_calls_a_success_a_rejection(bili_settings):
+    """``publish()`` checks the bvid first, so this guard is only reachable here."""
+    from ai_ops.publishers.bilibili_tool import _parse_rejection
+
+    assert _parse_rejection(REJECT_LINE, returncode=0) is not None
+    assert _parse_rejection(REJECT_LINE + SUCCESS_LINE, returncode=0) is None
+
+
+@pytest.mark.parametrize("returncode", [0, 1, None])
+def test_bvid_line_wins_over_everything(bili_settings, monkeypatch, returncode):
+    """With an archive in place neither a rejection line nor a bad exit matters."""
+    _, assets = bili_settings
+
+    result = _publish_with_stderr(
+        monkeypatch, assets, REJECT_LINE + SUCCESS_LINE, returncode=returncode
+    )
+
+    assert result.success is True
+    assert result.platform_post_id == BVID
+    assert result.raw_response["outcome"] in {"confirmed", "confirmed_partial"}
 
 
 def test_timeout_without_bvid_is_unknown(bili_settings, monkeypatch):
@@ -670,3 +752,58 @@ def test_timeout_must_stay_below_the_worker_execution_timeout():
 
     with pytest.raises(ValueError, match="BILITOOL_TIMEOUT_SECONDS"):
         Settings(bilitool_enabled=True, bilitool_timeout_seconds=1800)
+
+
+def test_platform_rejection_lets_the_worker_fall_through_to_the_next_publisher(
+    bili_settings, monkeypatch
+):
+    """The real adapter feeding the real fallback loop.
+
+    Before the rejection was recognised it was reported as "unknown", and the
+    worker stops the chain on an unknown outcome, so a refused publish could
+    never be rescued by the browser Publisher.
+    """
+    from ai_ops.publishers.registry import PublisherRegistry
+    from ai_ops.scheduler import worker as worker_mod
+
+    _, assets = bili_settings
+    rejecting = BilibiliToolPublisher()
+
+    async def run(account_id, *args, timeout=None):
+        return _CommandResult(started=True, returncode=0, stderr=REJECT_LINE)
+
+    _ready(rejecting, monkeypatch)
+    monkeypatch.setattr(rejecting, "_run", run)
+
+    class Next:
+        kind = "social_auto_upload"
+        platform = Platform.BILIBILI
+
+        def __init__(self):
+            self.tried = False
+
+        async def publish(self, account_id, credential, content):
+            self.tried = True
+            return PublishResult(
+                success=True, effect_applied=True, platform_post_id=BVID
+            )
+
+    next_publisher = Next()
+    registry = PublisherRegistry()
+    monkeypatch.setattr(
+        registry, "resolve", lambda _platform: [rejecting, next_publisher]
+    )
+    monkeypatch.setattr(worker_mod, "default_registry", registry)
+
+    result = asyncio.run(
+        worker_mod._try_publishers(
+            Platform.BILIBILI,
+            1,
+            {},
+            _content(_video(assets)),
+        )
+    )
+
+    assert next_publisher.tried is True
+    assert result.success is True
+    assert result.platform_post_id == BVID
