@@ -106,6 +106,17 @@ once release automation is established.
 
 ### Changed
 
+- The bilitool adapter reports a platform rejection as a definite failure instead of an
+  unknown outcome. When bilitool exits 0 without a bvid line and its last line is an
+  `[ERROR]` from its own `bilitool` logger with no traceback, the publish request was
+  answered and refused, so the result is `outcome_uncertain=false`, not retryable and
+  `raw_response.outcome="rejected"`; the worker therefore no longer resubmits the same
+  content up to the retry budget and then degrades the account, and it may fall through to
+  the next Publisher. A non-zero exit, a traceback, a timeout or a line from another logger
+  is still unknown, and the platform's message is not stored (only its length), because it
+  can echo submitted metadata. Before this change such a rejection read as "outcome
+  unknown" and the operator was told to check the platform for a post that was never
+  created.
 - Zhihu exact Agent targets now bind a canonical public `whoami.id` identity through planning,
   human review, the plan digest, and the final pre-write check. `zhihu-login` reports the value
   for an explicit operator PATCH and never changes account data automatically.
@@ -233,26 +244,20 @@ once release automation is established.
   independent implementations (Rust, TypeScript, PHP, Python). The page does not state the base
   and the gateway rejects a fake token before it looks at the parameter, so the platform itself
   has not confirmed it; the first real canary must.
-- The bilitool adapter now reports a platform rejection as a definite failure instead of an
-  unknown outcome. When bilitool exits 0 without a bvid line and its last line is an
-  `[ERROR]` from its own `bilitool` logger with no traceback, the publish request was
-  answered and refused, so the result is `outcome_uncertain=false`, not retryable and
-  `raw_response.outcome="rejected"`; the worker therefore no longer resubmits the same
-  content up to the retry budget and then degrades the account, and it may fall through to
-  the next Publisher. A non-zero exit, a traceback, a timeout or a line from another logger
-  is still unknown, and the platform's message is not stored (only its length), because it
-  can echo submitted metadata. Observed on 2026-11-28 with a real account: code `21590`
-  (“投稿工具已停用”), i.e. Bilibili refuses third-party upload clients for this account, and
-  the upload phase completed first, so the bytes went up before the refusal arrived.
+- Bilibili refuses the bilitool path for now. Observed on 2026-11-28 with a real account:
+  the publish request was answered with code `21590` (“投稿工具已停用”), a verdict on this
+  tool rather than a fault in the request, so the adapter cannot publish for this account
+  as things stand. Bilibili's upload lines also fail intermittently with a TLS error; that
+  is a traceback and a non-zero exit, so it stays an unknown outcome, and the same canary
+  rerun right after the `21590` run stopped that way with the account's health untouched.
 - Those three adapters have now been exercised against the real platforms: with fake
   credentials for all three (pre-publication paths: refresh, health, login, and the real
   `bilitool` 0.1.3 binary driven through the adapter up to its cookie-import step), and for
   bilitool with a real account on 2026-11-28. The real run logged in, passed the health
   check and uploaded a 5-second canary video, and was refused at publish with code `21590`;
-  no archive was created. That refusal is a verdict on this tool, not a fault in the
-  request, so the bilitool path cannot publish for this account as things stand. No
-  successful publish has been observed on any platform, so every post-ID receipt, the
-  Douyin and Kuaishou upload gateways and the Kuaishou `photo_id` remain unverified.
+  no archive was created. No successful publish has been observed on any platform, so every
+  post-ID receipt, the Douyin and Kuaishou upload gateways and the Kuaishou `photo_id` remain
+  unverified.
 - The worker tries the next Publisher when an adapter fails before sending anything, so a canary
   whose API/CLI preflight fails (missing cover, asset outside the asset root) is published by the
   browser path instead and the job still reads as a success. The job's `publisher_kind` records
