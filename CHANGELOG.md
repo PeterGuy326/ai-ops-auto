@@ -178,10 +178,14 @@ once release automation is established.
 - The MCP bridge is configured with a scoped Agent Bearer token only through its process environment,
   never exposes legacy administrator or human-approval capabilities, reserves stdout for protocol
   frames, and inherits the v1 idempotency, validation, and redacted error boundaries over HTTP.
-- `httpx` request logging at INFO no longer writes access tokens into application logs. The existing
-  WeChat MP API adapter already put `access_token` into request URLs, so with the default
-  `LOG_LEVEL=INFO` every API call was logged with a usable credential; the same applied to the new
-  Douyin and Kuaishou adapters.
+- `httpx` request logging at INFO no longer writes access tokens into application logs. The WeChat MP
+  API and Kuaishou adapters put `access_token` (and for Kuaishou `app_secret`, `refresh_token`,
+  `upload_token`) into request URLs, so with the default `LOG_LEVEL=INFO` every such call was logged
+  with a usable credential. Logging setup pins the `httpx` logger at WARNING, and the two adapters
+  that put credentials in a URL also pin it when they build a client, so the guarantee no longer
+  depends on the process having run `init_observability()`: a script or an embedding application
+  that never calls it and turns the root logger up to DEBUG leaked every token, which is how the
+  gap was found while checking the first fix against the live platforms.
 - `safety.publication` in `ai-ops doctor` omitted the WeChat MP API publish switch, so a deployment
   could have real publication enabled while the safety report said no live capability was on.
 

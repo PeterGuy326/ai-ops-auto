@@ -107,6 +107,7 @@ import httpx
 from ..config import settings
 from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
 from ..core.schemas import PublishContent, PublishResult
+from ..observability.structured_logging import cap_httpx_logger
 from ..runtime.receipts import write_publish_receipt
 from .base import AgentContractRendererUnavailable, PublisherBase
 
@@ -541,6 +542,10 @@ class KuaishouOpenApiPublisher(PublisherBase):
     # ---------------- HTTP 基础 ----------------
 
     def _client(self, timeout: float) -> httpx.AsyncClient:
+        # access_token / app_secret / refresh_token / upload_token 都在查询串里，
+        # 而 httpx 的 INFO 请求行会打印完整 URL。这里自己保证上限，不依赖调用方
+        # 初始化过日志：logger 级别是进程级的，钉在 WARNING 后不随 root 变。
+        cap_httpx_logger()
         return httpx.AsyncClient(
             timeout=timeout,
             transport=self._transport,

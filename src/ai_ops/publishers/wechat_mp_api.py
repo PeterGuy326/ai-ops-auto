@@ -40,6 +40,7 @@ import httpx
 from ..config import settings
 from ..core.enums import AccountHealth, ContentType, Platform, PublisherKind
 from ..core.schemas import PublishContent, PublishResult
+from ..observability.structured_logging import cap_httpx_logger
 from .base import PublisherBase
 
 
@@ -88,6 +89,9 @@ class WechatMpApiPublisher(PublisherBase):
     # ---------------- HTTP 基础 ----------------
 
     def _client(self, timeout: float) -> httpx.AsyncClient:
+        # access_token 在每个业务请求的查询串里，而 httpx 的 INFO 请求行会打印
+        # 完整 URL。这里自己保证上限，不依赖调用方初始化过日志。
+        cap_httpx_logger()
         return httpx.AsyncClient(
             base_url=self._base_url,
             timeout=timeout,

@@ -1608,3 +1608,46 @@ def test_an_upload_failure_labels_the_step_and_the_code(assets, video_size, step
     assert label in result.error
     assert "100120002" in result.error
     _assert_no_secrets(result)
+
+
+# ---------------------------------------------------------------------------
+# 不依赖日志初始化：适配器自己保证 httpx 请求行不外泄
+# ---------------------------------------------------------------------------
+
+
+def test_adapter_caps_httpx_without_any_logging_setup(
+    assets, monkeypatch, root_log_records, httpx_logger_unconfigured
+):
+    """进程没走 init_observability()、root 又被开到 DEBUG 时，仍不得打印凭证。
+
+    setup_logging() 也会钉住 httpx，但那是「调用方记得初始化日志」才有的保证。
+    这里一次都不调用它。顺序要紧：先建客户端（钉住上限），再把 root 调到
+    DEBUG，然后才发请求——钉住之后 root 再怎么变，httpx 自己的级别都不跟。
+    """
+    import logging
+
+    logger = httpx_logger_unconfigured
+    assert logger.level == logging.NOTSET  # 起点：没人设置过
+
+    def drive() -> None:
+        router = _Router()
+        router.on(m._PHOTO_COUNT_PATH, _ok(public_count=0, all_count=0))
+        router.on(m._REFRESH_TOKEN_PATH, _err(100200101))
+        publisher = _publisher(router)
+        assert asyncio.run(publisher.health_check(1, dict(CREDENTIAL))) is AccountHealth.HEALTHY
+        assert asyncio.run(publisher.login(1, dict(CREDENTIAL))) is False
+
+    monkeypatch.setattr(logging.getLogger(), "level", logging.DEBUG)
+
+    drive()  # builds a client: pins the httpx logger
+    assert logger.level == logging.WARNING
+
+    # Under DEBUG the pinned logger still refuses INFO, so the request line —
+    # which carries the query string — is never formatted, let alone emitted.
+    assert not logger.isEnabledFor(logging.INFO)
+
+    drive()  # more requests under DEBUG
+    text = "\n".join(root_log_records)
+    assert "HTTP Request" not in text
+    for secret in (*ALL_SECRETS, CREDENTIAL["app_id"]):
+        assert secret not in text

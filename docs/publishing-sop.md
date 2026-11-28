@@ -344,7 +344,9 @@ src/ai_ops/
   都在发出任何请求之前作为确定失败返回。
 - 凭证值只存在于加密的 credential 中，不进 argv、日志、回执、`error` 或 `raw_response`。
   `httpx` 的 INFO 级请求日志会输出完整 URL（含 query 中的 token），`setup_logging` 已把
-  该 logger 钉在 WARNING；部署时不要把 `httpx` 的级别调回 INFO。
+  该 logger 钉在 WARNING；把凭证放进 URL 的适配器（快手、公众号 API）在建立客户端时也会
+  各自钉一次，所以没走 `init_observability()` 的入口（脚本、把这个库嵌进别的应用）同样不漏。
+  这是钉在 logger 自身上的级别，不随 root logger 变化；不要显式把 `httpx` 的级别调回 INFO。
 
 ### 抖音官方 API（`douyin_open_api`）
 

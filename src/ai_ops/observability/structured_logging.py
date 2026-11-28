@@ -110,16 +110,22 @@ def setup_logging(*, log_format: str = "text", log_level: str = "INFO") -> None:
     # access_token/app_secret/refresh_token/upload_token）。默认 LOG_LEVEL=INFO，
     # 这些凭证因此会以明文写进 stdout / 日志采集。请求行没有不可替代的诊断
     # 价值，所以无论配置的级别多低，httpx logger 都硬性不低于 WARNING。
-    _cap_httpx_logger()
+    cap_httpx_logger()
 
 
-def _cap_httpx_logger() -> None:
-    """把 ``httpx`` logger 的级别钉在 WARNING：它的 INFO 记录含完整请求 URL。"""
+def cap_httpx_logger() -> None:
+    """把 ``httpx`` logger 的级别钉在 WARNING：它的 INFO 记录含完整请求 URL。
+
+    ``setup_logging`` 会调用它，但凡是把凭证放进 URL 查询串的调用点也应当各自
+    调用：这个保证不该依赖「调用方记得初始化日志」。进程一旦没走
+    ``init_observability()``（脚本、测试工具、把这个库嵌进别的应用），又有人把
+    root logger 开到 DEBUG，每个请求都会连凭证一起写出来。
+    """
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _restore_httpx_logger_for_test() -> None:
-    """测试辅助：撤销 ``_cap_httpx_logger``，以免污染其它用例的 logger 级别。"""
+    """测试辅助：撤销 ``cap_httpx_logger``，以免污染其它用例的 logger 级别。"""
     logging.getLogger("httpx").setLevel(logging.NOTSET)
 
 

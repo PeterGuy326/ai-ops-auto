@@ -398,3 +398,40 @@ def test_registry_gate(monkeypatch):
     resolved = registry_on.resolve(P.WECHAT_MP)
     assert registry_on.kind_value(resolved[0]) == "wechat_mp_api"  # 优先于浏览器草稿版
     assert any(registry_on.kind_value(p) == "social_auto_upload" for p in resolved)
+
+
+# ---------------------------------------------------------------------------
+# 不依赖日志初始化：适配器自己保证 httpx 请求行不外泄
+# ---------------------------------------------------------------------------
+
+
+def test_adapter_caps_httpx_without_any_logging_setup(
+    monkeypatch, root_log_records, httpx_logger_unconfigured
+):
+    """进程没走 init_observability()、root 又被开到 DEBUG 时，仍不得打印凭证。
+
+    access_token 在每个业务请求的查询串里。setup_logging() 也会钉住 httpx，
+    但那是「调用方记得初始化日志」才有的保证；这里一次都不调用它。
+    """
+    import logging
+
+    logger = httpx_logger_unconfigured
+    assert logger.level == logging.NOTSET  # 起点：没人设置过
+
+    def drive() -> None:
+        router = _Router()
+        router.on("/cgi-bin/stable_token", _token_ok)
+        publisher = _make_publisher(router)
+        assert asyncio.run(publisher.login(1, dict(CREDENTIAL))) is True
+
+    monkeypatch.setattr(logging.getLogger(), "level", logging.DEBUG)
+
+    drive()  # builds a client: pins the httpx logger
+    assert logger.level == logging.WARNING
+    assert not logger.isEnabledFor(logging.INFO)
+
+    drive()
+    text = "\n".join(root_log_records)
+    assert "HTTP Request" not in text
+    for secret in (*CREDENTIAL.values(), TOKEN):
+        assert secret not in text
