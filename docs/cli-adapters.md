@@ -90,9 +90,11 @@ YouTube 还有平台级前置条件：2020-07-28 后创建且未经审核的 API
    离线契约测试，尚无真实 remote/Pages canary，因此继续标 Experimental。
 2. **已落地**：`youtubeuploader` 每账号隔离 OAuth 文件，固定 v1.25.5，解析
    `-metaJSONout` video ID；默认关闭，等专用频道 private canary。
-3. **已落地（默认关闭，未 canary）**：B 站 `bilitool==0.1.3` 版本门禁 canary，每账号
+3. **已落地（默认关闭；canary 被平台拒绝）**：B 站 `bilitool==0.1.3` 版本门禁 canary，每账号
    独立 venv，只认 stderr 的 bvid 回执；退出码不可信。它走未公开 member 接口，
    官方 Open Platform 仍是长期路线、尚未实现；`biliup` 不再作为主路线。
+   2026-11-28 真实账号 canary：登录、健康检查、上传全部成功，发布被平台以 code `21590`
+   （“投稿工具已停用”）拒绝，未产生稿件，所以这条路径当前不可用于真发。
 4. **已落地（默认关闭，未 canary）**：抖音与快手的官方视频发布 API 各接了一个
    default-off 适配器（内置 Publisher，未走 Plugin SDK），带分片上传、确定/未知结果语义、
    令牌刷新只在 `login()` 中完成的离线契约测试。两者都受平台准入限制（抖音要求开发者

@@ -319,7 +319,8 @@ src/ai_ops/
 
 ## 三-E、抖音 / 快手 / B 站 Publisher（官方 API 与 CLI canary，默认关闭）
 
-> **当前决策**：三个适配器都已接入 registry，但**默认关闭且均未经真实账号 canary**。
+> **当前决策**：三个适配器都已接入 registry，但**默认关闭**。抖音与快手未经真实账号 canary；
+> B 站 bilitool 路径 2026-11-28 做过一次，发布被平台拒绝（code `21590`，见下文）。
 > 各自启用后 priority=5，排在 SAU 浏览器路径（priority=10）之前；关闭时行为与此前完全一致。
 > 只有专用测试账号 canary 通过后才可以开启。
 
