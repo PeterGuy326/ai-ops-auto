@@ -88,6 +88,20 @@ data/cli_profiles/bilibili/account_<id>/venv/bin/bilitool --version
 `POST /accounts/{id}/login` 导入。它走 B 站未公开的 member 接口，不是开放平台；
 配置与验收见 [Publishing SOP](publishing-sop.md)。
 
+`<id>` 是账号在库里的真实 `account_id`，所以顺序是先建账号、再按它的编号建 venv；
+`scripts/canary_prepare.py prepare bilibili` 会在缺少 venv 时打印出该建的路径。导出
+登录态用的是该 venv 里的同一个二进制，在可信终端里扫码，产物落在当前目录：
+
+```bash
+data/cli_profiles/bilibili/account_<id>/venv/bin/bilitool login --export
+# 在手机 B 站 App 扫码；成功后当前目录出现 cookie.json
+chmod 600 cookie.json && mv cookie.json data/cli_profiles/bilibili/account_<id>/cookie.json
+```
+
+`ai-ops doctor` 的 `adapter.bilitool` 探测的是 `BILITOOL_BIN`（`PATH` 上的副本），不是这里
+的隔离 venv；按本节装好后它仍可能报 `warn`，这不代表适配器不可用。适配器自己只认
+`account_<id>/venv` 里的二进制，canary 脚本检查的也是那一个。
+
 ## 安装模式
 
 ### MoneyPrinterTurbo CLI 隔离

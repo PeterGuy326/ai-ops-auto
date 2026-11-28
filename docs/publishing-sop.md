@@ -359,7 +359,9 @@ src/ai_ops/
   `douyin_private_status`（0 公开 / 1 自见 / 2 好友可见）、`douyin_download_type`。
 - 回执：官方返回的 `item_id` 作为 post ID。**不写 `platform_url`**：官方文档没有给出
   分享 URL 的构造规则，不自行拼接。
-- **未确认点**：分片上传的 `part_number` 官方只写「分片序号」未给示例，实现按 1 起始；
+- **未确认点**：分片上传的 `part_number` 官方只写「分片序号」、示例值为 `1`，没有写明基数。
+  实现按 1 起始，与官方示例及四个独立实现（Rust / TypeScript / PHP / Python）一致；但网关
+  先校验令牌，假令牌探不出平台对 `0` 的反应，**未经平台实证**，首次真机 canary 必须确认；
   `text_extra` 话题定位、`micro_app_id`、`publish_way`（立即/定时/私有）未接入。
 
 ### 快手官方 API（`kuaishou_open_api`）
@@ -399,12 +401,35 @@ src/ai_ops/
 
 ### 验收时的关键 SOP（canary 清单）
 
+0. 用脚本走前两步，它只做到「登录可用」为止，不发布，并且会把登录失败的**真实原因**
+   打印出来（`POST /accounts/{id}/login` 出于安全只回同一句通用提示）：
+
+   ```bash
+   # 凭证从标准输入读，不进 argv / shell 历史 / 进程列表
+   echo '{"app_id":"…","app_secret":"…","refresh_token":"…"}' \
+     | python scripts/canary_prepare.py prepare kuaishou --name ks-canary
+   python scripts/canary_prepare.py prepare bilibili --name bili-canary   # 不读凭证
+   ```
+
+   同名账号再次执行会复用并覆盖凭证；修好问题后用 `--account-id <id>` 只重新验证。
 1. 用专用测试账号，不碰运营账号；`ai-ops doctor` 确认对应 flag 已出现在
-   `safety.publication` 的 `enabled_capabilities` 中。
+   `safety.publication` 的 `enabled_capabilities` 中（开关打开时该项为 `warn`）。
 2. API 适配器：先完成平台准入与接口权限审核，写入凭证，执行一次
    `POST /accounts/{id}/login`，确认 `health_check` 返回 `HEALTHY`。
 3. bilitool：在隔离 venv 中安装 0.1.3，可信终端登录并导入 cookie，确认 `health_check`。
+   venv 要按账号的**真实 `account_id`** 建，所以先建账号再装。
 4. 发一条 canary：到平台端人工确认作品存在、内容与标题一致；对照回执中的 post ID。
+   发布命令需要 `--yes`，并且走正式链路（素材 → 审批 → 分发 → job），风控与留痕照常：
+
+   ```bash
+   python scripts/canary_prepare.py publish kuaishou --account-id <id> --video data/canary.mp4 --yes
+   ```
+
+   - **养号期**：新账号 `NURTURE_DAYS`（默认 7）天内被风控延后，这是预期行为；专用测试账号
+     可以在自己的部署里把它调小。同一账号两次发布至少间隔 `PUBLISH_MIN_INTERVAL_SECONDS`（默认 4 小时）。
+   - **回退**：适配器在发出任何请求之前失败（封面缺失、素材不在 asset root 内等）时，worker
+     会接着用下一个 Publisher（SAU 浏览器路径）发同一条内容，job 一样显示成功。脚本会读出
+     job 的 `publisher_kind`，不是被测适配器时判为不通过；在 UI 上手动分发时要自己核对这个字段。
 5. 发第二条，在上传阶段断网，确认结果是「可重试、未发布」；再在发布请求阶段断网，
    确认结果是「结果未知、不重试、转人工」，且平台端没有重复作品。
 6. 关闭 flag，确认同一账号回落到 SAU 路径且行为与此前一致。
