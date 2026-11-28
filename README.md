@@ -143,7 +143,9 @@ API_KEY='<与 .env 相同的管理 key>' bash scripts/seed_demo.sh
 - 知乎/YouTube/B 站 bilitool CLI canary、抖音/快手开放平台官方视频发布 API adapter
   （`DOUYIN_OPEN_API_ENABLED` / `KUAISHOU_OPEN_API_ENABLED`）、微信公众号官方 API adapter
   （`WECHAT_MP_API_PUBLISHER_ENABLED`）与百家号/搜狐号 Stub 默认不进入真实写主链路；
-  四者均未经真实账号 canary，准入条件与验收见 [Publishing SOP](docs/publishing-sop.md)。
+  四者的准入条件与验收见 [Publishing SOP](docs/publishing-sop.md)。
+  抖音/快手/微信三者均未经真实账号 canary；B 站 bilitool 路径做过一次真实账号 canary
+  （2026-11-28）：登录、健康检查与上传成功，发布被平台以 code `21590` 拒绝，当前不可用于真发。
 - `PUBLISHER_PLUGIN_ALLOWLIST=[]`：未授权的第三方 entry point 不会被 import；非空 allowlist
   等同于同进程代码执行授权，不是沙箱。
 - 开源配置不包含内网端点、个人路径、固定通知群或任何凭证。

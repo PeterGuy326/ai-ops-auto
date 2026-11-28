@@ -20,6 +20,13 @@ identical to git tag ``v0.1.3``):
   returned by ``publish_video``, so a publish the server rejects still exits
   ``0`` after one ``[ERROR]`` log line.  Only the bvid line is the success
   boundary.
+* A rejection is recognisable, though.  ``publish_video`` reaches its
+  ``logger.error(response["message"])`` only after the publish request has
+  been answered with a non-zero ``code``, and nothing runs after it in
+  ``cli()``, so ``[ERROR] - [<timestamp> bilitool] - <message>`` with exit
+  status 0 and no traceback means Bilibili refused the archive (observed
+  2026-11-28: ``code 21590``, "投稿工具已停用", with no archive left on the
+  account).  That is a definite failure, not an unknown outcome.
 * The ``append`` (分P) subcommand is deliberately not wired: it calls two
   ``http://`` member endpoints with ``verify=False`` while sending
   ``access_key``.  Auto-driving it would knowingly downgrade transport
@@ -61,6 +68,14 @@ _VERSION_RE = re.compile(r"^bilitool\s+([0-9]+(?:\.[0-9]+){2})\s+and source code
 # Upstream logs this through logging.info() -> stderr, with a literal TAB.
 _SUCCESS_RE = re.compile(r"upload success![ \t]+bvid:(BV[0-9A-Za-z]{10})")
 _BVID_RE = re.compile(r"^BV[0-9A-Za-z]{10}$")
+# Upstream's own logging format (``cli()``: ``[%(levelname)s] - [%(asctime)s
+# %(name)s] - %(message)s``) on an ERROR line from the ``bilitool`` logger.  Any
+# other ERROR line, from requests or urllib3, does not match.
+_REJECT_RE = re.compile(
+    r"^\[ERROR\] - \[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:,]+ bilitool\] - (?!Traceback)(.+)$",
+    re.MULTILINE,
+)
+_TRACEBACK_RE = re.compile(r"^Traceback \(most recent call last\):", re.MULTILINE)
 _CHECK_ACCOUNT_RE = re.compile(r"^Current account:\s*(.+?)\s*$", re.MULTILINE)
 _CHECK_NO_LOGIN = "There is currently no login account"
 _CHECK_FAILED = "Check failed, please check the info"
@@ -202,6 +217,23 @@ def _parse_bvid(stderr: str) -> str | None:
 
     match = _SUCCESS_RE.search(stderr)
     return match.group(1) if match else None
+
+
+def _parse_rejection(stderr: str, *, returncode: int | None) -> str | None:
+    """Return the platform's reason when it refused the publish, else ``None``.
+
+    Only the audited shape counts: the ``bilitool`` logger's ERROR line, a
+    clean exit and no traceback.  Anything else - a traceback, a timeout, no
+    line at all - may have happened before or during the transfer, and stays
+    the caller's "unknown".
+    """
+
+    if returncode != 0 or _TRACEBACK_RE.search(stderr) or _SUCCESS_RE.search(stderr):
+        return None
+    match = _REJECT_RE.search(stderr)
+    if match is None:
+        return None
+    return match.group(1).strip() or None
 
 
 def _parse_login_account(stdout: str) -> str | None:
@@ -576,10 +608,33 @@ class BilibiliToolPublisher(PublisherBase):
                 ),
             )
 
-        # Started but no bvid line. The bytes may be sitting in Bilibili's
-        # upload bin, the publish may have been rejected (upstream still exits
-        # 0), or the transfer may have died: the adapter cannot tell these
-        # apart, so this stays unknown and blocks fallback and retry.
+        rejection = _parse_rejection(result.stderr, returncode=result.returncode)
+        if rejection is not None:
+            # The publish request was answered and refused, so no archive was
+            # created and the registry may fall through to the next Publisher.
+            # Not retryable: a retry would resubmit the same content to the
+            # same refusal, and exhausting the budget would degrade the account
+            # for what is a verdict on the content or on this tool (21590).
+            # The platform's message can echo submitted metadata and is
+            # upstream output, so only its length is kept.
+            raw["outcome"] = "rejected"
+            raw["rejection_reason_length"] = len(rejection)
+            return self._journal_result(
+                content,
+                PublishResult(
+                    success=False,
+                    effect_applied=False,
+                    retryable=False,
+                    outcome_uncertain=False,
+                    error="B站拒绝了这次投稿（bilitool 未获得稿件回执）",
+                    raw_response=raw,
+                ),
+            )
+
+        # Started, no bvid line and no recognisable rejection: the bytes may
+        # be sitting in Bilibili's upload bin or the transfer may have died
+        # part-way.  The adapter cannot tell these apart, so this stays unknown
+        # and blocks fallback and retry.
         raw["outcome"] = "unknown"
         return self._journal_result(
             content,
