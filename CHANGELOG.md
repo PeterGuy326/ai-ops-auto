@@ -87,6 +87,14 @@ once release automation is established.
 - `ai-ops doctor` now lists the bilitool, Douyin API, Kuaishou API and WeChat MP API publish switches
   under `safety.publication`, and reports `adapter.bilitool` with the same executable check as the
   other CLI adapters.
+- `scripts/canary_prepare.py`, a two-command canary runbook for the bilitool, Douyin and Kuaishou
+  adapters. `prepare` confirms the switch, creates the dedicated account with the grant read from
+  stdin and encrypted at rest, validates the grant under the per-account lock and persists the
+  last rotated refresh token; it stops before publishing and prints the adapter's real login
+  reason, which the login endpoint deliberately does not return. `publish` needs `--yes`, goes
+  through the ordinary article → approve → distribute → job path, and reports a run that fell
+  through to another Publisher as a failure. `.env.example` now also lists
+  `EASEL_WECHAT_PUBLISHER_ENABLED`.
 - A local `ai-ops-mcp` stdio bridge that reuses the Agent contract HTTP client and exposes exactly
   seven Agent operations to MCP clients while keeping all human-only approval operations outside
   the tool surface.
@@ -215,7 +223,22 @@ once release automation is established.
 - The bilitool, Douyin Open Platform and Kuaishou Open Platform adapters are disabled by default
   and have only offline contract evidence. None has published through a real account; eligibility
   (developer qualification reviews, interface-permission approval) has not been exercised, and the
-  Douyin `part_number` base is taken from an official description that gives no example.
+  Douyin `part_number` base is 1, matching the example value on the official page and four
+  independent implementations (Rust, TypeScript, PHP, Python). The page does not state the base
+  and the gateway rejects a fake token before it looks at the parameter, so the platform itself
+  has not confirmed it; the first real canary must.
+- Those three adapters have now been exercised against the real platforms with fake credentials
+  (pre-publication paths only: refresh, health, login, and the real `bilitool` 0.1.3 binary
+  driven through the adapter up to its cookie-import step). No upload or publish request has
+  been sent with a real grant, so the upload gateways, the Kuaishou `photo_id` and every post-ID
+  receipt remain unverified on the platform side.
+- The worker tries the next Publisher when an adapter fails before sending anything, so a canary
+  whose API/CLI preflight fails (missing cover, asset outside the asset root) is published by the
+  browser path instead and the job still reads as a success. The job's `publisher_kind` records
+  which one actually posted; `scripts/canary_prepare.py` checks it, a manual UI distribution does
+  not. Separately, `ai-ops doctor`'s `adapter.bilitool` probes `BILITOOL_BIN` on `PATH` while the
+  adapter only runs the per-account venv binary, so that check can report `warn` for a correctly
+  installed adapter.
 - The two Open Platform adapters do not refresh tokens outside `login()`: an operator has to call
   `POST /accounts/{id}/login` within every token lifetime (15 days for Douyin, 48 hours for Kuaishou).
   Kuaishou's refresh token is single-use, so a missed rotation needs a fresh user authorization.
